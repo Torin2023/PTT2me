@@ -14,17 +14,81 @@ use core_foundation::runloop::{
 use objc2_foundation::MainThreadMarker;
 
 use crate::asr::{spawn_asr_worker, AsrCommand, AsrEvent};
-use crate::audio::AudioRecorder;
+use crate::audio::{AudioError, AudioRecorder};
 use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS};
 use crate::hotkey::{HotkeyListener, HotkeySignal};
 use crate::inserter;
 use crate::menu::MenuBar;
 use crate::model::{resources_dir_from_executable, ModelPaths};
-use crate::permissions::{self, SystemPermissionProbe};
+use crate::permissions::{
+    self, MicrophoneAuthorization, MicrophonePermissionBoundary, MicrophonePermissionFlow,
+    SystemPermissionProbe,
+};
 use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
 
 const EVENT_DRAIN_MS: u64 = 50;
 const PERMISSION_POLL_MS: u64 = 1_000;
+
+struct MicrophonePermissionRuntime {
+    flow: MicrophonePermissionFlow,
+    completion_sender: Sender<()>,
+    completions: Receiver<()>,
+}
+
+impl Default for MicrophonePermissionRuntime {
+    fn default() -> Self {
+        let (completion_sender, completions) = mpsc::channel();
+        Self {
+            flow: MicrophonePermissionFlow::default(),
+            completion_sender,
+            completions,
+        }
+    }
+}
+
+impl MicrophonePermissionRuntime {
+    fn completion_sender(&self) -> Sender<()> {
+        self.completion_sender.clone()
+    }
+
+    fn permission_needed(
+        &mut self,
+        authorization: MicrophoneAuthorization,
+        boundary: &mut impl MicrophonePermissionBoundary,
+    ) {
+        self.flow.permission_needed(authorization, boundary);
+    }
+
+    fn drain_completions(
+        &mut self,
+        mut authorization: impl FnMut() -> MicrophoneAuthorization,
+        boundary: &mut impl MicrophonePermissionBoundary,
+    ) -> bool {
+        if self.completions.try_recv().is_err() {
+            return false;
+        }
+        while self.completions.try_recv().is_ok() {}
+        self.flow.request_completed(authorization(), boundary);
+        true
+    }
+}
+
+struct SystemMicrophonePermissionBoundary {
+    completion_sender: Sender<()>,
+}
+
+impl MicrophonePermissionBoundary for SystemMicrophonePermissionBoundary {
+    fn request_access(&mut self) -> bool {
+        let completion_sender = self.completion_sender.clone();
+        permissions::request_microphone_access(move || {
+            let _ = completion_sender.send(());
+        })
+    }
+
+    fn open_settings(&mut self) -> bool {
+        permissions::open_settings(crate::state::PermissionKind::Microphone)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TapState {
@@ -168,6 +232,7 @@ pub struct Runtime {
     error_timer: Option<ScheduledTimer>,
     press_started: Option<Instant>,
     applied_permissions: PermissionSnapshot,
+    microphone_permissions: MicrophonePermissionRuntime,
     tap_needs_retry: bool,
     deferred_tap_state: DeferredTapState,
     _pin: PhantomPinned,
@@ -201,6 +266,7 @@ impl Runtime {
             error_timer: None,
             press_started: None,
             applied_permissions: PermissionSnapshot::default(),
+            microphone_permissions: MicrophonePermissionRuntime::default(),
             tap_needs_retry: false,
             deferred_tap_state: DeferredTapState::default(),
             _pin: PhantomPinned,
@@ -270,6 +336,8 @@ impl Runtime {
     }
 
     fn drain_events(&mut self) {
+        self.drain_microphone_permission_completions();
+
         let hotkey_events: Vec<_> = self.hotkey_events.try_iter().collect();
         for signal in hotkey_events {
             self.handle_hotkey(signal);
@@ -293,6 +361,19 @@ impl Runtime {
                     break;
                 }
             }
+        }
+    }
+
+    fn drain_microphone_permission_completions(&mut self) {
+        let mut boundary = SystemMicrophonePermissionBoundary {
+            completion_sender: self.microphone_permissions.completion_sender(),
+        };
+        let should_repoll = self.microphone_permissions.drain_completions(
+            SystemPermissionProbe::microphone_authorization,
+            &mut boundary,
+        );
+        if should_repoll {
+            self.poll_permissions();
         }
     }
 
@@ -389,7 +470,14 @@ impl Runtime {
     fn execute(&mut self, effect: Effect) {
         match effect {
             Effect::OpenPermission(permission) => {
-                if !permissions::open_settings(permission) {
+                if permission == crate::state::PermissionKind::Microphone {
+                    let authorization = SystemPermissionProbe::microphone_authorization();
+                    let mut boundary = SystemMicrophonePermissionBoundary {
+                        completion_sender: self.microphone_permissions.completion_sender(),
+                    };
+                    self.microphone_permissions
+                        .permission_needed(authorization, &mut boundary);
+                } else if !permissions::open_settings(permission) {
                     tracing::warn!(error_category = "open_permission_settings");
                 }
             }
@@ -450,17 +538,17 @@ impl Runtime {
 
     fn finish_capture(&mut self) {
         self.press_started = None;
-        match self.recorder.stop() {
+        let stop_result = self.recorder.stop();
+        match &stop_result {
             Ok(samples) => {
                 let sample_count = samples.as_ref().map_or(0, Vec::len);
                 tracing::debug!(sample_count, lifecycle = "capture_finished");
-                self.dispatch(AppEvent::AudioReady(samples));
             }
             Err(_) => {
                 tracing::warn!(error_category = "microphone_stop");
-                self.dispatch(AppEvent::CaptureFailed);
             }
         }
+        self.dispatch(capture_result_event(stop_result));
     }
 
     fn replace_finish_timer(&mut self, delay_ms: u64) {
@@ -505,6 +593,13 @@ impl Runtime {
 
     fn cancel_capture_limit_timer(&mut self) {
         cancel_timer(&self.run_loop, &mut self.capture_limit_timer);
+    }
+}
+
+pub(crate) fn capture_result_event(result: Result<Option<Vec<f32>>, AudioError>) -> AppEvent {
+    match result {
+        Ok(samples) => AppEvent::AudioReady(samples),
+        Err(_) => AppEvent::CaptureFailed,
     }
 }
 
@@ -578,12 +673,32 @@ pub fn smoke_bundled_model() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::{
-        milliseconds_to_seconds, status_name, DeferredTapState, TapState, EVENT_DRAIN_MS,
-        PERMISSION_POLL_MS,
+        milliseconds_to_seconds, status_name, DeferredTapState, MicrophonePermissionRuntime,
+        TapState, EVENT_DRAIN_MS, PERMISSION_POLL_MS,
     };
     use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
+    use crate::permissions::{MicrophoneAuthorization, MicrophonePermissionBoundary};
     use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
+
+    struct RecordingMicrophoneBoundary {
+        events: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl MicrophonePermissionBoundary for RecordingMicrophoneBoundary {
+        fn request_access(&mut self) -> bool {
+            self.events.borrow_mut().push("request");
+            true
+        }
+
+        fn open_settings(&mut self) -> bool {
+            self.events.borrow_mut().push("open");
+            true
+        }
+    }
 
     fn recognizing_controller() -> AppController {
         let mut controller = AppController::new();
@@ -615,6 +730,33 @@ mod tests {
             }),
             "error"
         );
+    }
+
+    #[test]
+    fn microphone_callback_rechecks_before_opening_settings_and_requests_repoll() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut boundary = RecordingMicrophoneBoundary {
+            events: Rc::clone(&events),
+        };
+        let mut permissions = MicrophonePermissionRuntime::default();
+
+        permissions.permission_needed(MicrophoneAuthorization::NotDetermined, &mut boundary);
+        permissions.permission_needed(MicrophoneAuthorization::NotDetermined, &mut boundary);
+        assert_eq!(*events.borrow(), vec!["request"]);
+
+        permissions.completion_sender().send(()).unwrap();
+        let should_repoll = permissions.drain_completions(
+            || {
+                events.borrow_mut().push("recheck");
+                MicrophoneAuthorization::Denied
+            },
+            &mut boundary,
+        );
+
+        assert!(should_repoll);
+        assert_eq!(*events.borrow(), vec!["request", "recheck", "open"]);
+        assert!(!permissions
+            .drain_completions(|| panic!("no second authorization recheck"), &mut boundary,));
     }
 
     #[test]

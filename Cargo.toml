@@ -5,6 +5,7 @@ edition = "2021"
 description = "Minimal offline GigaAM v3 push-to-talk for macOS"
 
 [dependencies]
+block2 = "0.5"
 cpal = "0.15"
 core-foundation = "0.10"
 core-graphics = "0.24"

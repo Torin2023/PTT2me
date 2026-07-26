@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use block2::RcBlock;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use objc2::msg_send;
-use objc2::runtime::{AnyClass, AnyObject};
+use objc2::runtime::{AnyClass, AnyObject, Bool};
 use objc2_app_kit::NSWorkspace;
 use objc2_foundation::{NSString, NSURL};
 
@@ -28,8 +29,93 @@ extern "C" {
 
 const IOHID_REQUEST_LISTEN_EVENT: u32 = 1;
 const IOHID_ACCESS_GRANTED: u32 = 0;
+const AV_NOT_DETERMINED: isize = 0;
+const AV_RESTRICTED: isize = 1;
+const AV_DENIED: isize = 2;
 const AV_AUTHORIZED: isize = 3;
 const MICROPHONE_PRIME_MS: u64 = 150;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicrophoneAuthorization {
+    NotDetermined,
+    Restricted,
+    Denied,
+    Authorized,
+    Unknown,
+}
+
+impl MicrophoneAuthorization {
+    const fn from_raw(status: isize) -> Self {
+        match status {
+            AV_NOT_DETERMINED => Self::NotDetermined,
+            AV_RESTRICTED => Self::Restricted,
+            AV_DENIED => Self::Denied,
+            AV_AUTHORIZED => Self::Authorized,
+            _ => Self::Unknown,
+        }
+    }
+
+    const fn is_authorized(self) -> bool {
+        matches!(self, Self::Authorized)
+    }
+}
+
+pub trait MicrophonePermissionBoundary {
+    fn request_access(&mut self) -> bool;
+    fn open_settings(&mut self) -> bool;
+}
+
+/// One-process coordinator for the asynchronous microphone consent prompt.
+///
+/// It never prompts more than once and opens System Settings at most once.
+#[derive(Default)]
+pub struct MicrophonePermissionFlow {
+    request_started: bool,
+    settings_opened: bool,
+}
+
+impl MicrophonePermissionFlow {
+    pub fn permission_needed(
+        &mut self,
+        authorization: MicrophoneAuthorization,
+        boundary: &mut impl MicrophonePermissionBoundary,
+    ) {
+        match authorization {
+            MicrophoneAuthorization::NotDetermined if !self.request_started => {
+                self.request_started = true;
+                if !boundary.request_access() {
+                    self.open_settings_once(boundary);
+                }
+            }
+            MicrophoneAuthorization::Denied
+            | MicrophoneAuthorization::Restricted
+            | MicrophoneAuthorization::Unknown => self.open_settings_once(boundary),
+            MicrophoneAuthorization::NotDetermined | MicrophoneAuthorization::Authorized => {}
+        }
+    }
+
+    pub fn request_completed(
+        &mut self,
+        authorization: MicrophoneAuthorization,
+        boundary: &mut impl MicrophonePermissionBoundary,
+    ) {
+        if matches!(
+            authorization,
+            MicrophoneAuthorization::Denied
+                | MicrophoneAuthorization::Restricted
+                | MicrophoneAuthorization::Unknown
+        ) {
+            self.open_settings_once(boundary);
+        }
+    }
+
+    fn open_settings_once(&mut self, boundary: &mut impl MicrophonePermissionBoundary) {
+        if !self.settings_opened {
+            self.settings_opened = true;
+            let _ = boundary.open_settings();
+        }
+    }
+}
 
 /// Read-only probes for the three macOS permissions PTT2me requires.
 pub struct SystemPermissionProbe;
@@ -42,8 +128,12 @@ impl SystemPermissionProbe {
             input_monitoring: unsafe {
                 IOHIDCheckAccess(IOHID_REQUEST_LISTEN_EVENT) == IOHID_ACCESS_GRANTED
             },
-            microphone: microphone_authorization_status() == AV_AUTHORIZED,
+            microphone: Self::microphone_authorization().is_authorized(),
         }
+    }
+
+    pub fn microphone_authorization() -> MicrophoneAuthorization {
+        MicrophoneAuthorization::from_raw(microphone_authorization_status())
     }
 }
 
@@ -135,10 +225,49 @@ fn microphone_authorization_status() -> isize {
     unsafe { msg_send![device_class, authorizationStatusForMediaType: AVMediaTypeAudio] }
 }
 
+/// Starts AVFoundation's asynchronous, one-shot microphone authorization
+/// prompt. The callback owns `completion` until macOS invokes the copied block.
+pub fn request_microphone_access(completion: impl Fn() + Send + Sync + 'static) -> bool {
+    let Some(device_class) = AnyClass::get("AVCaptureDevice") else {
+        return false;
+    };
+    let completion: RcBlock<dyn Fn(Bool)> = RcBlock::new(move |_granted: Bool| completion());
+
+    unsafe {
+        let _: () = msg_send![
+            device_class,
+            requestAccessForMediaType: AVMediaTypeAudio,
+            completionHandler: &*completion
+        ];
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{prime_exit_code, settings_url};
+    use super::{
+        prime_exit_code, settings_url, MicrophoneAuthorization, MicrophonePermissionBoundary,
+        MicrophonePermissionFlow,
+    };
     use crate::state::{PermissionKind, PermissionSnapshot};
+
+    #[derive(Default)]
+    struct RecordingBoundary {
+        effects: Vec<&'static str>,
+        request_succeeds: bool,
+    }
+
+    impl MicrophonePermissionBoundary for RecordingBoundary {
+        fn request_access(&mut self) -> bool {
+            self.effects.push("request");
+            self.request_succeeds
+        }
+
+        fn open_settings(&mut self) -> bool {
+            self.effects.push("open");
+            true
+        }
+    }
 
     #[test]
     fn missing_permissions_are_requested_in_required_order() {
@@ -192,5 +321,41 @@ mod tests {
     fn microphone_prime_callback_failure_returns_error_exit_code() {
         assert_eq!(prime_exit_code(false), 0);
         assert_eq!(prime_exit_code(true), 1);
+    }
+
+    #[test]
+    fn not_determined_microphone_requests_once_then_rechecks_before_opening_settings() {
+        let mut flow = MicrophonePermissionFlow::default();
+        let mut boundary = RecordingBoundary {
+            request_succeeds: true,
+            ..RecordingBoundary::default()
+        };
+
+        flow.permission_needed(MicrophoneAuthorization::NotDetermined, &mut boundary);
+        flow.permission_needed(MicrophoneAuthorization::NotDetermined, &mut boundary);
+        assert_eq!(boundary.effects, vec!["request"]);
+
+        flow.request_completed(MicrophoneAuthorization::Denied, &mut boundary);
+        flow.request_completed(MicrophoneAuthorization::Denied, &mut boundary);
+        assert_eq!(boundary.effects, vec!["request", "open"]);
+    }
+
+    #[test]
+    fn denied_or_restricted_microphone_never_triggers_an_authorization_request() {
+        for authorization in [
+            MicrophoneAuthorization::Denied,
+            MicrophoneAuthorization::Restricted,
+        ] {
+            let mut flow = MicrophonePermissionFlow::default();
+            let mut boundary = RecordingBoundary {
+                request_succeeds: true,
+                ..RecordingBoundary::default()
+            };
+
+            flow.permission_needed(authorization, &mut boundary);
+            flow.permission_needed(authorization, &mut boundary);
+
+            assert_eq!(boundary.effects, vec!["open"]);
+        }
     }
 }

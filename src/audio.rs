@@ -13,6 +13,59 @@ pub enum AudioError {
     BuildStream(String),
     StartStream(String),
     UnsupportedSampleFormat,
+    StreamCallbackFailed,
+}
+
+#[derive(Default)]
+struct CallbackFailureState {
+    next_generation: u64,
+    active_generation: Option<u64>,
+    failed_generation: Option<u64>,
+}
+
+#[derive(Default)]
+struct CallbackFailures {
+    state: Mutex<CallbackFailureState>,
+}
+
+impl CallbackFailures {
+    fn begin(&self) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.next_generation = state.next_generation.wrapping_add(1).max(1);
+        let generation = state.next_generation;
+        state.active_generation = Some(generation);
+        state.failed_generation = None;
+        generation
+    }
+
+    fn report(&self, generation: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.active_generation == Some(generation) {
+            state.failed_generation = Some(generation);
+        }
+    }
+
+    fn finish(&self, generation: u64) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let failed = state.active_generation == Some(generation)
+            && state.failed_generation == Some(generation);
+        if state.active_generation == Some(generation) {
+            state.active_generation = None;
+        }
+        if state.failed_generation == Some(generation) {
+            state.failed_generation = None;
+        }
+        failed
+    }
 }
 
 /// A short-lived microphone capture. It must stay on the AppKit main thread,
@@ -22,6 +75,8 @@ pub struct AudioRecorder {
     stream: Option<cpal::Stream>,
     source_rate: u32,
     active: bool,
+    active_generation: Option<u64>,
+    callback_failures: Arc<CallbackFailures>,
     #[cfg(test)]
     test_input: Option<TestInput>,
 }
@@ -40,6 +95,8 @@ impl AudioRecorder {
             stream: None,
             source_rate: SAMPLE_RATE,
             active: false,
+            active_generation: None,
+            callback_failures: Arc::new(CallbackFailures::default()),
             #[cfg(test)]
             test_input: None,
         }
@@ -49,6 +106,8 @@ impl AudioRecorder {
         if self.active {
             return Err(AudioError::AlreadyRecording);
         }
+        let generation = self.callback_failures.begin();
+        self.active_generation = Some(generation);
 
         #[cfg(test)]
         if let Some(input) = &self.test_input {
@@ -58,76 +117,98 @@ impl AudioRecorder {
             return Ok(());
         }
 
-        let device = cpal::default_host()
-            .default_input_device()
-            .ok_or(AudioError::NoInputDevice)?;
-        let supported_config = device
-            .default_input_config()
-            .map_err(|error| AudioError::DefaultInputConfig(error.to_string()))?;
-        let sample_format = supported_config.sample_format();
-        let config: cpal::StreamConfig = supported_config.into();
+        let result = (|| {
+            let device = cpal::default_host()
+                .default_input_device()
+                .ok_or(AudioError::NoInputDevice)?;
+            let supported_config = device
+                .default_input_config()
+                .map_err(|error| AudioError::DefaultInputConfig(error.to_string()))?;
+            let sample_format = supported_config.sample_format();
+            let config: cpal::StreamConfig = supported_config.into();
 
-        self.replace_samples(Vec::new());
-        self.source_rate = config.sample_rate.0;
-        let channels = config.channels;
-        let callback_samples = Arc::clone(&self.samples);
-        let error_callback = |error| tracing::warn!(%error, "microphone input stream error");
+            self.replace_samples(Vec::new());
+            self.source_rate = config.sample_rate.0;
+            let channels = config.channels;
+            let callback_samples = Arc::clone(&self.samples);
+            let callback_failures = Arc::clone(&self.callback_failures);
+            let error_callback = move |_error| {
+                callback_failures.report(generation);
+                tracing::warn!(error_category = "microphone_stream_callback");
+            };
 
-        let stream = match sample_format {
-            cpal::SampleFormat::F32 => device.build_input_stream(
-                &config,
-                move |data: &[f32], _| {
-                    append_frames(&callback_samples, data, channels, |sample| sample)
-                },
-                error_callback,
-                None,
-            ),
-            cpal::SampleFormat::I16 => device.build_input_stream(
-                &config,
-                move |data: &[i16], _| {
-                    append_frames(&callback_samples, data, channels, normalize_i16)
-                },
-                error_callback,
-                None,
-            ),
-            cpal::SampleFormat::U16 => device.build_input_stream(
-                &config,
-                move |data: &[u16], _| {
-                    append_frames(&callback_samples, data, channels, normalize_u16)
-                },
-                error_callback,
-                None,
-            ),
-            cpal::SampleFormat::F64 => device.build_input_stream(
-                &config,
-                move |data: &[f64], _| {
-                    append_frames(&callback_samples, data, channels, |sample| sample as f32)
-                },
-                error_callback,
-                None,
-            ),
-            _ => return Err(AudioError::UnsupportedSampleFormat),
+            let stream = match sample_format {
+                cpal::SampleFormat::F32 => device.build_input_stream(
+                    &config,
+                    move |data: &[f32], _| {
+                        append_frames(&callback_samples, data, channels, |sample| sample)
+                    },
+                    error_callback,
+                    None,
+                ),
+                cpal::SampleFormat::I16 => device.build_input_stream(
+                    &config,
+                    move |data: &[i16], _| {
+                        append_frames(&callback_samples, data, channels, normalize_i16)
+                    },
+                    error_callback,
+                    None,
+                ),
+                cpal::SampleFormat::U16 => device.build_input_stream(
+                    &config,
+                    move |data: &[u16], _| {
+                        append_frames(&callback_samples, data, channels, normalize_u16)
+                    },
+                    error_callback,
+                    None,
+                ),
+                cpal::SampleFormat::F64 => device.build_input_stream(
+                    &config,
+                    move |data: &[f64], _| {
+                        append_frames(&callback_samples, data, channels, |sample| sample as f32)
+                    },
+                    error_callback,
+                    None,
+                ),
+                _ => return Err(AudioError::UnsupportedSampleFormat),
+            }
+            .map_err(|error| AudioError::BuildStream(error.to_string()))?;
+
+            stream
+                .play()
+                .map_err(|error| AudioError::StartStream(error.to_string()))?;
+            self.stream = Some(stream);
+            self.active = true;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            self.active_generation = None;
+            self.callback_failures.finish(generation);
         }
-        .map_err(|error| AudioError::BuildStream(error.to_string()))?;
-
-        stream
-            .play()
-            .map_err(|error| AudioError::StartStream(error.to_string()))?;
-        self.stream = Some(stream);
-        self.active = true;
-        Ok(())
+        result
     }
 
     pub fn stop(&mut self) -> Result<Option<Vec<f32>>, AudioError> {
         self.stream.take();
         self.active = false;
+        let callback_failed = self
+            .active_generation
+            .take()
+            .is_some_and(|generation| self.callback_failures.finish(generation));
         let samples = self.take_samples();
+        if callback_failed {
+            return Err(AudioError::StreamCallbackFailed);
+        }
         Ok(prepare_capture(samples, self.source_rate))
     }
 
     pub fn abort(&mut self) {
         self.stream.take();
         self.active = false;
+        if let Some(generation) = self.active_generation.take() {
+            self.callback_failures.finish(generation);
+        }
         self.replace_samples(Vec::new());
     }
 
@@ -243,6 +324,18 @@ mod tests {
         downmix, normalize_i16, normalize_u16, prepare_capture, resample_linear, AudioError,
         AudioRecorder,
     };
+    use crate::runtime::capture_result_event;
+    use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
+
+    fn recognizing_controller() -> AppController {
+        let mut controller = AppController::new();
+        controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
+        controller.handle(AppEvent::ModelLoaded(Ok(())));
+        controller.handle(AppEvent::FnPressed);
+        controller.handle(AppEvent::FnReleased { held_ms: 900 });
+        assert_eq!(controller.status(), &AppStatus::Recognizing);
+        controller
+    }
 
     #[test]
     fn stereo_is_averaged_to_mono() {
@@ -304,5 +397,43 @@ mod tests {
         assert_eq!(samples.len(), 16_000);
         assert!(samples.iter().all(|sample| *sample == 0.0));
         assert_eq!(recorder.stop().unwrap(), None);
+    }
+
+    #[test]
+    fn callback_failure_discards_partial_audio_and_never_requests_recognition() {
+        let mut recorder = AudioRecorder::with_test_frames(vec![0.25; 48_000], 48_000, 1);
+        recorder.start().unwrap();
+        let generation = recorder.active_generation.unwrap();
+        recorder.callback_failures.report(generation);
+
+        let stop_result = recorder.stop();
+
+        assert_eq!(stop_result, Err(AudioError::StreamCallbackFailed));
+        let mut controller = recognizing_controller();
+        let effects = controller.handle(capture_result_event(stop_result));
+        assert!(effects
+            .iter()
+            .all(|effect| !matches!(effect, Effect::Recognize(_))));
+        assert!(matches!(
+            controller.status(),
+            AppStatus::Error {
+                recoverable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stale_callback_failure_does_not_poison_later_capture() {
+        let mut recorder = AudioRecorder::with_test_frames(vec![0.25; 48_000], 48_000, 1);
+        recorder.start().unwrap();
+        let stale_generation = recorder.active_generation.unwrap();
+        recorder.abort();
+
+        recorder.start().unwrap();
+        recorder.callback_failures.report(stale_generation);
+
+        let samples = recorder.stop().unwrap().unwrap();
+        assert_eq!(samples.len(), 16_000);
     }
 }
