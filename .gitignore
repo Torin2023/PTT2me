@@ -1,5 +1,6 @@
 .worktrees/
 .superpowers/
+.DS_Store
 /target
 /dist
 /vendor/models/**/*.onnx
