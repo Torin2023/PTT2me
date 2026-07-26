@@ -17,6 +17,8 @@ RESOURCES="$CONTENTS/Resources"
 FRAMEWORKS="$CONTENTS/Frameworks"
 MODEL_SOURCE="vendor/models/gigaam-v3-rnnt"
 MODEL_DESTINATION="$RESOURCES/models/gigaam-v3-rnnt"
+LICENSE_SOURCE="licenses"
+LICENSE_DESTINATION="$RESOURCES/licenses"
 RELEASE_DIR="target/$TARGET/release"
 SHERPA_DYLIB="libsherpa-onnx-c-api.dylib"
 ONNX_DYLIB="libonnxruntime.1.17.1.dylib"
@@ -30,6 +32,14 @@ require_nonempty_file() {
 
 for model_file in encoder.int8.onnx decoder.onnx joiner.onnx tokens.txt; do
     require_nonempty_file "$MODEL_SOURCE/$model_file"
+done
+for license_file in \
+    GIGAAM-MIT.txt \
+    SHERPA-RS-MIT.txt \
+    SHERPA-ONNX-APACHE-2.0.txt \
+    ONNXRUNTIME-MIT.txt \
+    ONNXRUNTIME-NOTICES.txt; do
+    require_nonempty_file "$LICENSE_SOURCE/$license_file"
 done
 
 VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
@@ -48,11 +58,19 @@ require_nonempty_file "$RELEASE_DIR/$SHERPA_DYLIB"
 require_nonempty_file "$RELEASE_DIR/$ONNX_DYLIB"
 
 rm -rf "$APP"
-mkdir -p "$MACOS" "$MODEL_DESTINATION" "$FRAMEWORKS"
+mkdir -p "$MACOS" "$MODEL_DESTINATION" "$LICENSE_DESTINATION" "$FRAMEWORKS"
 
 install -m 755 "$EXECUTABLE_SOURCE" "$MACOS/$PRODUCT"
 for model_file in encoder.int8.onnx decoder.onnx joiner.onnx tokens.txt; do
     install -m 644 "$MODEL_SOURCE/$model_file" "$MODEL_DESTINATION/$model_file"
+done
+for license_file in \
+    GIGAAM-MIT.txt \
+    SHERPA-RS-MIT.txt \
+    SHERPA-ONNX-APACHE-2.0.txt \
+    ONNXRUNTIME-MIT.txt \
+    ONNXRUNTIME-NOTICES.txt; do
+    install -m 644 "$LICENSE_SOURCE/$license_file" "$LICENSE_DESTINATION/$license_file"
 done
 install -m 755 "$RELEASE_DIR/$SHERPA_DYLIB" "$FRAMEWORKS/$SHERPA_DYLIB"
 install -m 755 "$RELEASE_DIR/$ONNX_DYLIB" "$FRAMEWORKS/$ONNX_DYLIB"
