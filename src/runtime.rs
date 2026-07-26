@@ -406,6 +406,13 @@ impl Runtime {
 
     fn poll_permissions(&mut self) {
         let permissions = SystemPermissionProbe::check();
+        if permissions.microphone {
+            let mut boundary = SystemMicrophonePermissionBoundary {
+                completion_sender: self.microphone_permissions.completion_sender(),
+            };
+            self.microphone_permissions
+                .permission_needed(MicrophoneAuthorization::Authorized, &mut boundary);
+        }
         let may_change_idle_state = !matches!(
             self.controller.status(),
             AppStatus::Recording | AppStatus::Recognizing
@@ -757,6 +764,21 @@ mod tests {
         assert_eq!(*events.borrow(), vec!["request", "recheck", "open"]);
         assert!(!permissions
             .drain_completions(|| panic!("no second authorization recheck"), &mut boundary,));
+    }
+
+    #[test]
+    fn observed_grant_allows_settings_to_open_after_future_revocation() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut boundary = RecordingMicrophoneBoundary {
+            events: Rc::clone(&events),
+        };
+        let mut permissions = MicrophonePermissionRuntime::default();
+
+        permissions.permission_needed(MicrophoneAuthorization::Denied, &mut boundary);
+        permissions.permission_needed(MicrophoneAuthorization::Authorized, &mut boundary);
+        permissions.permission_needed(MicrophoneAuthorization::Denied, &mut boundary);
+
+        assert_eq!(*events.borrow(), vec!["open", "open"]);
     }
 
     #[test]

@@ -67,7 +67,8 @@ pub trait MicrophonePermissionBoundary {
 
 /// One-process coordinator for the asynchronous microphone consent prompt.
 ///
-/// It never prompts more than once and opens System Settings at most once.
+/// It never prompts more than once and opens System Settings at most once
+/// while authorization remains missing.
 #[derive(Default)]
 pub struct MicrophonePermissionFlow {
     request_started: bool,
@@ -90,7 +91,10 @@ impl MicrophonePermissionFlow {
             MicrophoneAuthorization::Denied
             | MicrophoneAuthorization::Restricted
             | MicrophoneAuthorization::Unknown => self.open_settings_once(boundary),
-            MicrophoneAuthorization::NotDetermined | MicrophoneAuthorization::Authorized => {}
+            MicrophoneAuthorization::Authorized => {
+                self.settings_opened = false;
+            }
+            MicrophoneAuthorization::NotDetermined => {}
         }
     }
 
