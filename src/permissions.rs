@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -69,7 +71,12 @@ pub fn prime_microphone_and_exit() -> i32 {
     };
     let sample_format = supported_config.sample_format();
     let config: cpal::StreamConfig = supported_config.into();
-    let error_callback = |error| tracing::warn!(%error, "microphone prime stream error");
+    let callback_failed = Arc::new(AtomicBool::new(false));
+    let callback_failure_for_stream = Arc::clone(&callback_failed);
+    let error_callback = move |_| {
+        callback_failure_for_stream.store(true, Ordering::Release);
+        tracing::warn!("microphone prime stream error");
+    };
 
     let stream = match sample_format {
         cpal::SampleFormat::F32 => {
@@ -95,7 +102,15 @@ pub fn prime_microphone_and_exit() -> i32 {
 
     thread::sleep(Duration::from_millis(MICROPHONE_PRIME_MS));
     drop(stream);
-    0
+    prime_exit_code(callback_failed.load(Ordering::Acquire))
+}
+
+const fn prime_exit_code(callback_failed: bool) -> i32 {
+    if callback_failed {
+        1
+    } else {
+        0
+    }
 }
 
 pub const fn settings_url(permission: PermissionKind) -> &'static str {
@@ -122,7 +137,7 @@ fn microphone_authorization_status() -> isize {
 
 #[cfg(test)]
 mod tests {
-    use super::settings_url;
+    use super::{prime_exit_code, settings_url};
     use crate::state::{PermissionKind, PermissionSnapshot};
 
     #[test]
@@ -171,5 +186,11 @@ mod tests {
             settings_url(PermissionKind::Microphone),
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
         );
+    }
+
+    #[test]
+    fn microphone_prime_callback_failure_returns_error_exit_code() {
+        assert_eq!(prime_exit_code(false), 0);
+        assert_eq!(prime_exit_code(true), 1);
     }
 }
