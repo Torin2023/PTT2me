@@ -2,8 +2,8 @@
 
 PTT2me is a minimal, fully local macOS menu-bar app: hold Fn/Globe, speak,
 release the key, and the recognized Russian text is pasted into the frontmost
-app. Recognition uses the bundled GigaAM v3 model; the resulting text remains
-on the pasteboard.
+app. Recognition uses the bundled GigaAM v3 model; insertion preserves the
+previous pasteboard contents.
 
 ## Requirements and workflow
 
@@ -83,8 +83,10 @@ and guides their interactive setup.
 ## Privacy
 
 Audio and recognized text are processed locally. PTT2me does not save audio,
-transcripts, history, settings, or application data. Successful recognized
-text remains only in the macOS pasteboard after insertion.
+transcripts, history, settings, or application data. Recognized text is used
+temporarily for insertion and is not retained by PTT2me; the previous macOS
+pasteboard contents are restored unless newer contents were copied during
+insertion.
 
 ## Troubleshooting
 
