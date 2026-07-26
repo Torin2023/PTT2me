@@ -43,8 +43,11 @@ trait PasteboardAccess {
     fn snapshot(&mut self) -> Result<PasteboardSnapshot, InsertError>;
     fn write_temporary_text(&mut self, text: &str)
         -> Result<TemporaryWrite, TemporaryWriteFailure>;
-    fn change_count(&mut self) -> isize;
-    fn restore(&mut self, snapshot: &PasteboardSnapshot) -> Result<(), InsertError>;
+    fn restore(
+        &mut self,
+        snapshot: &PasteboardSnapshot,
+        expected_change_count: isize,
+    ) -> Result<(), InsertError>;
 }
 
 trait PasteCommand {
@@ -150,13 +153,16 @@ impl PasteboardAccess for SystemPasteboard {
         }
     }
 
-    fn change_count(&mut self) -> isize {
-        unsafe { self.pasteboard.changeCount() }
-    }
-
-    fn restore(&mut self, snapshot: &PasteboardSnapshot) -> Result<(), InsertError> {
+    fn restore(
+        &mut self,
+        snapshot: &PasteboardSnapshot,
+        expected_change_count: isize,
+    ) -> Result<(), InsertError> {
         let objects = reconstruct_items(snapshot)?;
         unsafe {
+            if self.pasteboard.changeCount() != expected_change_count {
+                return Ok(());
+            }
             self.pasteboard.clearContents();
             if snapshot.items.is_empty() || self.pasteboard.writeObjects(&objects) {
                 Ok(())
@@ -215,9 +221,7 @@ fn insert_with(
     let temporary = match pasteboard.write_temporary_text(&text) {
         Ok(temporary) => temporary,
         Err(failure) => {
-            if pasteboard.change_count() == failure.change_count
-                && pasteboard.restore(&snapshot).is_err()
-            {
+            if pasteboard.restore(&snapshot, failure.change_count).is_err() {
                 tracing::warn!(error_category = "pasteboard_restore_after_temporary_write_failure");
             }
             return Err(failure.error);
@@ -230,11 +234,7 @@ fn insert_with(
         sleeper.sleep(PASTEBOARD_RESTORE_DELAY);
     }
 
-    let restore_result = if pasteboard.change_count() == temporary.change_count {
-        pasteboard.restore(&snapshot)
-    } else {
-        Ok(())
-    };
+    let restore_result = pasteboard.restore(&snapshot, temporary.change_count);
 
     match (paste_result, restore_result) {
         (Err(primary), Err(_restore)) => {
@@ -285,6 +285,7 @@ mod tests {
         temporary_write_error: Option<InsertError>,
         restore_error: Option<InsertError>,
         replace_before_ownership_check: Option<PasteboardSnapshot>,
+        replace_during_restore: Option<PasteboardSnapshot>,
         temporary_write_calls: usize,
         restore_calls: usize,
     }
@@ -298,6 +299,7 @@ mod tests {
                 temporary_write_error: None,
                 restore_error: None,
                 replace_before_ownership_check: None,
+                replace_during_restore: None,
                 temporary_write_calls: 0,
                 restore_calls: 0,
             }
@@ -329,15 +331,22 @@ mod tests {
             }
         }
 
-        fn change_count(&mut self) -> isize {
+        fn restore(
+            &mut self,
+            saved: &PasteboardSnapshot,
+            expected_change_count: isize,
+        ) -> Result<(), InsertError> {
             if let Some(newer) = self.replace_before_ownership_check.take() {
                 self.current = newer;
                 self.change_count += 1;
             }
-            self.change_count
-        }
-
-        fn restore(&mut self, saved: &PasteboardSnapshot) -> Result<(), InsertError> {
+            if let Some(newer) = self.replace_during_restore.take() {
+                self.current = newer;
+                self.change_count += 1;
+            }
+            if self.change_count != expected_change_count {
+                return Ok(());
+            }
             self.restore_calls += 1;
             if let Some(error) = self.restore_error {
                 return Err(error);
@@ -434,8 +443,8 @@ mod tests {
 
         let captured = system.snapshot().unwrap();
         assert_snapshot_contains(&captured, &expected);
-        system.write_temporary_text("recognized").unwrap();
-        system.restore(&captured).unwrap();
+        let temporary = system.write_temporary_text("recognized").unwrap();
+        system.restore(&captured, temporary.change_count).unwrap();
 
         assert_eq!(system.snapshot().unwrap(), captured);
     }
@@ -447,8 +456,8 @@ mod tests {
         let mut system = SystemPasteboard::new(pasteboard);
 
         let captured = system.snapshot().unwrap();
-        system.write_temporary_text("recognized").unwrap();
-        system.restore(&captured).unwrap();
+        let temporary = system.write_temporary_text("recognized").unwrap();
+        system.restore(&captured, temporary.change_count).unwrap();
 
         assert_eq!(system.snapshot().unwrap(), PasteboardSnapshot::default());
     }
@@ -492,6 +501,25 @@ mod tests {
         );
         assert_eq!(pasteboard.current, newer);
         assert_eq!(pasteboard.restore_calls, 0);
+    }
+
+    #[test]
+    fn does_not_overwrite_a_change_during_restore_preparation() {
+        let original = snapshot(&[&[("public.utf8-plain-text", b"before")]]);
+        let newer = snapshot(&[&[("public.utf8-plain-text", b"newer")]]);
+        let mut pasteboard = FakePasteboard::with_snapshot(original);
+        pasteboard.replace_during_restore = Some(newer.clone());
+
+        assert_eq!(
+            insert_with(
+                "recognized",
+                &mut pasteboard,
+                &mut FakePasteCommand::succeed(),
+                &mut FakeSleeper::default(),
+            ),
+            Ok(())
+        );
+        assert_eq!(pasteboard.current, newer);
     }
 
     #[test]
