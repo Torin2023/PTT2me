@@ -176,8 +176,10 @@ require_file "$ONNX_DYLIB"
 require_arm64 "$ONNX_DYLIB"
 
 require_file "$PLIST"
+EXPECTED_VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+[[ -n "$EXPECTED_VERSION" ]] || fail "could not read version from Cargo.toml"
 assert_plist CFBundleIdentifier com.ptt2me.app
-assert_plist CFBundleShortVersionString 1.0.0
+assert_plist CFBundleShortVersionString "$EXPECTED_VERSION"
 assert_plist LSUIElement true
 assert_plist LSMinimumSystemVersion 13.0
 
