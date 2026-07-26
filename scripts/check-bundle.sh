@@ -186,7 +186,7 @@ BUILD_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST" 2>/
 [[ "$BUILD_VERSION" =~ ^[0-9]{12}$ ]] ||
     fail "Info.plist CFBundleVersion must be 12 decimal digits (YYYYMMDDHHMM)"
 PARSED_BUILD_VERSION=$(
-    /bin/date -j -f "%Y%m%d%H%M" "$BUILD_VERSION" "+%Y%m%d%H%M" 2>/dev/null
+    /bin/date -u -j -f "%Y%m%d%H%M" "$BUILD_VERSION" "+%Y%m%d%H%M" 2>/dev/null
 ) || fail "Info.plist CFBundleVersion is not a valid UTC calendar minute"
 [[ "$PARSED_BUILD_VERSION" == "$BUILD_VERSION" ]] ||
     fail "Info.plist CFBundleVersion is not a valid UTC calendar minute"
