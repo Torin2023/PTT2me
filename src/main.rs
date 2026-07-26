@@ -37,7 +37,9 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let application = NSApplication::sharedApplication(main_thread);
-    if !application.setActivationPolicy(NSApplicationActivationPolicy::Accessory) {
+    let policy_set = application.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let current_policy = unsafe { application.activationPolicy() };
+    if !activation_policy_allows_launch(current_policy, policy_set) {
         tracing::error!(error_category = "app_activation_policy");
         return ExitCode::FAILURE;
     }
@@ -58,11 +60,19 @@ fn parse_launch_mode(
     }
 }
 
+fn activation_policy_allows_launch(
+    current_policy: NSApplicationActivationPolicy,
+    set_succeeded: bool,
+) -> bool {
+    set_succeeded || current_policy == NSApplicationActivationPolicy::Accessory
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
 
-    use super::{parse_launch_mode, LaunchMode};
+    use super::{activation_policy_allows_launch, parse_launch_mode, LaunchMode};
+    use objc2_app_kit::NSApplicationActivationPolicy;
 
     #[test]
     fn recognizes_only_the_two_hidden_modes() {
@@ -87,5 +97,13 @@ mod tests {
             ]),
             Err(())
         );
+    }
+
+    #[test]
+    fn already_accessory_launches_when_redundant_setter_returns_false() {
+        assert!(activation_policy_allows_launch(
+            NSApplicationActivationPolicy::Accessory,
+            false,
+        ));
     }
 }
