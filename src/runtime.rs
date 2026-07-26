@@ -1,0 +1,542 @@
+use std::ffi::c_void;
+use std::marker::PhantomPinned;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::JoinHandle;
+use std::time::Instant;
+
+use core_foundation::date::CFDate;
+use core_foundation::runloop::{
+    kCFRunLoopCommonModes, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, CFRunLoopTimerRef,
+};
+use objc2_foundation::MainThreadMarker;
+
+use crate::asr::{spawn_asr_worker, AsrCommand, AsrEvent};
+use crate::audio::AudioRecorder;
+use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS};
+use crate::hotkey::{HotkeyListener, HotkeySignal};
+use crate::inserter;
+use crate::menu::MenuBar;
+use crate::model::{resources_dir_from_executable, ModelPaths};
+use crate::permissions::{self, SystemPermissionProbe};
+use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
+
+const EVENT_DRAIN_MS: u64 = 50;
+const PERMISSION_POLL_MS: u64 = 1_000;
+
+#[derive(Clone, Copy)]
+enum TimerKind {
+    DrainEvents,
+    PollPermissions,
+    FinishCapture,
+    CaptureLimit,
+    ResetError,
+}
+
+struct TimerContext {
+    // Points into the pinned `Runtime` that owns this context. Every timer is
+    // removed on that same main run loop before the runtime can be dropped.
+    runtime: *mut Runtime,
+    kind: TimerKind,
+}
+
+struct ScheduledTimer {
+    timer: CFRunLoopTimer,
+    _context: Box<TimerContext>,
+}
+
+impl ScheduledTimer {
+    fn new(
+        run_loop: &CFRunLoop,
+        runtime: *mut Runtime,
+        kind: TimerKind,
+        delay_ms: u64,
+        repeat_ms: Option<u64>,
+    ) -> Self {
+        let mut context = Box::new(TimerContext { runtime, kind });
+        let mut cf_context = CFRunLoopTimerContext {
+            version: 0,
+            info: (&mut *context as *mut TimerContext).cast::<c_void>(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+        };
+        let timer = CFRunLoopTimer::new(
+            CFDate::now().abs_time() + milliseconds_to_seconds(delay_ms),
+            repeat_ms.map(milliseconds_to_seconds).unwrap_or(0.0),
+            0,
+            0,
+            timer_fired,
+            &mut cf_context,
+        );
+        run_loop.add_timer(&timer, unsafe { kCFRunLoopCommonModes });
+        Self {
+            timer,
+            _context: context,
+        }
+    }
+
+    fn remove(self, run_loop: &CFRunLoop) {
+        run_loop.remove_timer(&self.timer, unsafe { kCFRunLoopCommonModes });
+    }
+}
+
+const fn milliseconds_to_seconds(milliseconds: u64) -> f64 {
+    milliseconds as f64 / 1_000.0
+}
+
+extern "C" fn timer_fired(_timer: CFRunLoopTimerRef, raw_context: *mut c_void) {
+    let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+        let context = raw_context.cast::<TimerContext>();
+        if context.is_null() {
+            return;
+        }
+        let runtime = (*context).runtime;
+        if runtime.is_null() {
+            return;
+        }
+        (*runtime).handle_timer((*context).kind);
+    }));
+
+    if result.is_err() {
+        tracing::error!(error_category = "timer_callback_panic");
+    }
+}
+
+/// Main-thread owner of the reducer and every macOS UI/input component.
+pub struct Runtime {
+    controller: AppController,
+    menu: MenuBar,
+    recorder: AudioRecorder,
+    hotkey: Option<HotkeyListener>,
+    hotkey_sender: Sender<HotkeySignal>,
+    hotkey_events: Receiver<HotkeySignal>,
+    asr_commands: Sender<AsrCommand>,
+    asr_events: Receiver<AsrEvent>,
+    asr_worker: Option<JoinHandle<()>>,
+    asr_connected: bool,
+    run_loop: CFRunLoop,
+    drain_timer: Option<ScheduledTimer>,
+    permission_timer: Option<ScheduledTimer>,
+    finish_timer: Option<ScheduledTimer>,
+    capture_limit_timer: Option<ScheduledTimer>,
+    error_timer: Option<ScheduledTimer>,
+    press_started: Option<Instant>,
+    applied_permissions: PermissionSnapshot,
+    tap_needs_retry: bool,
+    _pin: PhantomPinned,
+}
+
+impl Runtime {
+    /// Creates and starts the complete runtime. The returned box must remain
+    /// alive until `NSApplication::run` returns.
+    pub fn start(_mtm: MainThreadMarker) -> Pin<Box<Self>> {
+        let (hotkey_sender, hotkey_events) = mpsc::channel();
+        let (asr_commands, asr_command_receiver) = mpsc::channel();
+        let (asr_event_sender, asr_events) = mpsc::channel();
+        let asr_worker = spawn_asr_worker(asr_command_receiver, asr_event_sender);
+
+        let mut runtime = Box::pin(Self {
+            controller: AppController::new(),
+            menu: MenuBar::new(),
+            recorder: AudioRecorder::new(),
+            hotkey: None,
+            hotkey_sender,
+            hotkey_events,
+            asr_commands,
+            asr_events,
+            asr_worker: Some(asr_worker),
+            asr_connected: true,
+            run_loop: CFRunLoop::get_main(),
+            drain_timer: None,
+            permission_timer: None,
+            finish_timer: None,
+            capture_limit_timer: None,
+            error_timer: None,
+            press_started: None,
+            applied_permissions: PermissionSnapshot::default(),
+            tap_needs_retry: false,
+            _pin: PhantomPinned,
+        });
+
+        // SAFETY: The runtime has just been pinned, contains `PhantomPinned`,
+        // and is never exposed without its `Pin`. Its timers may therefore
+        // retain this address until `Drop` removes them.
+        let runtime_ref = unsafe { Pin::as_mut(&mut runtime).get_unchecked_mut() };
+        runtime_ref.install_repeating_timers();
+        runtime_ref.begin_model_load();
+        runtime_ref.poll_permissions();
+        tracing::info!(
+            lifecycle = "started",
+            state = status_name(runtime_ref.controller.status())
+        );
+        runtime
+    }
+
+    fn install_repeating_timers(&mut self) {
+        let runtime = self as *mut Self;
+        self.drain_timer = Some(ScheduledTimer::new(
+            &self.run_loop,
+            runtime,
+            TimerKind::DrainEvents,
+            EVENT_DRAIN_MS,
+            Some(EVENT_DRAIN_MS),
+        ));
+        self.permission_timer = Some(ScheduledTimer::new(
+            &self.run_loop,
+            runtime,
+            TimerKind::PollPermissions,
+            PERMISSION_POLL_MS,
+            Some(PERMISSION_POLL_MS),
+        ));
+    }
+
+    fn begin_model_load(&mut self) {
+        let paths = std::env::current_exe()
+            .map_err(|_| "current executable unavailable".to_owned())
+            .and_then(|executable| resources_dir_from_executable(&executable))
+            .and_then(|resources| ModelPaths::from_resources(&resources));
+
+        match paths {
+            Ok(paths) => {
+                if self.asr_commands.send(AsrCommand::Load(paths)).is_err() {
+                    self.dispatch(AppEvent::ModelLoaded(Err(
+                        "ASR worker unavailable".to_owned()
+                    )));
+                }
+            }
+            Err(error) => self.dispatch(AppEvent::ModelLoaded(Err(error))),
+        }
+    }
+
+    fn handle_timer(&mut self, kind: TimerKind) {
+        match kind {
+            TimerKind::DrainEvents => self.drain_events(),
+            TimerKind::PollPermissions => self.poll_permissions(),
+            TimerKind::FinishCapture => self.finish_capture(),
+            TimerKind::CaptureLimit => {
+                self.press_started = None;
+                self.dispatch(AppEvent::CaptureLimitReached);
+            }
+            TimerKind::ResetError => self.dispatch(AppEvent::ErrorTimerFired),
+        }
+    }
+
+    fn drain_events(&mut self) {
+        let hotkey_events: Vec<_> = self.hotkey_events.try_iter().collect();
+        for signal in hotkey_events {
+            self.handle_hotkey(signal);
+        }
+
+        loop {
+            match self.asr_events.try_recv() {
+                Ok(AsrEvent::Loaded(result)) => self.dispatch(AppEvent::ModelLoaded(result)),
+                Ok(AsrEvent::Recognized(result)) => {
+                    self.dispatch(AppEvent::RecognitionFinished(result));
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if self.asr_connected {
+                        self.asr_connected = false;
+                        tracing::error!(error_category = "asr_worker_disconnected");
+                        self.dispatch(AppEvent::ModelLoaded(Err(
+                            "ASR worker unavailable".to_owned()
+                        )));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn handle_hotkey(&mut self, signal: HotkeySignal) {
+        match signal {
+            HotkeySignal::Pressed => {
+                if self.controller.status() == &AppStatus::Ready {
+                    self.press_started = Some(Instant::now());
+                }
+                self.dispatch(AppEvent::FnPressed);
+            }
+            HotkeySignal::Released => {
+                let held_ms = self
+                    .press_started
+                    .take()
+                    .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0);
+                self.dispatch(AppEvent::FnReleased { held_ms });
+            }
+            HotkeySignal::TapLost => {
+                self.tap_needs_retry = true;
+                self.dispatch(AppEvent::EventTapLost);
+            }
+            HotkeySignal::TapRestored => {
+                self.tap_needs_retry = false;
+                self.dispatch(AppEvent::EventTapRestored);
+            }
+        }
+    }
+
+    fn poll_permissions(&mut self) {
+        let permissions = SystemPermissionProbe::check();
+        let may_change_idle_state = !matches!(
+            self.controller.status(),
+            AppStatus::Recording | AppStatus::Recognizing
+        );
+        if permissions != self.applied_permissions && may_change_idle_state {
+            self.applied_permissions = permissions;
+            self.dispatch(AppEvent::PermissionsChanged(permissions));
+        }
+
+        if !permissions.input_monitoring {
+            self.tap_needs_retry = false;
+            self.hotkey.take();
+            return;
+        }
+
+        if self.tap_needs_retry {
+            self.hotkey.take();
+        }
+        if self.hotkey.is_none() {
+            match HotkeyListener::install(self.hotkey_sender.clone()) {
+                Ok(listener) => {
+                    self.hotkey = Some(listener);
+                    self.tap_needs_retry = false;
+                    self.dispatch(AppEvent::EventTapRestored);
+                }
+                Err(_) => {
+                    self.tap_needs_retry = true;
+                    self.dispatch(AppEvent::EventTapLost);
+                }
+            }
+        }
+    }
+
+    fn dispatch(&mut self, event: AppEvent) {
+        let effects = self.controller.handle(event);
+        self.menu.render(self.controller.status());
+        tracing::debug!(state = status_name(self.controller.status()));
+        for effect in effects {
+            self.execute(effect);
+        }
+    }
+
+    fn execute(&mut self, effect: Effect) {
+        match effect {
+            Effect::OpenPermission(permission) => {
+                if !permissions::open_settings(permission) {
+                    tracing::warn!(error_category = "open_permission_settings");
+                }
+            }
+            Effect::StartCapture => match self.recorder.start() {
+                Ok(()) => {
+                    self.replace_capture_limit_timer(MAX_CAPTURE_MS);
+                    tracing::debug!(lifecycle = "capture_started");
+                }
+                Err(_) => {
+                    self.press_started = None;
+                    tracing::warn!(error_category = "microphone_start");
+                    self.dispatch(AppEvent::CaptureFailed);
+                }
+            },
+            Effect::AbortCapture => {
+                self.cancel_finish_timer();
+                self.cancel_capture_limit_timer();
+                self.recorder.abort();
+                tracing::debug!(lifecycle = "capture_aborted");
+            }
+            Effect::FinishCaptureAfter { delay_ms } => {
+                self.cancel_capture_limit_timer();
+                if delay_ms == 0 {
+                    self.finish_capture();
+                } else {
+                    debug_assert_eq!(delay_ms, RELEASE_GRACE_MS);
+                    self.replace_finish_timer(delay_ms);
+                }
+            }
+            Effect::Recognize(samples) => {
+                tracing::debug!(
+                    sample_count = samples.len(),
+                    lifecycle = "recognition_started"
+                );
+                if self
+                    .asr_commands
+                    .send(AsrCommand::Transcribe(samples))
+                    .is_err()
+                {
+                    tracing::warn!(error_category = "asr_channel");
+                    self.dispatch(AppEvent::RecognitionFinished(Err(
+                        "ASR worker unavailable".to_owned()
+                    )));
+                }
+            }
+            Effect::InsertText(text) => {
+                let result = inserter::insert_text(&text).map_err(|_| "insert failed".to_owned());
+                if result.is_err() {
+                    tracing::warn!(error_category = "text_insertion");
+                }
+                self.dispatch(AppEvent::PasteFinished(result));
+            }
+            Effect::ScheduleErrorReset { delay_ms } => {
+                self.replace_error_timer(delay_ms);
+            }
+        }
+    }
+
+    fn finish_capture(&mut self) {
+        self.press_started = None;
+        match self.recorder.stop() {
+            Ok(samples) => {
+                let sample_count = samples.as_ref().map_or(0, Vec::len);
+                tracing::debug!(sample_count, lifecycle = "capture_finished");
+                self.dispatch(AppEvent::AudioReady(samples));
+            }
+            Err(_) => {
+                tracing::warn!(error_category = "microphone_stop");
+                self.dispatch(AppEvent::CaptureFailed);
+            }
+        }
+    }
+
+    fn replace_finish_timer(&mut self, delay_ms: u64) {
+        cancel_timer(&self.run_loop, &mut self.finish_timer);
+        let runtime = self as *mut Self;
+        self.finish_timer = Some(ScheduledTimer::new(
+            &self.run_loop,
+            runtime,
+            TimerKind::FinishCapture,
+            delay_ms,
+            None,
+        ));
+    }
+
+    fn replace_capture_limit_timer(&mut self, delay_ms: u64) {
+        cancel_timer(&self.run_loop, &mut self.capture_limit_timer);
+        let runtime = self as *mut Self;
+        self.capture_limit_timer = Some(ScheduledTimer::new(
+            &self.run_loop,
+            runtime,
+            TimerKind::CaptureLimit,
+            delay_ms,
+            None,
+        ));
+    }
+
+    fn replace_error_timer(&mut self, delay_ms: u64) {
+        cancel_timer(&self.run_loop, &mut self.error_timer);
+        let runtime = self as *mut Self;
+        self.error_timer = Some(ScheduledTimer::new(
+            &self.run_loop,
+            runtime,
+            TimerKind::ResetError,
+            delay_ms,
+            None,
+        ));
+    }
+
+    fn cancel_finish_timer(&mut self) {
+        cancel_timer(&self.run_loop, &mut self.finish_timer);
+    }
+
+    fn cancel_capture_limit_timer(&mut self) {
+        cancel_timer(&self.run_loop, &mut self.capture_limit_timer);
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        cancel_timer(&self.run_loop, &mut self.drain_timer);
+        cancel_timer(&self.run_loop, &mut self.permission_timer);
+        cancel_timer(&self.run_loop, &mut self.finish_timer);
+        cancel_timer(&self.run_loop, &mut self.capture_limit_timer);
+        cancel_timer(&self.run_loop, &mut self.error_timer);
+        self.recorder.abort();
+        self.hotkey.take();
+        let _ = self.asr_commands.send(AsrCommand::Shutdown);
+        if let Some(worker) = self.asr_worker.take() {
+            let _ = worker.join();
+        }
+        tracing::info!(lifecycle = "terminated");
+    }
+}
+
+fn cancel_timer(run_loop: &CFRunLoop, slot: &mut Option<ScheduledTimer>) {
+    if let Some(timer) = slot.take() {
+        timer.remove(run_loop);
+    }
+}
+
+const fn status_name(status: &AppStatus) -> &'static str {
+    match status {
+        AppStatus::Starting => "starting",
+        AppStatus::PermissionBlocked(_) => "permission_blocked",
+        AppStatus::Ready => "ready",
+        AppStatus::Recording => "recording",
+        AppStatus::Recognizing => "recognizing",
+        AppStatus::Error { .. } => "error",
+    }
+}
+
+pub fn bundled_model_paths() -> Result<ModelPaths, String> {
+    let executable =
+        std::env::current_exe().map_err(|_| "current executable unavailable".to_owned())?;
+    bundled_model_paths_from_executable(executable)
+}
+
+fn bundled_model_paths_from_executable(executable: PathBuf) -> Result<ModelPaths, String> {
+    let resources = resources_dir_from_executable(&executable)?;
+    ModelPaths::from_resources(&resources)
+}
+
+/// Loads the embedded model once and returns a shell-compatible smoke status.
+pub fn smoke_bundled_model() -> i32 {
+    let Ok(paths) = bundled_model_paths() else {
+        tracing::error!(error_category = "model_resources");
+        return 1;
+    };
+
+    let (commands, command_receiver) = mpsc::channel();
+    let (event_sender, events) = mpsc::channel();
+    let worker = spawn_asr_worker(command_receiver, event_sender);
+    let load_sent = commands.send(AsrCommand::Load(paths)).is_ok();
+    let loaded = load_sent && matches!(events.recv(), Ok(AsrEvent::Loaded(Ok(()))));
+    let _ = commands.send(AsrCommand::Shutdown);
+    let joined = worker.join().is_ok();
+
+    if loaded && joined {
+        0
+    } else {
+        tracing::error!(error_category = "model_load");
+        1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{milliseconds_to_seconds, status_name, EVENT_DRAIN_MS, PERMISSION_POLL_MS};
+    use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
+    use crate::state::AppStatus;
+
+    #[test]
+    fn runtime_timings_match_the_product_contract() {
+        assert_eq!(EVENT_DRAIN_MS, 50);
+        assert_eq!(PERMISSION_POLL_MS, 1_000);
+        assert_eq!(RELEASE_GRACE_MS, 180);
+        assert_eq!(MAX_CAPTURE_MS, 25_000);
+        assert_eq!(ERROR_VISIBLE_MS, 3_000);
+        assert_eq!(milliseconds_to_seconds(RELEASE_GRACE_MS), 0.18);
+    }
+
+    #[test]
+    fn status_logging_uses_only_category_names() {
+        assert_eq!(status_name(&AppStatus::Ready), "ready");
+        assert_eq!(
+            status_name(&AppStatus::Error {
+                message: "private detail",
+                recoverable: true,
+            }),
+            "error"
+        );
+    }
+}

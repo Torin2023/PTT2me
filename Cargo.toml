@@ -11,13 +11,13 @@ core-graphics = "0.24"
 libc = "0.2"
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = [
-  "NSString", "NSURL", "NSTimer", "NSRunLoop",
+  "NSString", "NSURL", "NSTimer", "NSRunLoop", "NSThread",
 ] }
 objc2-app-kit = { version = "0.2", features = [
   "NSApplication", "NSStatusBar", "NSStatusItem", "NSStatusBarButton",
   "NSMenu", "NSMenuItem", "NSPasteboard", "NSWorkspace", "NSImage",
   "NSButton", "NSButtonCell", "NSControl", "NSResponder", "NSView", "NSCell",
-  "NSColor",
+  "NSColor", "NSRunningApplication",
 ] }
 sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
 tracing = "0.1"
