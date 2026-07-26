@@ -1,0 +1,33 @@
+[package]
+name = "ptt2me"
+version = "1.0.0"
+edition = "2021"
+description = "Minimal offline GigaAM v3 push-to-talk for macOS"
+
+[dependencies]
+cpal = "0.15"
+core-foundation = "0.10"
+core-graphics = "0.24"
+libc = "0.2"
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = [
+  "NSString", "NSURL", "NSTimer", "NSRunLoop",
+] }
+objc2-app-kit = { version = "0.2", features = [
+  "NSApplication", "NSStatusBar", "NSStatusItem", "NSStatusBarButton",
+  "NSMenu", "NSMenuItem", "NSPasteboard", "NSWorkspace", "NSImage",
+  "NSButton", "NSButtonCell", "NSControl", "NSResponder", "NSView", "NSCell",
+  "NSColor",
+] }
+sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-oslog = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

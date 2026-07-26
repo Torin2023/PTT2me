@@ -1,2 +1,7 @@
 .worktrees/
 .superpowers/
+/target
+/dist
+/vendor/models/**/*.onnx
+/vendor/models/**/tokens.txt
+/vendor/runtime/*.dylib
