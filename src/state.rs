@@ -176,8 +176,18 @@ impl AppController {
             {
                 self.enter_idle_state()
             }
-            AppEvent::EventTapLost => self.show_recoverable_error("Глобальная клавиша недоступна"),
-            AppEvent::EventTapRestored => self.enter_idle_state(),
+            AppEvent::EventTapLost
+                if !matches!(
+                    self.status,
+                    AppStatus::Error {
+                        recoverable: false,
+                        ..
+                    }
+                ) =>
+            {
+                self.show_recoverable_error("Глобальная клавиша недоступна")
+            }
+            AppEvent::EventTapRestored if self.is_event_tap_error() => self.enter_idle_state(),
             _ => Vec::new(),
         }
     }
@@ -224,6 +234,14 @@ impl AppController {
         vec![Effect::ScheduleErrorReset {
             delay_ms: ERROR_VISIBLE_MS,
         }]
+    }
+
+    fn is_event_tap_error(&self) -> bool {
+        self.status
+            == (AppStatus::Error {
+                message: "Глобальная клавиша недоступна",
+                recoverable: true,
+            })
     }
 
     #[cfg(test)]
@@ -319,6 +337,36 @@ mod tests {
             }
         );
         assert!(c.handle(AppEvent::ErrorTimerFired).is_empty());
+        assert_eq!(
+            c.status(),
+            &AppStatus::Error {
+                message: "Не удалось загрузить модель",
+                recoverable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn event_tap_loss_does_not_replace_persistent_model_failure() {
+        let mut c = AppController::new();
+        c.handle(AppEvent::ModelLoaded(Err("missing model".into())));
+
+        assert!(c.handle(AppEvent::EventTapLost).is_empty());
+        assert_eq!(
+            c.status(),
+            &AppStatus::Error {
+                message: "Не удалось загрузить модель",
+                recoverable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn event_tap_restoration_does_not_clear_persistent_model_failure() {
+        let mut c = AppController::new();
+        c.handle(AppEvent::ModelLoaded(Err("missing model".into())));
+
+        assert!(c.handle(AppEvent::EventTapRestored).is_empty());
         assert_eq!(
             c.status(),
             &AppStatus::Error {
