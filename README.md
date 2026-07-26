@@ -48,6 +48,23 @@ The script builds only `aarch64-apple-darwin`, obtains the two native runtime
 libraries from the Cargo release output, and creates the self-contained
 `dist/PTT2me.app`.
 
+## Local DMG release
+
+To rebuild the app and create a local Apple Silicon DMG, run:
+
+```bash
+scripts/build-dmg.sh
+```
+
+The command creates `dist/PTT2me-1.0.1-macos-arm64.dmg` and its
+`.sha256` checksum. The image contains `PTT2me.app` and an `Applications`
+link for drag-and-drop installation. It uses ad-hoc signing and is not
+notarized for public distribution.
+
+Before each new release, explicitly bump the package version in `Cargo.toml`
+and synchronize `Cargo.lock` with Cargo. Rebuilding an existing release does
+not change its version automatically.
+
 ## Permissions and launch
 
 PTT2me requires exactly Microphone, Input Monitoring, and Accessibility
