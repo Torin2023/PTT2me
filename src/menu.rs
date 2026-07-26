@@ -12,29 +12,65 @@ use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 
 use crate::state::{AppStatus, PermissionKind};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolStyle {
+    Template,
+    HierarchicalRed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuProjection {
     pub title: String,
     pub symbol: &'static str,
     pub pulse: bool,
+    pub style: SymbolStyle,
 }
 
 impl MenuProjection {
     pub fn from_status(status: &AppStatus) -> Self {
-        let (title, symbol, pulse) = match status {
-            AppStatus::Starting => ("● Запуск…".into(), "hourglass", false),
+        let (title, symbol, pulse, style) = match status {
+            AppStatus::Starting => (
+                "● Запуск…".into(),
+                "hourglass",
+                false,
+                SymbolStyle::Template,
+            ),
             AppStatus::PermissionBlocked(permission) => (
                 format!("● Нужен доступ: {}", permission_title(*permission)),
                 "exclamationmark.triangle.fill",
                 false,
+                SymbolStyle::HierarchicalRed,
             ),
-            AppStatus::Ready => ("● Готово".into(), "mic", false),
-            AppStatus::Recording => ("● Запись…".into(), "record.circle.fill", false),
-            AppStatus::Recognizing => ("● Распознавание…".into(), "waveform", true),
-            AppStatus::Error { message, .. } => (
+            AppStatus::Ready => ("● Готово".into(), "mic", false, SymbolStyle::Template),
+            AppStatus::Recording => (
+                "● Запись…".into(),
+                "record.circle.fill",
+                false,
+                SymbolStyle::HierarchicalRed,
+            ),
+            AppStatus::Recognizing => (
+                "● Распознавание…".into(),
+                "waveform",
+                true,
+                SymbolStyle::Template,
+            ),
+            AppStatus::Error {
+                message,
+                recoverable: false,
+            } => (
+                format!("● Ошибка: {message}"),
+                "exclamationmark.triangle.fill",
+                false,
+                SymbolStyle::HierarchicalRed,
+            ),
+            AppStatus::Error {
+                message,
+                recoverable: true,
+            } => (
                 format!("● Ошибка: {message}"),
                 "exclamationmark.circle.fill",
                 false,
+                SymbolStyle::Template,
             ),
         };
 
@@ -42,6 +78,7 @@ impl MenuProjection {
             title,
             symbol,
             pulse,
+            style,
         }
     }
 }
@@ -69,18 +106,8 @@ pub const MENU_DESCRIPTOR: [MenuEntry; 4] = [
     MenuEntry::Quit,
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SymbolStyle {
-    Template,
-    HierarchicalRed,
-}
-
 fn symbol_style(projection: &MenuProjection) -> SymbolStyle {
-    if projection.symbol == "record.circle.fill" {
-        SymbolStyle::HierarchicalRed
-    } else {
-        SymbolStyle::Template
-    }
+    projection.style
 }
 
 declare_class!(
@@ -334,6 +361,7 @@ mod tests {
                 title: "● Готово".into(),
                 symbol: "mic",
                 pulse: false,
+                style: SymbolStyle::Template,
             }
         );
         assert_eq!(
@@ -342,6 +370,7 @@ mod tests {
                 title: "● Запись…".into(),
                 symbol: "record.circle.fill",
                 pulse: false,
+                style: SymbolStyle::HierarchicalRed,
             }
         );
         assert_eq!(
@@ -350,6 +379,7 @@ mod tests {
                 title: "● Распознавание…".into(),
                 symbol: "waveform",
                 pulse: true,
+                style: SymbolStyle::Template,
             }
         );
     }
@@ -362,6 +392,7 @@ mod tests {
                 title: "● Запуск…".into(),
                 symbol: "hourglass",
                 pulse: false,
+                style: SymbolStyle::Template,
             }
         );
         assert_eq!(
@@ -370,6 +401,7 @@ mod tests {
                 title: "● Нужен доступ: микрофон".into(),
                 symbol: "exclamationmark.triangle.fill",
                 pulse: false,
+                style: SymbolStyle::HierarchicalRed,
             }
         );
         assert_eq!(
@@ -380,6 +412,7 @@ mod tests {
                 title: "● Нужен доступ: мониторинг ввода".into(),
                 symbol: "exclamationmark.triangle.fill",
                 pulse: false,
+                style: SymbolStyle::HierarchicalRed,
             }
         );
         assert_eq!(
@@ -390,6 +423,7 @@ mod tests {
                 title: "● Нужен доступ: универсальный доступ".into(),
                 symbol: "exclamationmark.triangle.fill",
                 pulse: false,
+                style: SymbolStyle::HierarchicalRed,
             }
         );
         assert_eq!(
@@ -401,8 +435,34 @@ mod tests {
                 title: "● Ошибка: Ошибка микрофона".into(),
                 symbol: "exclamationmark.circle.fill",
                 pulse: false,
+                style: SymbolStyle::Template,
             }
         );
+    }
+
+    #[test]
+    fn blocking_states_use_red_warning_triangles() {
+        let permission =
+            MenuProjection::from_status(&AppStatus::PermissionBlocked(PermissionKind::Microphone));
+        assert_eq!(permission.symbol, "exclamationmark.triangle.fill");
+        assert_eq!(symbol_style(&permission), SymbolStyle::HierarchicalRed);
+
+        let persistent = MenuProjection::from_status(&AppStatus::Error {
+            message: "Модель недоступна",
+            recoverable: false,
+        });
+        assert_eq!(persistent.symbol, "exclamationmark.triangle.fill");
+        assert_eq!(symbol_style(&persistent), SymbolStyle::HierarchicalRed);
+    }
+
+    #[test]
+    fn recoverable_error_keeps_template_circle() {
+        let transient = MenuProjection::from_status(&AppStatus::Error {
+            message: "Ошибка микрофона",
+            recoverable: true,
+        });
+        assert_eq!(transient.symbol, "exclamationmark.circle.fill");
+        assert_eq!(symbol_style(&transient), SymbolStyle::Template);
     }
 
     #[test]
