@@ -5,4 +5,5 @@ pub mod asr;
 pub mod audio;
 pub mod constants;
 pub mod model;
+pub mod permissions;
 pub mod state;
