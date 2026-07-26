@@ -5,8 +5,8 @@ use objc2::{
     runtime::AnyObject, sel, ClassType, DeclaredClass,
 };
 use objc2_app_kit::{
-    NSApplication, NSColor, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusBarButton,
-    NSStatusItem, NSVariableStatusItemLength,
+    NSApplication, NSColor, NSImage, NSImageSymbolConfiguration, NSMenu, NSMenuItem, NSStatusBar,
+    NSStatusBarButton, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 
@@ -68,6 +68,20 @@ pub const MENU_DESCRIPTOR: [MenuEntry; 4] = [
     MenuEntry::Separator,
     MenuEntry::Quit,
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolStyle {
+    Template,
+    HierarchicalRed,
+}
+
+fn symbol_style(projection: &MenuProjection) -> SymbolStyle {
+    if projection.symbol == "record.circle.fill" {
+        SymbolStyle::HierarchicalRed
+    } else {
+        SymbolStyle::Template
+    }
+}
 
 declare_class!(
     struct MenuTarget;
@@ -197,7 +211,6 @@ impl MenuBar {
         if let Some(image) = system_symbol(&projection) {
             unsafe { self.button.setImage(Some(&image)) };
         }
-        set_recording_tint(&self.button, matches!(status, AppStatus::Recording));
 
         if self.pulse_active != projection.pulse {
             set_recognition_pulse(&self.button, projection.pulse);
@@ -246,16 +259,22 @@ fn system_symbol(projection: &MenuProjection) -> Option<Retained<NSImage>> {
     let image = unsafe {
         NSImage::imageWithSystemSymbolName_accessibilityDescription(&name, Some(&description))
     }?;
-    unsafe { image.setTemplate(projection.symbol != "record.circle.fill") };
-    Some(image)
-}
 
-fn set_recording_tint(button: &NSStatusBarButton, recording: bool) {
-    unsafe {
-        if recording {
-            button.setContentTintColor(Some(&NSColor::systemRedColor()));
-        } else {
-            button.setContentTintColor(None);
+    match symbol_style(projection) {
+        SymbolStyle::Template => {
+            unsafe { image.setTemplate(true) };
+            Some(image)
+        }
+        SymbolStyle::HierarchicalRed => {
+            let configuration = unsafe {
+                NSImageSymbolConfiguration::configurationWithHierarchicalColor(
+                    &NSColor::systemRedColor(),
+                )
+            };
+            let image =
+                unsafe { image.imageWithSymbolConfiguration(&configuration) }.unwrap_or(image);
+            unsafe { image.setTemplate(false) };
+            Some(image)
         }
     }
 }
@@ -396,6 +415,18 @@ mod tests {
                 MenuEntry::Separator,
                 MenuEntry::Quit,
             ]
+        );
+    }
+
+    #[test]
+    fn recording_uses_red_non_template_symbol_style() {
+        assert_eq!(
+            symbol_style(&MenuProjection::from_status(&AppStatus::Recording)),
+            SymbolStyle::HierarchicalRed
+        );
+        assert_eq!(
+            symbol_style(&MenuProjection::from_status(&AppStatus::Ready)),
+            SymbolStyle::Template
         );
     }
 }
