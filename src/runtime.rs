@@ -26,6 +26,49 @@ use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapsho
 const EVENT_DRAIN_MS: u64 = 50;
 const PERMISSION_POLL_MS: u64 = 1_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TapState {
+    Lost,
+    Restored,
+}
+
+impl TapState {
+    const fn event(self) -> AppEvent {
+        match self {
+            Self::Lost => AppEvent::EventTapLost,
+            Self::Restored => AppEvent::EventTapRestored,
+        }
+    }
+}
+
+#[derive(Default)]
+struct DeferredTapState {
+    pending: Option<TapState>,
+}
+
+impl DeferredTapState {
+    fn observe(&mut self, status: &AppStatus, state: TapState) -> Option<AppEvent> {
+        if is_dictation_in_flight(status) {
+            self.pending = Some(state);
+            None
+        } else {
+            Some(state.event())
+        }
+    }
+
+    fn take_when_idle(&mut self, status: &AppStatus) -> Option<AppEvent> {
+        if is_dictation_in_flight(status) {
+            None
+        } else {
+            self.pending.take().map(TapState::event)
+        }
+    }
+}
+
+const fn is_dictation_in_flight(status: &AppStatus) -> bool {
+    matches!(status, AppStatus::Recording | AppStatus::Recognizing)
+}
+
 #[derive(Clone, Copy)]
 enum TimerKind {
     DrainEvents,
@@ -126,6 +169,7 @@ pub struct Runtime {
     press_started: Option<Instant>,
     applied_permissions: PermissionSnapshot,
     tap_needs_retry: bool,
+    deferred_tap_state: DeferredTapState,
     _pin: PhantomPinned,
 }
 
@@ -158,6 +202,7 @@ impl Runtime {
             press_started: None,
             applied_permissions: PermissionSnapshot::default(),
             tap_needs_retry: false,
+            deferred_tap_state: DeferredTapState::default(),
             _pin: PhantomPinned,
         });
 
@@ -269,11 +314,11 @@ impl Runtime {
             }
             HotkeySignal::TapLost => {
                 self.tap_needs_retry = true;
-                self.dispatch(AppEvent::EventTapLost);
+                self.observe_tap_state(TapState::Lost);
             }
             HotkeySignal::TapRestored => {
                 self.tap_needs_retry = false;
-                self.dispatch(AppEvent::EventTapRestored);
+                self.observe_tap_state(TapState::Restored);
             }
         }
     }
@@ -303,11 +348,11 @@ impl Runtime {
                 Ok(listener) => {
                     self.hotkey = Some(listener);
                     self.tap_needs_retry = false;
-                    self.dispatch(AppEvent::EventTapRestored);
+                    self.observe_tap_state(TapState::Restored);
                 }
                 Err(_) => {
                     self.tap_needs_retry = true;
-                    self.dispatch(AppEvent::EventTapLost);
+                    self.observe_tap_state(TapState::Lost);
                 }
             }
         }
@@ -319,6 +364,25 @@ impl Runtime {
         tracing::debug!(state = status_name(self.controller.status()));
         for effect in effects {
             self.execute(effect);
+        }
+        self.flush_deferred_tap_state();
+    }
+
+    fn observe_tap_state(&mut self, state: TapState) {
+        if let Some(event) = self
+            .deferred_tap_state
+            .observe(self.controller.status(), state)
+        {
+            self.dispatch(event);
+        }
+    }
+
+    fn flush_deferred_tap_state(&mut self) {
+        if let Some(event) = self
+            .deferred_tap_state
+            .take_when_idle(self.controller.status())
+        {
+            self.dispatch(event);
         }
     }
 
@@ -514,9 +578,22 @@ pub fn smoke_bundled_model() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{milliseconds_to_seconds, status_name, EVENT_DRAIN_MS, PERMISSION_POLL_MS};
+    use super::{
+        milliseconds_to_seconds, status_name, DeferredTapState, TapState, EVENT_DRAIN_MS,
+        PERMISSION_POLL_MS,
+    };
     use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
-    use crate::state::AppStatus;
+    use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
+
+    fn recognizing_controller() -> AppController {
+        let mut controller = AppController::new();
+        controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
+        controller.handle(AppEvent::ModelLoaded(Ok(())));
+        controller.handle(AppEvent::FnPressed);
+        controller.handle(AppEvent::FnReleased { held_ms: 900 });
+        assert_eq!(controller.status(), &AppStatus::Recognizing);
+        controller
+    }
 
     #[test]
     fn runtime_timings_match_the_product_contract() {
@@ -537,6 +614,67 @@ mod tests {
                 recoverable: true,
             }),
             "error"
+        );
+    }
+
+    #[test]
+    fn tap_loss_and_restore_do_not_end_in_flight_recognition() {
+        let mut controller = recognizing_controller();
+        let mut tap = DeferredTapState::default();
+
+        assert_eq!(tap.observe(controller.status(), TapState::Lost), None);
+        assert_eq!(tap.observe(controller.status(), TapState::Restored), None);
+        assert!(controller.handle(AppEvent::FnPressed).is_empty());
+        assert_eq!(controller.status(), &AppStatus::Recognizing);
+
+        assert_eq!(
+            controller.handle(AppEvent::RecognitionFinished(Ok("старый результат".into()))),
+            vec![Effect::InsertText("старый результат".into())]
+        );
+        controller.handle(AppEvent::PasteFinished(Ok(())));
+        assert_eq!(
+            tap.take_when_idle(controller.status()),
+            Some(AppEvent::EventTapRestored)
+        );
+        controller.handle(AppEvent::EventTapRestored);
+
+        assert_eq!(
+            controller.handle(AppEvent::FnPressed),
+            vec![Effect::StartCapture]
+        );
+    }
+
+    #[test]
+    fn unresolved_tap_loss_blocks_new_cycle_after_old_result_completes() {
+        let mut controller = recognizing_controller();
+        let mut tap = DeferredTapState::default();
+
+        assert_eq!(tap.observe(controller.status(), TapState::Lost), None);
+        assert!(controller.handle(AppEvent::FnPressed).is_empty());
+        assert_eq!(
+            controller.handle(AppEvent::RecognitionFinished(Ok("первый".into()))),
+            vec![Effect::InsertText("первый".into())]
+        );
+        controller.handle(AppEvent::PasteFinished(Ok(())));
+
+        let deferred = tap.take_when_idle(controller.status()).unwrap();
+        controller.handle(deferred);
+        assert!(matches!(
+            controller.status(),
+            AppStatus::Error {
+                recoverable: true,
+                ..
+            }
+        ));
+        assert!(controller.handle(AppEvent::FnPressed).is_empty());
+
+        let restored = tap
+            .observe(controller.status(), TapState::Restored)
+            .unwrap();
+        controller.handle(restored);
+        assert_eq!(
+            controller.handle(AppEvent::FnPressed),
+            vec![Effect::StartCapture]
         );
     }
 }
