@@ -17,12 +17,35 @@ export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();
   const host = requestHeaders.get("host") ?? "localhost";
   const protocol = host.startsWith("localhost") ? "http" : "https";
+  const origin = `${protocol}://${host}`;
 
   return {
-    metadataBase: new URL(`${protocol}://${host}`),
+    metadataBase: new URL(origin),
     title: "PTT2me — локальная диктовка для macOS",
     description:
       "Удерживайте Fn, говорите по-русски и вставляйте распознанный текст в любое приложение. Полностью локально на Apple Silicon.",
+    openGraph: {
+      type: "website",
+      locale: "ru_RU",
+      title: "PTT2me — локальная диктовка для macOS",
+      description:
+        "Говорите — текст уже там. Полностью локальная диктовка на вашем Mac.",
+      images: [
+        {
+          url: "/og.png",
+          width: 1200,
+          height: 630,
+          alt: "PTT2me — Говорите, текст уже там",
+        },
+      ],
+    },
+    twitter: {
+      card: "summary_large_image",
+      title: "PTT2me — локальная диктовка для macOS",
+      description:
+        "Говорите — текст уже там. Полностью локальная диктовка на вашем Mac.",
+      images: ["/og.png"],
+    },
     icons: {
       icon: "/favicon.svg",
       shortcut: "/favicon.svg",
