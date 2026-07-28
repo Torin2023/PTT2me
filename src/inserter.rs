@@ -180,11 +180,12 @@ impl PasteCommand for SystemPasteCommand {
     }
 }
 
-struct InsertionTransaction<P, C> {
+struct InsertionTransaction<P: PasteboardAccess, C> {
     pasteboard: P,
     command: C,
     snapshot: PasteboardSnapshot,
     temporary: TemporaryWrite,
+    restore_required: bool,
 }
 
 pub(crate) struct PendingInsertion {
@@ -235,6 +236,7 @@ impl<P: PasteboardAccess, C: PasteCommand> InsertionTransaction<P, C> {
             command,
             snapshot,
             temporary,
+            restore_required: true,
         })
     }
 
@@ -243,8 +245,13 @@ impl<P: PasteboardAccess, C: PasteCommand> InsertionTransaction<P, C> {
     }
 
     pub(crate) fn restore(&mut self) -> Result<(), InsertError> {
+        if !self.restore_required {
+            return Ok(());
+        }
         self.pasteboard
-            .restore(&self.snapshot, self.temporary.change_count)
+            .restore(&self.snapshot, self.temporary.change_count)?;
+        self.restore_required = false;
+        Ok(())
     }
 
     pub(crate) fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {
@@ -252,6 +259,20 @@ impl<P: PasteboardAccess, C: PasteCommand> InsertionTransaction<P, C> {
             tracing::warn!(error_category = "pasteboard_restore_after_insert_failure");
         }
         primary
+    }
+}
+
+impl<P: PasteboardAccess, C> Drop for InsertionTransaction<P, C> {
+    fn drop(&mut self) {
+        if self.restore_required
+            && self
+                .pasteboard
+                .restore(&self.snapshot, self.temporary.change_count)
+                .is_err()
+        {
+            tracing::warn!(error_category = "pasteboard_restore_on_drop");
+        }
+        self.restore_required = false;
     }
 }
 
@@ -602,6 +623,35 @@ mod tests {
 
         assert_eq!(insertion.paste(), Ok(()));
         assert_eq!(insertion.restore(), Err(InsertError::PasteboardRestore));
+    }
+
+    #[test]
+    fn dropping_an_active_transaction_restores_the_original_pasteboard() {
+        let pasteboard =
+            FakePasteboard::with_snapshot(snapshot(&[&[("public.utf8-plain-text", b"before")]]));
+        let restore_counter = Rc::clone(&pasteboard.restore_counter);
+
+        drop(
+            InsertionTransaction::begin_with("recognized", pasteboard, FakePasteCommand::succeed())
+                .unwrap(),
+        );
+
+        assert_eq!(restore_counter.get(), 1);
+    }
+
+    #[test]
+    fn explicit_restore_then_drop_does_not_restore_twice() {
+        let pasteboard =
+            FakePasteboard::with_snapshot(snapshot(&[&[("public.utf8-plain-text", b"before")]]));
+        let restore_counter = Rc::clone(&pasteboard.restore_counter);
+        let mut insertion =
+            InsertionTransaction::begin_with("recognized", pasteboard, FakePasteCommand::succeed())
+                .unwrap();
+
+        insertion.restore().unwrap();
+        drop(insertion);
+
+        assert_eq!(restore_counter.get(), 1);
     }
 
     #[test]
