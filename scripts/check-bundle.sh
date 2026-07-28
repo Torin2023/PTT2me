@@ -203,4 +203,14 @@ check_onnx_linkage "$ONNX_DYLIB"
 codesign --verify --deep --strict "$APP_PATH" >/dev/null 2>&1 ||
     fail "code signature verification failed"
 
+if "$EXECUTABLE" --smoke-model; then
+    :
+else
+    SMOKE_STATUS=$?
+    if [[ "$SMOKE_STATUS" == 124 ]]; then
+        fail "bundled model initialization exceeded 180 seconds"
+    fi
+    fail "bundled model initialization failed with status $SMOKE_STATUS"
+fi
+
 echo "PTT2me bundle is valid: $APP_PATH"

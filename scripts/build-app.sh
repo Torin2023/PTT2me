@@ -35,6 +35,7 @@ for model_file in encoder.int8.onnx decoder.onnx joiner.onnx tokens.txt; do
 done
 for license_file in \
     GIGAAM-MIT.txt \
+    RTRB-MIT.txt \
     SHERPA-RS-MIT.txt \
     SHERPA-ONNX-APACHE-2.0.txt \
     ONNXRUNTIME-MIT.txt \
@@ -66,6 +67,7 @@ for model_file in encoder.int8.onnx decoder.onnx joiner.onnx tokens.txt; do
 done
 for license_file in \
     GIGAAM-MIT.txt \
+    RTRB-MIT.txt \
     SHERPA-RS-MIT.txt \
     SHERPA-ONNX-APACHE-2.0.txt \
     ONNXRUNTIME-MIT.txt \
