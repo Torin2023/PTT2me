@@ -21,6 +21,7 @@ use std::{
         mpsc::Sender,
         Mutex,
     },
+    time::Instant,
 };
 
 const FN_KEYCODE: u16 = 63;
@@ -32,8 +33,8 @@ const KEYBOARD_EVENT_MASK: CGEventMask = (1 << CGEventType::KeyDown as CGEventMa
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HotkeySignal {
-    Pressed,
-    Released,
+    Pressed { observed_at: Instant },
+    Released { observed_at: Instant },
     TapLost,
     TapRestored,
 }
@@ -60,7 +61,11 @@ pub struct FnTracker {
 }
 
 impl FnTracker {
-    pub fn handle(&mut self, observation: KeyboardObservation) -> Option<HotkeySignal> {
+    pub fn handle_at(
+        &mut self,
+        observation: KeyboardObservation,
+        observed_at: Instant,
+    ) -> Option<HotkeySignal> {
         let next_pressed = match observation.kind {
             ObservationKind::KeyDown if observation.is_fn_or_globe() => Some(true),
             ObservationKind::KeyUp if observation.is_fn_or_globe() => Some(false),
@@ -79,9 +84,9 @@ impl FnTracker {
 
         self.pressed = next_pressed;
         Some(if next_pressed {
-            HotkeySignal::Pressed
+            HotkeySignal::Pressed { observed_at }
         } else {
-            HotkeySignal::Released
+            HotkeySignal::Released { observed_at }
         })
     }
 }
@@ -132,7 +137,7 @@ impl CallbackState {
                 .tracker
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            tracker.handle(observation)
+            tracker.handle_at(observation, Instant::now())
         };
 
         if let Some(signal) = signal {
@@ -343,11 +348,38 @@ mod tests {
         let mut tracker = FnTracker::default();
         let fn_down = observation(ObservationKind::FlagsChanged, 63, true);
         let fn_up = observation(ObservationKind::FlagsChanged, 63, false);
+        let observed_at = std::time::Instant::now();
 
-        assert_eq!(tracker.handle(fn_down), Some(HotkeySignal::Pressed));
-        assert_eq!(tracker.handle(fn_down), None);
-        assert_eq!(tracker.handle(fn_up), Some(HotkeySignal::Released));
-        assert_eq!(tracker.handle(fn_up), None);
+        assert_eq!(
+            tracker.handle_at(fn_down, observed_at),
+            Some(HotkeySignal::Pressed { observed_at })
+        );
+        assert_eq!(tracker.handle_at(fn_down, observed_at), None);
+        assert_eq!(
+            tracker.handle_at(fn_up, observed_at),
+            Some(HotkeySignal::Released { observed_at })
+        );
+        assert_eq!(tracker.handle_at(fn_up, observed_at), None);
+    }
+
+    #[test]
+    fn signals_keep_callback_timestamps_when_processing_is_delayed() {
+        let mut tracker = FnTracker::default();
+        let pressed_at = std::time::Instant::now();
+        let released_at = pressed_at + std::time::Duration::from_millis(900);
+
+        assert_eq!(
+            tracker.handle_at(observation(ObservationKind::KeyDown, 63, false), pressed_at),
+            Some(HotkeySignal::Pressed {
+                observed_at: pressed_at
+            })
+        );
+        assert_eq!(
+            tracker.handle_at(observation(ObservationKind::KeyUp, 63, false), released_at),
+            Some(HotkeySignal::Released {
+                observed_at: released_at
+            })
+        );
     }
 
     #[test]
@@ -355,41 +387,59 @@ mod tests {
         let mut tracker = FnTracker::default();
         let globe_down = observation(ObservationKind::KeyDown, 179, false);
         let globe_up = observation(ObservationKind::KeyUp, 179, false);
+        let observed_at = std::time::Instant::now();
 
-        assert_eq!(tracker.handle(globe_down), Some(HotkeySignal::Pressed));
-        assert_eq!(tracker.handle(globe_down), None);
-        assert_eq!(tracker.handle(globe_up), Some(HotkeySignal::Released));
-        assert_eq!(tracker.handle(globe_up), None);
+        assert_eq!(
+            tracker.handle_at(globe_down, observed_at),
+            Some(HotkeySignal::Pressed { observed_at })
+        );
+        assert_eq!(tracker.handle_at(globe_down, observed_at), None);
+        assert_eq!(
+            tracker.handle_at(globe_up, observed_at),
+            Some(HotkeySignal::Released { observed_at })
+        );
+        assert_eq!(tracker.handle_at(globe_up, observed_at), None);
     }
 
     #[test]
     fn function_key_key_events_are_supported() {
         let mut tracker = FnTracker::default();
+        let observed_at = std::time::Instant::now();
 
         assert_eq!(
-            tracker.handle(observation(ObservationKind::KeyDown, 63, false)),
-            Some(HotkeySignal::Pressed)
+            tracker.handle_at(
+                observation(ObservationKind::KeyDown, 63, false),
+                observed_at
+            ),
+            Some(HotkeySignal::Pressed { observed_at })
         );
         assert_eq!(
-            tracker.handle(observation(ObservationKind::KeyUp, 63, false)),
-            Some(HotkeySignal::Released)
+            tracker.handle_at(observation(ObservationKind::KeyUp, 63, false), observed_at),
+            Some(HotkeySignal::Released { observed_at })
         );
     }
 
     #[test]
     fn unrelated_keyboard_observations_are_ignored() {
         let mut tracker = FnTracker::default();
+        let observed_at = std::time::Instant::now();
 
         assert_eq!(
-            tracker.handle(observation(ObservationKind::KeyDown, 56, false)),
+            tracker.handle_at(
+                observation(ObservationKind::KeyDown, 56, false),
+                observed_at
+            ),
             None
         );
         assert_eq!(
-            tracker.handle(observation(ObservationKind::KeyUp, 56, false)),
+            tracker.handle_at(observation(ObservationKind::KeyUp, 56, false), observed_at),
             None
         );
         assert_eq!(
-            tracker.handle(observation(ObservationKind::FlagsChanged, 56, true)),
+            tracker.handle_at(
+                observation(ObservationKind::FlagsChanged, 56, true),
+                observed_at
+            ),
             None
         );
     }
@@ -398,13 +448,20 @@ mod tests {
     fn tap_timeout_forces_exactly_one_release() {
         let mut tracker = FnTracker::default();
         let timeout = observation(ObservationKind::TapDisabledByTimeout, 0, false);
+        let observed_at = std::time::Instant::now();
 
         assert_eq!(
-            tracker.handle(observation(ObservationKind::FlagsChanged, 63, true)),
-            Some(HotkeySignal::Pressed)
+            tracker.handle_at(
+                observation(ObservationKind::FlagsChanged, 63, true),
+                observed_at
+            ),
+            Some(HotkeySignal::Pressed { observed_at })
         );
-        assert_eq!(tracker.handle(timeout), Some(HotkeySignal::Released));
-        assert_eq!(tracker.handle(timeout), None);
+        assert_eq!(
+            tracker.handle_at(timeout, observed_at),
+            Some(HotkeySignal::Released { observed_at })
+        );
+        assert_eq!(tracker.handle_at(timeout, observed_at), None);
     }
 
     #[test]
@@ -432,11 +489,17 @@ mod tests {
             tap: AtomicPtr::new(null_mut()),
         };
         state.emit_observation(observation(ObservationKind::KeyDown, 63, false));
-        assert_eq!(receiver.recv().unwrap(), HotkeySignal::Pressed);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            HotkeySignal::Pressed { .. }
+        ));
 
         state.recover_tap(ObservationKind::TapDisabledByTimeout);
 
-        assert_eq!(receiver.recv().unwrap(), HotkeySignal::Released);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            HotkeySignal::Released { .. }
+        ));
         assert_eq!(receiver.recv().unwrap(), HotkeySignal::TapLost);
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
     }

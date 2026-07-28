@@ -17,7 +17,9 @@ use crate::asr::{spawn_asr_worker, AsrCommand, AsrEvent};
 use crate::audio::{AudioError, AudioRecorder};
 use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS};
 use crate::hotkey::{HotkeyListener, HotkeySignal};
-use crate::inserter;
+use crate::inserter::{
+    InsertError, PendingInsertion, PASTEBOARD_RESTORE_DELAY_MS, PASTEBOARD_SETTLE_DELAY_MS,
+};
 use crate::menu::MenuBar;
 use crate::model::{resources_dir_from_executable, ModelPaths};
 use crate::permissions::{
@@ -139,6 +141,8 @@ enum TimerKind {
     PollPermissions,
     FinishCapture,
     CaptureLimit,
+    PasteCommand,
+    RestorePasteboard,
     ResetError,
 }
 
@@ -229,7 +233,9 @@ pub struct Runtime {
     permission_timer: Option<ScheduledTimer>,
     finish_timer: Option<ScheduledTimer>,
     capture_limit_timer: Option<ScheduledTimer>,
+    insertion_timer: Option<ScheduledTimer>,
     error_timer: Option<ScheduledTimer>,
+    pending_insertion: Option<PendingInsertion>,
     press_started: Option<Instant>,
     applied_permissions: PermissionSnapshot,
     microphone_permissions: MicrophonePermissionRuntime,
@@ -263,7 +269,9 @@ impl Runtime {
             permission_timer: None,
             finish_timer: None,
             capture_limit_timer: None,
+            insertion_timer: None,
             error_timer: None,
+            pending_insertion: None,
             press_started: None,
             applied_permissions: PermissionSnapshot::default(),
             microphone_permissions: MicrophonePermissionRuntime::default(),
@@ -331,6 +339,8 @@ impl Runtime {
                 self.press_started = None;
                 self.dispatch(AppEvent::CaptureLimitReached);
             }
+            TimerKind::PasteCommand => self.send_pending_paste(),
+            TimerKind::RestorePasteboard => self.restore_pending_pasteboard(),
             TimerKind::ResetError => self.dispatch(AppEvent::ErrorTimerFired),
         }
     }
@@ -338,9 +348,8 @@ impl Runtime {
     fn drain_events(&mut self) {
         self.drain_microphone_permission_completions();
 
-        let hotkey_events: Vec<_> = self.hotkey_events.try_iter().collect();
-        for signal in hotkey_events {
-            self.handle_hotkey(signal);
+        if self.pending_insertion.is_none() {
+            self.drain_hotkey_events();
         }
 
         loop {
@@ -364,6 +373,13 @@ impl Runtime {
         }
     }
 
+    fn drain_hotkey_events(&mut self) {
+        let hotkey_events: Vec<_> = self.hotkey_events.try_iter().collect();
+        for signal in hotkey_events {
+            self.handle_hotkey(signal);
+        }
+    }
+
     fn drain_microphone_permission_completions(&mut self) {
         let mut boundary = SystemMicrophonePermissionBoundary {
             completion_sender: self.microphone_permissions.completion_sender(),
@@ -379,17 +395,17 @@ impl Runtime {
 
     fn handle_hotkey(&mut self, signal: HotkeySignal) {
         match signal {
-            HotkeySignal::Pressed => {
+            HotkeySignal::Pressed { observed_at } => {
                 if self.controller.status() == &AppStatus::Ready {
-                    self.press_started = Some(Instant::now());
+                    self.press_started = Some(observed_at);
                 }
                 self.dispatch(AppEvent::FnPressed);
             }
-            HotkeySignal::Released => {
+            HotkeySignal::Released { observed_at } => {
                 let held_ms = self
                     .press_started
                     .take()
-                    .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+                    .map(|started| held_millis(started, observed_at))
                     .unwrap_or(0);
                 self.dispatch(AppEvent::FnReleased { held_ms });
             }
@@ -530,13 +546,19 @@ impl Runtime {
                     )));
                 }
             }
-            Effect::InsertText(text) => {
-                let result = inserter::insert_text(&text).map_err(|_| "insert failed".to_owned());
-                if result.is_err() {
-                    tracing::warn!(error_category = "text_insertion");
+            Effect::InsertText(text) => match PendingInsertion::begin(&text) {
+                Ok(insertion) => {
+                    self.pending_insertion = Some(insertion);
+                    self.replace_insertion_timer(
+                        TimerKind::PasteCommand,
+                        PASTEBOARD_SETTLE_DELAY_MS,
+                    );
                 }
-                self.dispatch(AppEvent::PasteFinished(result));
-            }
+                Err(_) => {
+                    tracing::warn!(error_category = "text_insertion");
+                    self.dispatch(AppEvent::PasteFinished(Err("insert failed".to_owned())));
+                }
+            },
             Effect::ScheduleErrorReset { delay_ms } => {
                 self.replace_error_timer(delay_ms);
             }
@@ -594,6 +616,57 @@ impl Runtime {
         ));
     }
 
+    fn replace_insertion_timer(&mut self, kind: TimerKind, delay_ms: u64) {
+        cancel_timer(&self.run_loop, &mut self.insertion_timer);
+        let runtime = self as *mut Self;
+        self.insertion_timer = Some(ScheduledTimer::new(
+            &self.run_loop,
+            runtime,
+            kind,
+            delay_ms,
+            None,
+        ));
+    }
+
+    fn send_pending_paste(&mut self) {
+        let Some(insertion) = self.pending_insertion.as_mut() else {
+            return;
+        };
+        match insertion.paste() {
+            Ok(()) => self
+                .replace_insertion_timer(TimerKind::RestorePasteboard, PASTEBOARD_RESTORE_DELAY_MS),
+            Err(primary) => {
+                let result = self.finish_failed_paste(primary);
+                self.dispatch(AppEvent::PasteFinished(result));
+                self.drain_hotkey_events();
+            }
+        }
+    }
+
+    fn finish_failed_paste(&mut self, primary: InsertError) -> Result<(), String> {
+        cancel_timer(&self.run_loop, &mut self.insertion_timer);
+        if let Some(mut insertion) = self.pending_insertion.take() {
+            insertion.restore_after_paste_failure(primary);
+        }
+        tracing::warn!(error_category = "text_insertion");
+        Err("insert failed".to_owned())
+    }
+
+    fn restore_pending_pasteboard(&mut self) {
+        cancel_timer(&self.run_loop, &mut self.insertion_timer);
+        let result = self
+            .pending_insertion
+            .take()
+            .map(|mut insertion| insertion.restore())
+            .unwrap_or(Ok(()))
+            .map_err(|_| "insert failed".to_owned());
+        if result.is_err() {
+            tracing::warn!(error_category = "text_insertion");
+        }
+        self.dispatch(AppEvent::PasteFinished(result));
+        self.drain_hotkey_events();
+    }
+
     fn cancel_finish_timer(&mut self) {
         cancel_timer(&self.run_loop, &mut self.finish_timer);
     }
@@ -601,6 +674,13 @@ impl Runtime {
     fn cancel_capture_limit_timer(&mut self) {
         cancel_timer(&self.run_loop, &mut self.capture_limit_timer);
     }
+}
+
+fn held_millis(pressed_at: Instant, released_at: Instant) -> u64 {
+    let duration = released_at
+        .checked_duration_since(pressed_at)
+        .unwrap_or_default();
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub(crate) fn capture_result_event(result: Result<Option<Vec<f32>>, AudioError>) -> AppEvent {
@@ -616,7 +696,13 @@ impl Drop for Runtime {
         cancel_timer(&self.run_loop, &mut self.permission_timer);
         cancel_timer(&self.run_loop, &mut self.finish_timer);
         cancel_timer(&self.run_loop, &mut self.capture_limit_timer);
+        cancel_timer(&self.run_loop, &mut self.insertion_timer);
         cancel_timer(&self.run_loop, &mut self.error_timer);
+        if let Some(mut insertion) = self.pending_insertion.take() {
+            if insertion.restore().is_err() {
+                tracing::warn!(error_category = "pasteboard_restore_on_shutdown");
+            }
+        }
         self.recorder.abort();
         self.hotkey.take();
         let _ = self.asr_commands.send(AsrCommand::Shutdown);
@@ -684,8 +770,8 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        milliseconds_to_seconds, status_name, DeferredTapState, MicrophonePermissionRuntime,
-        TapState, EVENT_DRAIN_MS, PERMISSION_POLL_MS,
+        held_millis, milliseconds_to_seconds, status_name, DeferredTapState,
+        MicrophonePermissionRuntime, TapState, EVENT_DRAIN_MS, PERMISSION_POLL_MS,
     };
     use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
     use crate::permissions::{MicrophoneAuthorization, MicrophonePermissionBoundary};
@@ -725,6 +811,14 @@ mod tests {
         assert_eq!(MAX_CAPTURE_MS, 25_000);
         assert_eq!(ERROR_VISIBLE_MS, 3_000);
         assert_eq!(milliseconds_to_seconds(RELEASE_GRACE_MS), 0.18);
+    }
+
+    #[test]
+    fn delayed_hotkey_drain_uses_callback_times_for_hold_duration() {
+        let pressed_at = std::time::Instant::now();
+        let released_at = pressed_at + std::time::Duration::from_millis(900);
+
+        assert_eq!(held_millis(pressed_at, released_at), 900);
     }
 
     #[test]
