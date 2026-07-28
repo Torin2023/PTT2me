@@ -10,7 +10,7 @@ use objc2_foundation::{NSArray, NSData, NSString};
 
 const PASTE_KEYCODE: u16 = 9;
 pub(crate) const PASTEBOARD_SETTLE_DELAY_MS: u64 = 30;
-pub(crate) const PASTEBOARD_RESTORE_DELAY_MS: u64 = 100;
+pub(crate) const PASTEBOARD_RESTORE_DELAY_MS: u64 = 1_000;
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 struct PasteboardSnapshot {
@@ -57,6 +57,9 @@ trait PasteCommand {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InsertError {
     EmptyText,
+    SecureField,
+    Accessibility,
+    UnicodeEvent,
     PasteboardSnapshot,
     PasteboardWrite,
     PasteboardRestore,
@@ -68,6 +71,9 @@ impl fmt::Display for InsertError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::EmptyText => "cannot insert empty text",
+            Self::SecureField => "cannot insert into a secure text field",
+            Self::Accessibility => "could not insert through Accessibility",
+            Self::UnicodeEvent => "could not create a Unicode keyboard event",
             Self::PasteboardSnapshot => "could not snapshot the pasteboard",
             Self::PasteboardWrite => "could not write to the pasteboard",
             Self::PasteboardRestore => "could not restore the pasteboard",

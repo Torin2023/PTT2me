@@ -28,6 +28,7 @@ use crate::permissions::{
     SystemPermissionProbe,
 };
 use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
+use crate::text_inserter::{self, InsertMethod, InsertOutcome};
 
 const EVENT_DRAIN_MS: u64 = 50;
 const PERMISSION_POLL_MS: u64 = 1_000;
@@ -639,8 +640,16 @@ impl Runtime {
                     )));
                 }
             }
-            Effect::InsertText(text) => match PendingInsertion::begin(&text) {
-                Ok(insertion) => {
+            Effect::InsertText(text) => match text_inserter::begin(&text) {
+                Ok(InsertOutcome::Complete(method)) => {
+                    let method = match method {
+                        InsertMethod::Accessibility => "accessibility",
+                        InsertMethod::UnicodeEvents => "unicode_events",
+                    };
+                    tracing::debug!(method, lifecycle = "text_inserted");
+                    self.dispatch(AppEvent::PasteFinished(Ok(())));
+                }
+                Ok(InsertOutcome::PendingClipboard(insertion)) => {
                     let flow = PasteFlow::begin(insertion, self);
                     self.pending_insertion = Some(flow);
                 }
@@ -969,7 +978,7 @@ mod tests {
                     (TimerKind::PasteCommand, 30) => {
                         self.events.borrow_mut().push("schedule_paste")
                     }
-                    (TimerKind::RestorePasteboard, 100) => {
+                    (TimerKind::RestorePasteboard, 1_000) => {
                         self.events.borrow_mut().push("schedule_restore")
                     }
                     _ => panic!("unexpected timer"),
