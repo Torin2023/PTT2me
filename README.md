@@ -1,30 +1,43 @@
 # PTT2me
 
 PTT2me is a minimal, fully local macOS menu-bar app: hold Fn/Globe, speak,
-release the key, and the recognized Russian text is pasted into the frontmost
-app. Recognition uses the bundled GigaAM v3 model; insertion preserves the
-previous pasteboard contents.
+release the key, and the recognized Russian text is inserted at the cursor's
+current location. Recognition uses the bundled GigaAM v3 model. Insertion
+prefers the focused Accessibility text field and preserves the previous
+pasteboard whenever compatibility requires Command-V fallback.
 
 ## Requirements and workflow
 
 - Apple Silicon (`arm64`) Mac
 - macOS 13 Ventura or newer
 
-PTT2me loads its fixed model at startup. When the status becomes `Готово`,
-hold Fn/Globe for at least 250 ms while speaking and release it. The app keeps
-recording for another 180 ms, recognizes the captured phrase, and pastes a
-non-empty result with Cmd+V. A capture ends automatically after 25 seconds.
+PTT2me loads its fixed model at startup. A short Fn/Globe press below 250 ms is
+replayed to macOS, so it remains available for the configured system action,
+including input-source switching. When the status becomes `Готово`, hold
+Fn/Globe for at least 250 ms while speaking and release it. The app keeps
+recording for another 180 ms, recognizes the captured phrase, and inserts a
+non-empty result into whichever editable field owns the cursor at that moment.
+A capture ends automatically after 25 seconds.
+
+Insertion first tries the focused field's Accessibility selected-text
+attribute, then direct Unicode keyboard events. If neither method is
+available, PTT2me temporarily uses the full macOS pasteboard and Command-V,
+then performs a guarded restore after one second. A newer pasteboard change is
+never overwritten.
 
 The menu contains exactly:
 
 ```text
 <status>
 PTT2me 1.0.3
+Открыть настройки…   (only while a required permission is missing)
 ────────────
 Выйти
 ```
 
-The status and version rows are informational; `Выйти` is the only command.
+The status and version rows are informational. While a permission is missing,
+`Открыть настройки…` opens its exact Privacy & Security pane and can be used
+repeatedly. `Выйти` terminates the app.
 
 ## Build
 
@@ -92,11 +105,19 @@ No model is fetched at build or runtime. Before publishing a DMG:
    forever.
 2. Launch the built app in a normal macOS user session and verify the fixed
    model reaches `Готово`.
-3. With Microphone, Input Monitoring, and Accessibility granted, hold and
-   release Fn/Globe in a text editor and verify recognition, Cmd+V insertion,
-   and restoration of a multi-item pasteboard.
-4. Revoke each permission in turn and verify the corresponding status and
-   recovery path.
+3. Put `CLIPBOARD-НЕ-ВСТАВЛЯТЬ` in the pasteboard and verify dictation in
+   ChatGPT, a native text view, HTML `input`, `textarea`, contenteditable,
+   Telegram, and Discord. The marker must never be inserted; the next manual
+   Command-V must still produce it.
+4. Verify rich text, an image, and a Finder file URL survive a fallback
+   insertion.
+5. Perform 20 short Fn/Globe presses and 20 long holds. Short presses must
+   perform the configured macOS action without ASR; long holds must run PTT
+   without the short system action.
+6. Revoke each permission in turn and verify the corresponding status,
+   repeatable `Открыть настройки…` action, and return to `Готово`.
+7. Move the cursor to another editable field during recognition and verify the
+   result is inserted at its final location.
 
 ## Permissions and launch
 
@@ -117,9 +138,10 @@ and guides their interactive setup.
 
 Audio and recognized text are processed locally. PTT2me does not save audio,
 transcripts, history, settings, or application data. Recognized text is used
-temporarily for insertion and is not retained by PTT2me; the previous macOS
-pasteboard contents are restored unless newer contents were copied during
-insertion.
+temporarily for insertion and is not retained by PTT2me. Direct Accessibility
+and Unicode insertion do not modify the pasteboard. The compatibility fallback
+restores every previous pasteboard item and representation unless newer
+contents were copied during insertion.
 
 ## Troubleshooting
 

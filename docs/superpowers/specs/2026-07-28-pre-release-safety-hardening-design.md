@@ -1,8 +1,8 @@
 # PTT2me Pre-release Safety Hardening Design
 
-**Date:** 2026-07-28  
-**Target release:** 1.0.3  
-**Status:** Approved product direction; written specification pending final review
+**Date:** 2026-07-28
+**Target release:** 1.0.3
+**Status:** Approved
 
 ## Goal
 
