@@ -27,6 +27,13 @@ Their license texts and required notices are bundled under
 - License: MIT
 - Included text: `licenses/SHERPA-RS-MIT.txt`
 
+## rtrb
+
+- Component: `rtrb` 0.3.4 realtime SPSC ring buffer
+- Project: <https://github.com/mgeier/rtrb>
+- License: MIT OR Apache-2.0; PTT2me redistributes it under the MIT option
+- Included text: `licenses/RTRB-MIT.txt`
+
 ## sherpa-onnx
 
 - Component: sherpa-onnx native C API runtime
