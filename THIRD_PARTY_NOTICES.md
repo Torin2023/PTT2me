@@ -1,6 +1,6 @@
 # Third-party notices
 
-PTT2me 1.0.0 redistributes the following model and native runtime components.
+PTT2me 1.0.2 redistributes the following model and native runtime components.
 Their license texts and required notices are bundled under
 `Contents/Resources/licenses/`.
 

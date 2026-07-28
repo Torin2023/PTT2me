@@ -106,4 +106,3 @@
 - [ ] Run `cargo build --release --target aarch64-apple-darwin`.
 - [ ] Inspect the full diff for accidental product-scope changes.
 - [ ] Record anything requiring the frozen model assets or manual TCC/Fn interaction as an explicit remaining release gate.
-

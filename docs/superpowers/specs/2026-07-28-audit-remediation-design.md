@@ -71,4 +71,3 @@ Hardware/TCC/Fn validation remains a documented manual release gate.
 - Model smoke exits with a distinct timeout status.
 - PR CI blocks formatting, test, Clippy, or dependency-audit failures.
 - All automated tests pass without AppKit background-thread warnings.
-

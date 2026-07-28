@@ -6,7 +6,12 @@ use std::sync::{
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::constants::{MAX_CAPTURE_MS, SAMPLE_RATE};
+use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS, SAMPLE_RATE};
+
+// The runtime still stops a capture at 25 seconds. Storage also covers the
+// release tail and delayed timer delivery so a valid near-limit capture is not
+// misclassified as overflow.
+const CAPTURE_BUFFER_MARGIN_MS: u64 = 1_000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AudioError {
@@ -254,7 +259,8 @@ fn capture_buffer(capacity: usize) -> (Producer<f32>, Consumer<f32>) {
 }
 
 fn capture_capacity(source_rate: u32) -> usize {
-    let frames = u64::from(source_rate) * MAX_CAPTURE_MS / 1_000;
+    let buffered_ms = MAX_CAPTURE_MS + RELEASE_GRACE_MS + CAPTURE_BUFFER_MARGIN_MS;
+    let frames = u64::from(source_rate) * buffered_ms / 1_000;
     usize::try_from(frames).unwrap_or(usize::MAX).max(1)
 }
 
@@ -383,9 +389,9 @@ mod tests {
     }
 
     #[test]
-    fn capture_capacity_covers_the_full_recording_limit() {
-        assert_eq!(capture_capacity(48_000), 1_200_000);
-        assert_eq!(capture_capacity(96_000), 2_400_000);
+    fn capture_capacity_covers_limit_release_grace_and_scheduling_margin() {
+        assert_eq!(capture_capacity(48_000), 1_256_640);
+        assert_eq!(capture_capacity(96_000), 2_513_280);
     }
 
     #[test]
