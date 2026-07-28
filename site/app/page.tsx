@@ -1,8 +1,7 @@
 const DOWNLOAD_URL =
-  "https://github.com/Torin2023/PTT2me/releases/download/v1.0.2/PTT2me-1.0.2-macos-arm64.dmg";
+  "https://github.com/Torin2023/PTT2me/releases/download/v1.0.3/PTT2me-1.0.3-macos-arm64.dmg";
 const REPOSITORY_URL = "https://github.com/Torin2023/PTT2me";
-const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.0.2`;
-const CHECKSUM_URL = `${DOWNLOAD_URL}.sha256`;
+const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.0.3`;
 
 const steps = [
   ["01", "Удерживайте", "Нажмите и удерживайте Fn или Globe."],
@@ -41,6 +40,7 @@ export default function Home() {
           <p className="eyebrow">
             <span aria-hidden="true" />
             Локальная диктовка для macOS
+            <span className="preview-badge">Preview 1.0.3</span>
           </p>
           <h1>
             Говорите —
@@ -49,11 +49,12 @@ export default function Home() {
           </h1>
           <p className="lede">
             Удерживайте Fn, говорите по-русски и отпускайте. PTT2me распознает
-            речь прямо на вашем Mac и вставит текст в активное приложение.
+            речь прямо на вашем Mac и вставит результат в поле, где находится
+            курсор к моменту завершения распознавания.
           </p>
           <div className="hero-actions">
             <a className="button" href={DOWNLOAD_URL}>
-              Скачать PTT2me 1.0.2
+              Скачать PTT2me 1.0.3
               <span aria-hidden="true">↘</span>
             </a>
             <a className="text-link" href={REPOSITORY_URL}>
@@ -115,12 +116,15 @@ export default function Home() {
         <article>
           <span>02</span>
           <h2>Одна клавиша</h2>
-          <p>Никаких окон: удерживайте Fn или Globe.</p>
+          <p>
+            Короткое нажатие сохраняет системное действие, удержание запускает
+            диктовку.
+          </p>
         </article>
         <article>
           <span>03</span>
-          <h2>В любом приложении</h2>
-          <p>Готовый текст вставляется туда, где находится курсор.</p>
+          <h2>Точно в курсор</h2>
+          <p>Результат получает поле, которое активно после распознавания.</p>
         </article>
       </section>
 
@@ -144,7 +148,8 @@ export default function Home() {
         <p className="fine-print">
           Минимальное удержание — 250 мс. После отпускания PTT2me оставляет
           180 мс, чтобы не обрезать окончание фразы. Максимальная запись —
-          25 секунд.
+          25 секунд. Короткое нажатие возвращается macOS и сохраняет настроенное
+          системное действие.
         </p>
       </section>
 
@@ -158,9 +163,11 @@ export default function Home() {
           <p className="eyebrow">Ваши слова остаются вашими</p>
           <h2>Распознавание без отправки в интернет.</h2>
           <p>
-            PTT2me не сохраняет аудио, расшифровки, историю, настройки или
-            данные приложения. Буфер обмена восстанавливается после вставки,
-            если вы не скопировали что-то новое.
+            PTT2me сначала вставляет текст напрямую через Accessibility или
+            Unicode — эти способы не меняют буфер обмена. Если приложению нужен
+            совместимый Command-V fallback, PTT2me восстанавливает все прежние
+            элементы и форматы буфера и никогда не перезаписывает более новые
+            изменения.
           </p>
           <div className="privacy-facts" aria-label="Факты о приватности">
             <span>Нет аккаунта</span>
@@ -204,15 +211,19 @@ export default function Home() {
             </div>
           </article>
         </div>
+        <p className="permission-note">
+          Если разрешения не хватает, «Открыть настройки…» повторно открывает
+          соответствующий раздел «Конфиденциальность и безопасность».
+        </p>
       </section>
 
       <section className="section install" id="install">
         <div className="install-copy">
-          <p className="eyebrow">PTT2me 1.0.2</p>
+          <p className="eyebrow">PTT2me Preview 1.0.3</p>
           <h2>Готовы говорить?</h2>
           <p>Для Mac с Apple Silicon и macOS 13 Ventura или новее.</p>
           <a className="button" href={DOWNLOAD_URL}>
-            Скачать DMG · 182 МБ
+            Скачать Preview DMG · 182 МБ
             <span aria-hidden="true">↘</span>
           </a>
         </div>
@@ -248,12 +259,11 @@ export default function Home() {
         <p>
           SHA-256{" "}
           <code>
-            1119711c9fee89218d816fb9eb4a03c138c790a51b3a0792970f0c6c17016f53
+            513ddace2ca4b8d8bc9f9e5da099cc238ea6476f559d376605b80c76a267e2f4
           </code>
         </p>
         <div>
-          <a href={CHECKSUM_URL}>Checksum</a>
-          <a href={RELEASE_URL}>Релиз 1.0.2</a>
+          <a href={RELEASE_URL}>Preview-релиз 1.0.3</a>
           <a href={REPOSITORY_URL}>GitHub</a>
         </div>
       </footer>

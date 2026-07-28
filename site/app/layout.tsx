@@ -23,13 +23,13 @@ export async function generateMetadata(): Promise<Metadata> {
     metadataBase: new URL(origin),
     title: "PTT2me — локальная диктовка для macOS",
     description:
-      "Удерживайте Fn, говорите по-русски и вставляйте распознанный текст в любое приложение. Полностью локально на Apple Silicon.",
+      "Удерживайте Fn, говорите по-русски и вставляйте результат в поле, где находится курсор. Полностью локально на Apple Silicon.",
     openGraph: {
       type: "website",
       locale: "ru_RU",
       title: "PTT2me — локальная диктовка для macOS",
       description:
-        "Говорите — текст уже там. Полностью локальная диктовка на вашем Mac.",
+        "Удерживайте Fn, говорите по-русски и вставляйте результат в поле, где находится курсор. Полностью локально на Apple Silicon.",
       images: [
         {
           url: "/og.png",
@@ -43,7 +43,7 @@ export async function generateMetadata(): Promise<Metadata> {
       card: "summary_large_image",
       title: "PTT2me — локальная диктовка для macOS",
       description:
-        "Говорите — текст уже там. Полностью локальная диктовка на вашем Mac.",
+        "Удерживайте Fn, говорите по-русски и вставляйте результат в поле, где находится курсор. Полностью локально на Apple Silicon.",
       images: ["/og.png"],
     },
     icons: {
