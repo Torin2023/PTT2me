@@ -3,9 +3,10 @@ use std::marker::PhantomPinned;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::process::{Child, Command};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread::JoinHandle;
-use std::time::Instant;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use core_foundation::date::CFDate;
 use core_foundation::runloop::{
@@ -30,6 +31,9 @@ use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapsho
 
 const EVENT_DRAIN_MS: u64 = 50;
 const PERMISSION_POLL_MS: u64 = 1_000;
+const SMOKE_MODEL_TIMEOUT: Duration = Duration::from_secs(180);
+const SMOKE_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SMOKE_TIMEOUT_EXIT_CODE: i32 = 124;
 
 struct MicrophonePermissionRuntime {
     flow: MicrophonePermissionFlow,
@@ -741,8 +745,21 @@ fn bundled_model_paths_from_executable(executable: PathBuf) -> Result<ModelPaths
     ModelPaths::from_resources(&resources)
 }
 
-/// Loads the embedded model once and returns a shell-compatible smoke status.
+/// Starts a bounded child process that initializes the embedded model.
 pub fn smoke_bundled_model() -> i32 {
+    let Ok(executable) = std::env::current_exe() else {
+        tracing::error!(error_category = "current_executable");
+        return 1;
+    };
+    let Ok(mut child) = Command::new(executable).arg("--smoke-model-child").spawn() else {
+        tracing::error!(error_category = "model_smoke_spawn");
+        return 1;
+    };
+    wait_for_smoke_child(&mut child, SMOKE_MODEL_TIMEOUT)
+}
+
+/// Initializes the embedded model inside the watchdog child process.
+pub fn smoke_bundled_model_child() -> i32 {
     let Ok(paths) = bundled_model_paths() else {
         tracing::error!(error_category = "model_resources");
         return 1;
@@ -764,13 +781,37 @@ pub fn smoke_bundled_model() -> i32 {
     }
 }
 
+fn wait_for_smoke_child(child: &mut Child, timeout: Duration) -> i32 {
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code().unwrap_or(1),
+            Ok(None) => {}
+            Err(_) => {
+                tracing::error!(error_category = "model_smoke_wait");
+                let _ = child.kill();
+                let _ = child.wait();
+                return 1;
+            }
+        }
+
+        if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+            tracing::error!(error_category = "model_load_timeout");
+            let _ = child.kill();
+            let _ = child.wait();
+            return SMOKE_TIMEOUT_EXIT_CODE;
+        }
+        thread::sleep(SMOKE_CHILD_POLL_INTERVAL);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
     use super::{
-        held_millis, milliseconds_to_seconds, status_name, DeferredTapState,
+        held_millis, milliseconds_to_seconds, status_name, wait_for_smoke_child, DeferredTapState,
         MicrophonePermissionRuntime, TapState, EVENT_DRAIN_MS, PERMISSION_POLL_MS,
     };
     use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
@@ -819,6 +860,32 @@ mod tests {
         let released_at = pressed_at + std::time::Duration::from_millis(900);
 
         assert_eq!(held_millis(pressed_at, released_at), 900);
+    }
+
+    #[test]
+    fn smoke_watchdog_returns_child_exit_code() {
+        let mut child = std::process::Command::new("/usr/bin/false")
+            .spawn()
+            .unwrap();
+
+        assert_eq!(
+            wait_for_smoke_child(&mut child, std::time::Duration::from_secs(1)),
+            1
+        );
+    }
+
+    #[test]
+    fn smoke_watchdog_terminates_a_hung_child() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+
+        assert_eq!(
+            wait_for_smoke_child(&mut child, std::time::Duration::from_millis(10)),
+            124
+        );
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[test]

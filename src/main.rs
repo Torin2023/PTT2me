@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::MainThreadMarker;
 use ptt2me::permissions::prime_microphone_and_exit;
-use ptt2me::runtime::{smoke_bundled_model, Runtime};
+use ptt2me::runtime::{smoke_bundled_model, smoke_bundled_model_child, Runtime};
 use ptt2me::single_instance::InstanceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +11,7 @@ enum LaunchMode {
     App,
     PrimeMicrophone,
     SmokeModel,
+    SmokeModelChild,
 }
 
 fn main() -> ExitCode {
@@ -26,6 +27,9 @@ fn main() -> ExitCode {
         }
         LaunchMode::SmokeModel => {
             return ExitCode::from(smoke_bundled_model() as u8);
+        }
+        LaunchMode::SmokeModelChild => {
+            return ExitCode::from(smoke_bundled_model_child() as u8);
         }
         LaunchMode::App => {}
     }
@@ -56,6 +60,7 @@ fn parse_launch_mode(
         [] => Ok(LaunchMode::App),
         [argument] if argument == "--prime-microphone-and-exit" => Ok(LaunchMode::PrimeMicrophone),
         [argument] if argument == "--smoke-model" => Ok(LaunchMode::SmokeModel),
+        [argument] if argument == "--smoke-model-child" => Ok(LaunchMode::SmokeModelChild),
         _ => Err(()),
     }
 }
@@ -75,7 +80,7 @@ mod tests {
     use objc2_app_kit::NSApplicationActivationPolicy;
 
     #[test]
-    fn recognizes_only_the_two_hidden_modes() {
+    fn recognizes_only_the_hidden_modes() {
         assert_eq!(parse_launch_mode(Vec::new()), Ok(LaunchMode::App));
         assert_eq!(
             parse_launch_mode([OsString::from("--prime-microphone-and-exit")]),
@@ -84,6 +89,10 @@ mod tests {
         assert_eq!(
             parse_launch_mode([OsString::from("--smoke-model")]),
             Ok(LaunchMode::SmokeModel)
+        );
+        assert_eq!(
+            parse_launch_mode([OsString::from("--smoke-model-child")]),
+            Ok(LaunchMode::SmokeModelChild)
         );
     }
 
