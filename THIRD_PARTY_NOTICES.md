@@ -1,6 +1,6 @@
 # Third-party notices
 
-PTT2me 1.0.0 redistributes the following model and native runtime components.
+PTT2me 1.0.3 redistributes the following model and native runtime components.
 Their license texts and required notices are bundled under
 `Contents/Resources/licenses/`.
 
@@ -26,6 +26,13 @@ Their license texts and required notices are bundled under
   <https://github.com/thewh1teagle/sherpa-rs/blob/main/LICENSE>
 - License: MIT
 - Included text: `licenses/SHERPA-RS-MIT.txt`
+
+## rtrb
+
+- Component: `rtrb` 0.3.4 realtime SPSC ring buffer
+- Project: <https://github.com/mgeier/rtrb>
+- License: MIT OR Apache-2.0; PTT2me redistributes it under the MIT option
+- Included text: `licenses/RTRB-MIT.txt`
 
 ## sherpa-onnx
 

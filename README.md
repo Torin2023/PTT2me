@@ -1,30 +1,43 @@
 # PTT2me
 
 PTT2me is a minimal, fully local macOS menu-bar app: hold Fn/Globe, speak,
-release the key, and the recognized Russian text is pasted into the frontmost
-app. Recognition uses the bundled GigaAM v3 model; insertion preserves the
-previous pasteboard contents.
+release the key, and the recognized Russian text is inserted at the cursor's
+current location. Recognition uses the bundled GigaAM v3 model. Insertion
+prefers the focused Accessibility text field and preserves the previous
+pasteboard whenever compatibility requires Command-V fallback.
 
 ## Requirements and workflow
 
 - Apple Silicon (`arm64`) Mac
 - macOS 13 Ventura or newer
 
-PTT2me loads its fixed model at startup. When the status becomes `Готово`,
-hold Fn/Globe for at least 250 ms while speaking and release it. The app keeps
-recording for another 180 ms, recognizes the captured phrase, and pastes a
-non-empty result with Cmd+V. A capture ends automatically after 25 seconds.
+PTT2me loads its fixed model at startup. A short Fn/Globe press below 250 ms is
+replayed to macOS, so it remains available for the configured system action,
+including input-source switching. When the status becomes `Готово`, hold
+Fn/Globe for at least 250 ms while speaking and release it. The app keeps
+recording for another 180 ms, recognizes the captured phrase, and inserts a
+non-empty result into whichever editable field owns the cursor at that moment.
+A capture ends automatically after 25 seconds.
+
+Insertion first tries the focused field's Accessibility selected-text
+attribute, then direct Unicode keyboard events. If neither method is
+available, PTT2me temporarily uses the full macOS pasteboard and Command-V,
+then performs a guarded restore after one second. A newer pasteboard change is
+never overwritten.
 
 The menu contains exactly:
 
 ```text
 <status>
-PTT2me 1.0.0
+PTT2me 1.0.3
+Открыть настройки…   (only while a required permission is missing)
 ────────────
 Выйти
 ```
 
-The status and version rows are informational; `Выйти` is the only command.
+The status and version rows are informational. While a permission is missing,
+`Открыть настройки…` opens its exact Privacy & Security pane and can be used
+repeatedly. `Выйти` terminates the app.
 
 ## Build
 
@@ -48,6 +61,24 @@ The script builds only `aarch64-apple-darwin`, obtains the two native runtime
 libraries from the Cargo release output, and creates the self-contained
 `dist/PTT2me.app`.
 
+## Automated checks
+
+Pull requests and pushes to `main` run on an Apple Silicon macOS runner. The
+workflow checks formatting, runs all unit and integration tests (including the
+main-thread NSPasteboard round trip), denies Clippy warnings, and audits locked
+Rust dependencies:
+
+```bash
+cargo fmt --all -- --check
+cargo test --all-targets --features test-support -- --test-threads=1
+cargo clippy --all-targets --features test-support -- -D warnings
+cargo audit --deny warnings
+```
+
+These checks compile and test the program; they do not download or substitute
+an ASR model. PTT2me has one fixed GigaAM v3 RNNT model, supplied as frozen
+build assets and embedded in the application bundle.
+
 ## Local DMG release
 
 To rebuild the app and create a local Apple Silicon DMG, run:
@@ -56,7 +87,7 @@ To rebuild the app and create a local Apple Silicon DMG, run:
 scripts/build-dmg.sh
 ```
 
-The command creates `dist/PTT2me-1.0.2-macos-arm64.dmg` and its
+The command creates `dist/PTT2me-1.0.3-macos-arm64.dmg` and its
 `.sha256` checksum. The image contains `PTT2me.app` and an `Applications`
 link for drag-and-drop installation. It uses ad-hoc signing and is not
 notarized for public distribution.
@@ -64,6 +95,29 @@ notarized for public distribution.
 Before each new release, explicitly bump the package version in `Cargo.toml`
 and synchronize `Cargo.lock` with Cargo. Rebuilding an existing release does
 not change its version automatically.
+
+The release gate runs on a controlled Apple Silicon Mac where the four frozen
+model files have already been provisioned in `vendor/models/gigaam-v3-rnnt/`.
+No model is fetched at build or runtime. Before publishing a DMG:
+
+1. Run `scripts/build-dmg.sh`; its bundle check initializes the model embedded
+   in the generated `PTT2me.app` and fails after 180 seconds instead of waiting
+   forever.
+2. Launch the built app in a normal macOS user session and verify the fixed
+   model reaches `Готово`.
+3. Put `CLIPBOARD-НЕ-ВСТАВЛЯТЬ` in the pasteboard and verify dictation in
+   ChatGPT, a native text view, HTML `input`, `textarea`, contenteditable,
+   Telegram, and Discord. The marker must never be inserted; the next manual
+   Command-V must still produce it.
+4. Verify rich text, an image, and a Finder file URL survive a fallback
+   insertion.
+5. Perform 20 short Fn/Globe presses and 20 long holds. Short presses must
+   perform the configured macOS action without ASR; long holds must run PTT
+   without the short system action.
+6. Revoke each permission in turn and verify the corresponding status,
+   repeatable `Открыть настройки…` action, and return to `Готово`.
+7. Move the cursor to another editable field during recognition and verify the
+   result is inserted at its final location.
 
 ## Permissions and launch
 
@@ -84,9 +138,10 @@ and guides their interactive setup.
 
 Audio and recognized text are processed locally. PTT2me does not save audio,
 transcripts, history, settings, or application data. Recognized text is used
-temporarily for insertion and is not retained by PTT2me; the previous macOS
-pasteboard contents are restored unless newer contents were copied during
-insertion.
+temporarily for insertion and is not retained by PTT2me. Direct Accessibility
+and Unicode insertion do not modify the pasteboard. The compatibility fallback
+restores every previous pasteboard item and representation unless newer
+contents were copied during insertion.
 
 ## Troubleshooting
 

@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::ptr::NonNull;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use objc2::{
     declare_class, msg_send, msg_send_id, mutability, rc::Retained, runtime::AnyClass,
@@ -24,6 +26,30 @@ pub struct MenuProjection {
     pub symbol: &'static str,
     pub pulse: bool,
     pub style: SymbolStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PermissionActionProjection {
+    visible: bool,
+    enabled: bool,
+    permission: Option<PermissionKind>,
+}
+
+impl PermissionActionProjection {
+    const fn from_status(status: &AppStatus) -> Self {
+        match status {
+            AppStatus::PermissionBlocked(permission) => Self {
+                visible: true,
+                enabled: true,
+                permission: Some(*permission),
+            },
+            _ => Self {
+                visible: false,
+                enabled: false,
+                permission: None,
+            },
+        }
+    }
 }
 
 impl MenuProjection {
@@ -95,19 +121,31 @@ const fn permission_title(permission: PermissionKind) -> &'static str {
 pub enum MenuEntry {
     Status,
     Version,
+    PermissionSettings,
     Separator,
     Quit,
 }
 
-pub const MENU_DESCRIPTOR: [MenuEntry; 4] = [
+pub const MENU_DESCRIPTOR: [MenuEntry; 5] = [
     MenuEntry::Status,
     MenuEntry::Version,
+    MenuEntry::PermissionSettings,
     MenuEntry::Separator,
     MenuEntry::Quit,
 ];
 
 fn symbol_style(projection: &MenuProjection) -> SymbolStyle {
     projection.style
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuAction {
+    OpenPermission(PermissionKind),
+}
+
+struct MenuTargetIvars {
+    action_sender: Sender<MenuAction>,
+    permission: Cell<Option<PermissionKind>>,
 }
 
 declare_class!(
@@ -123,7 +161,7 @@ declare_class!(
     }
 
     impl DeclaredClass for MenuTarget {
-        type Ivars = ();
+        type Ivars = MenuTargetIvars;
     }
 
     unsafe impl NSObjectProtocol for MenuTarget {}
@@ -136,12 +174,25 @@ declare_class!(
             let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
             unsafe { app.terminate(Some(sender)) };
         }
+
+        #[method(openPermissionSettings:)]
+        fn open_permission_settings(&self, _sender: &AnyObject) {
+            if let Some(permission) = self.ivars().permission.get() {
+                let _ = self
+                    .ivars()
+                    .action_sender
+                    .send(MenuAction::OpenPermission(permission));
+            }
+        }
     }
 );
 
 impl MenuTarget {
-    fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = mtm.alloc().set_ivars(());
+    fn new(mtm: MainThreadMarker, action_sender: Sender<MenuAction>) -> Retained<Self> {
+        let this = mtm.alloc().set_ivars(MenuTargetIvars {
+            action_sender,
+            permission: Cell::new(None),
+        });
         unsafe { msg_send_id![super(this), init] }
     }
 }
@@ -153,8 +204,10 @@ pub struct MenuBar {
     _status_item: Retained<NSStatusItem>,
     _menu: Retained<NSMenu>,
     status_row: Retained<NSMenuItem>,
+    permission_row: Retained<NSMenuItem>,
     button: Retained<NSStatusBarButton>,
     _target: Retained<MenuTarget>,
+    action_receiver: Receiver<MenuAction>,
     pulse_active: bool,
 }
 
@@ -167,11 +220,13 @@ impl MenuBar {
     /// provide a button for its newly-created status item.
     pub fn new() -> Self {
         let mtm = main_thread_marker();
-        let target = MenuTarget::new(mtm);
+        let (action_sender, action_receiver) = mpsc::channel();
+        let target = MenuTarget::new(mtm, action_sender);
         let menu = unsafe { NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("PTT2me")) };
         unsafe { menu.setAutoenablesItems(false) };
 
         let mut status_row = None;
+        let mut permission_row = None;
         for entry in MENU_DESCRIPTOR {
             match entry {
                 MenuEntry::Status => {
@@ -184,6 +239,20 @@ impl MenuBar {
                     let item = menu_item(mtm, concat!("PTT2me ", env!("CARGO_PKG_VERSION")), None);
                     unsafe { item.setEnabled(false) };
                     menu.addItem(&item);
+                }
+                MenuEntry::PermissionSettings => {
+                    let item = menu_item(
+                        mtm,
+                        "Открыть настройки…",
+                        Some(sel!(openPermissionSettings:)),
+                    );
+                    unsafe {
+                        item.setTarget(Some(&target));
+                        item.setEnabled(false);
+                        item.setHidden(true);
+                    }
+                    menu.addItem(&item);
+                    permission_row = Some(item);
                 }
                 MenuEntry::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
                 MenuEntry::Quit => {
@@ -214,8 +283,11 @@ impl MenuBar {
             _status_item: status_item,
             _menu: menu,
             status_row: status_row.expect("menu descriptor must contain the status row"),
+            permission_row: permission_row
+                .expect("menu descriptor must contain the permission action row"),
             button,
             _target: target,
+            action_receiver,
             pulse_active: false,
         };
         menu_bar.render(&AppStatus::Starting);
@@ -230,10 +302,17 @@ impl MenuBar {
         let _mtm = main_thread_marker();
 
         let projection = MenuProjection::from_status(status);
+        let permission_action = PermissionActionProjection::from_status(status);
         unsafe {
             self.status_row
                 .setTitle(&NSString::from_str(&projection.title));
+            self.permission_row.setHidden(!permission_action.visible);
+            self.permission_row.setEnabled(permission_action.enabled);
         }
+        self._target
+            .ivars()
+            .permission
+            .set(permission_action.permission);
 
         if let Some(image) = system_symbol(&projection) {
             unsafe { self.button.setImage(Some(&image)) };
@@ -243,6 +322,10 @@ impl MenuBar {
             set_recognition_pulse(&self.button, projection.pulse);
             self.pulse_active = projection.pulse;
         }
+    }
+
+    pub(crate) fn take_action(&self) -> Option<MenuAction> {
+        self.action_receiver.try_recv().ok()
     }
 }
 
@@ -466,16 +549,43 @@ mod tests {
     }
 
     #[test]
-    fn menu_descriptor_contains_only_the_four_approved_entries() {
+    fn menu_descriptor_contains_the_five_approved_entries() {
         assert_eq!(
             MENU_DESCRIPTOR,
             [
                 MenuEntry::Status,
                 MenuEntry::Version,
+                MenuEntry::PermissionSettings,
                 MenuEntry::Separator,
                 MenuEntry::Quit,
             ]
         );
+    }
+
+    #[test]
+    fn permission_action_tracks_the_current_missing_permission() {
+        assert_eq!(
+            PermissionActionProjection::from_status(&AppStatus::Ready),
+            PermissionActionProjection {
+                visible: false,
+                enabled: false,
+                permission: None,
+            }
+        );
+        for permission in [
+            PermissionKind::Accessibility,
+            PermissionKind::InputMonitoring,
+            PermissionKind::Microphone,
+        ] {
+            assert_eq!(
+                PermissionActionProjection::from_status(&AppStatus::PermissionBlocked(permission)),
+                PermissionActionProjection {
+                    visible: true,
+                    enabled: true,
+                    permission: Some(permission),
+                }
+            );
+        }
     }
 
     #[test]

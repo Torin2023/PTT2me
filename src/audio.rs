@@ -1,9 +1,17 @@
-use std::mem;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::constants::SAMPLE_RATE;
+use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS, SAMPLE_RATE};
+
+// The runtime still stops a capture at 25 seconds. Storage also covers the
+// release tail and delayed timer delivery so a valid near-limit capture is not
+// misclassified as overflow.
+const CAPTURE_BUFFER_MARGIN_MS: u64 = 1_000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AudioError {
@@ -14,71 +22,55 @@ pub enum AudioError {
     StartStream(String),
     UnsupportedSampleFormat,
     StreamCallbackFailed,
-}
-
-#[derive(Default)]
-struct CallbackFailureState {
-    next_generation: u64,
-    active_generation: Option<u64>,
-    failed_generation: Option<u64>,
+    BufferOverflow,
 }
 
 #[derive(Default)]
 struct CallbackFailures {
-    state: Mutex<CallbackFailureState>,
+    next_generation: AtomicU64,
+    active_generation: AtomicU64,
+    failed_generation: AtomicU64,
 }
 
 impl CallbackFailures {
     fn begin(&self) -> u64 {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.next_generation = state.next_generation.wrapping_add(1).max(1);
-        let generation = state.next_generation;
-        state.active_generation = Some(generation);
-        state.failed_generation = None;
+        let generation = self
+            .next_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+            .max(1);
+        self.failed_generation.store(0, Ordering::Release);
+        self.active_generation.store(generation, Ordering::Release);
         generation
     }
 
     fn report(&self, generation: u64) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.active_generation == Some(generation) {
-            state.failed_generation = Some(generation);
+        if self.active_generation.load(Ordering::Acquire) == generation {
+            self.failed_generation.store(generation, Ordering::Release);
         }
     }
 
     fn finish(&self, generation: u64) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let failed = state.active_generation == Some(generation)
-            && state.failed_generation == Some(generation);
-        if state.active_generation == Some(generation) {
-            state.active_generation = None;
-        }
-        if state.failed_generation == Some(generation) {
-            state.failed_generation = None;
-        }
-        failed
+        let active = self.active_generation.swap(0, Ordering::AcqRel);
+        let failed = self.failed_generation.swap(0, Ordering::AcqRel);
+        active == generation && failed == generation
     }
 }
 
 /// A short-lived microphone capture. It must stay on the AppKit main thread,
 /// where its `cpal::Stream` is created and dropped.
 pub struct AudioRecorder {
-    samples: Arc<Mutex<Vec<f32>>>,
+    consumer: Option<Consumer<f32>>,
     stream: Option<cpal::Stream>,
     source_rate: u32,
     active: bool,
     active_generation: Option<u64>,
     callback_failures: Arc<CallbackFailures>,
+    overflowed: Arc<AtomicBool>,
     #[cfg(test)]
     test_input: Option<TestInput>,
+    #[cfg(test)]
+    test_capacity: Option<usize>,
 }
 
 #[cfg(test)]
@@ -91,14 +83,17 @@ struct TestInput {
 impl AudioRecorder {
     pub fn new() -> Self {
         Self {
-            samples: Arc::new(Mutex::new(Vec::new())),
+            consumer: None,
             stream: None,
             source_rate: SAMPLE_RATE,
             active: false,
             active_generation: None,
             callback_failures: Arc::new(CallbackFailures::default()),
+            overflowed: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_input: None,
+            #[cfg(test)]
+            test_capacity: None,
         }
     }
 
@@ -108,10 +103,22 @@ impl AudioRecorder {
         }
         let generation = self.callback_failures.begin();
         self.active_generation = Some(generation);
+        self.overflowed.store(false, Ordering::Release);
 
         #[cfg(test)]
         if let Some(input) = &self.test_input {
-            self.replace_samples(downmix(&input.frames, input.channels));
+            let capacity = self
+                .test_capacity
+                .unwrap_or_else(|| capture_capacity(input.sample_rate));
+            let (mut producer, consumer) = capture_buffer(capacity);
+            append_frames(
+                &mut producer,
+                &input.frames,
+                input.channels,
+                |sample| sample,
+                &self.overflowed,
+            );
+            self.consumer = Some(consumer);
             self.source_rate = input.sample_rate;
             self.active = true;
             return Ok(());
@@ -127,49 +134,34 @@ impl AudioRecorder {
             let sample_format = supported_config.sample_format();
             let config: cpal::StreamConfig = supported_config.into();
 
-            self.replace_samples(Vec::new());
+            self.consumer = None;
             self.source_rate = config.sample_rate.0;
             let channels = config.channels;
-            let callback_samples = Arc::clone(&self.samples);
-            let callback_failures = Arc::clone(&self.callback_failures);
-            let error_callback = move |_error| {
-                callback_failures.report(generation);
-                tracing::warn!(error_category = "microphone_stream_callback");
-            };
+            let capacity = capture_capacity(self.source_rate);
 
-            let stream = match sample_format {
-                cpal::SampleFormat::F32 => device.build_input_stream(
-                    &config,
-                    move |data: &[f32], _| {
-                        append_frames(&callback_samples, data, channels, |sample| sample)
-                    },
-                    error_callback,
-                    None,
-                ),
-                cpal::SampleFormat::I16 => device.build_input_stream(
-                    &config,
-                    move |data: &[i16], _| {
-                        append_frames(&callback_samples, data, channels, normalize_i16)
-                    },
-                    error_callback,
-                    None,
-                ),
-                cpal::SampleFormat::U16 => device.build_input_stream(
-                    &config,
-                    move |data: &[u16], _| {
-                        append_frames(&callback_samples, data, channels, normalize_u16)
-                    },
-                    error_callback,
-                    None,
-                ),
-                cpal::SampleFormat::F64 => device.build_input_stream(
-                    &config,
-                    move |data: &[f64], _| {
-                        append_frames(&callback_samples, data, channels, |sample| sample as f32)
-                    },
-                    error_callback,
-                    None,
-                ),
+            let context = || CaptureStreamContext {
+                channels,
+                overflowed: Arc::clone(&self.overflowed),
+                callback_failures: Arc::clone(&self.callback_failures),
+                generation,
+            };
+            let (stream, consumer) = match sample_format {
+                cpal::SampleFormat::F32 => {
+                    build_capture_stream(&device, &config, capacity, context(), |sample: f32| {
+                        sample
+                    })
+                }
+                cpal::SampleFormat::I16 => {
+                    build_capture_stream(&device, &config, capacity, context(), normalize_i16)
+                }
+                cpal::SampleFormat::U16 => {
+                    build_capture_stream(&device, &config, capacity, context(), normalize_u16)
+                }
+                cpal::SampleFormat::F64 => {
+                    build_capture_stream(&device, &config, capacity, context(), |sample: f64| {
+                        sample as f32
+                    })
+                }
                 _ => return Err(AudioError::UnsupportedSampleFormat),
             }
             .map_err(|error| AudioError::BuildStream(error.to_string()))?;
@@ -177,6 +169,7 @@ impl AudioRecorder {
             stream
                 .play()
                 .map_err(|error| AudioError::StartStream(error.to_string()))?;
+            self.consumer = Some(consumer);
             self.stream = Some(stream);
             self.active = true;
             Ok(())
@@ -185,6 +178,7 @@ impl AudioRecorder {
         if result.is_err() {
             self.active_generation = None;
             self.callback_failures.finish(generation);
+            self.consumer = None;
         }
         result
     }
@@ -196,9 +190,13 @@ impl AudioRecorder {
             .active_generation
             .take()
             .is_some_and(|generation| self.callback_failures.finish(generation));
+        let overflowed = self.overflowed.swap(false, Ordering::AcqRel);
         let samples = self.take_samples();
         if callback_failed {
             return Err(AudioError::StreamCallbackFailed);
+        }
+        if overflowed {
+            return Err(AudioError::BufferOverflow);
         }
         Ok(prepare_capture(samples, self.source_rate))
     }
@@ -209,20 +207,19 @@ impl AudioRecorder {
         if let Some(generation) = self.active_generation.take() {
             self.callback_failures.finish(generation);
         }
-        self.replace_samples(Vec::new());
+        self.consumer = None;
+        self.overflowed.store(false, Ordering::Release);
     }
 
-    fn replace_samples(&self, samples: Vec<f32>) {
-        if let Ok(mut stored) = self.samples.lock() {
-            *stored = samples;
+    fn take_samples(&mut self) -> Vec<f32> {
+        let Some(mut consumer) = self.consumer.take() else {
+            return Vec::new();
+        };
+        let mut samples = Vec::with_capacity(consumer.slots());
+        while let Ok(sample) = consumer.pop() {
+            samples.push(sample);
         }
-    }
-
-    fn take_samples(&self) -> Vec<f32> {
-        self.samples
-            .lock()
-            .map(|mut samples| mem::take(&mut *samples))
-            .unwrap_or_default()
+        samples
     }
 
     #[cfg(test)]
@@ -236,6 +233,19 @@ impl AudioRecorder {
             ..Self::new()
         }
     }
+
+    #[cfg(test)]
+    fn with_test_frames_and_capacity(
+        frames: Vec<f32>,
+        sample_rate: u32,
+        channels: u16,
+        capacity: usize,
+    ) -> Self {
+        Self {
+            test_capacity: Some(capacity),
+            ..Self::with_test_frames(frames, sample_rate, channels)
+        }
+    }
 }
 
 impl Default for AudioRecorder {
@@ -244,11 +254,56 @@ impl Default for AudioRecorder {
     }
 }
 
+fn capture_buffer(capacity: usize) -> (Producer<f32>, Consumer<f32>) {
+    RingBuffer::new(capacity.max(1))
+}
+
+fn capture_capacity(source_rate: u32) -> usize {
+    let buffered_ms = MAX_CAPTURE_MS + RELEASE_GRACE_MS + CAPTURE_BUFFER_MARGIN_MS;
+    let frames = u64::from(source_rate) * buffered_ms / 1_000;
+    usize::try_from(frames).unwrap_or(usize::MAX).max(1)
+}
+
+struct CaptureStreamContext {
+    channels: u16,
+    overflowed: Arc<AtomicBool>,
+    callback_failures: Arc<CallbackFailures>,
+    generation: u64,
+}
+
+fn build_capture_stream<T, F>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    capacity: usize,
+    context: CaptureStreamContext,
+    convert: F,
+) -> Result<(cpal::Stream, Consumer<f32>), cpal::BuildStreamError>
+where
+    T: cpal::SizedSample + Copy,
+    F: Fn(T) -> f32 + Copy + Send + 'static,
+{
+    let (mut producer, consumer) = capture_buffer(capacity);
+    let channels = context.channels;
+    let overflowed = context.overflowed;
+    let callback_failures = context.callback_failures;
+    let generation = context.generation;
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[T], _| {
+            append_frames(&mut producer, data, channels, convert, &overflowed);
+        },
+        move |_error| callback_failures.report(generation),
+        None,
+    )?;
+    Ok((stream, consumer))
+}
+
 fn append_frames<T>(
-    destination: &Arc<Mutex<Vec<f32>>>,
+    destination: &mut Producer<f32>,
     data: &[T],
     channels: u16,
     convert: impl Fn(T) -> f32,
+    overflowed: &AtomicBool,
 ) where
     T: Copy,
 {
@@ -257,10 +312,12 @@ fn append_frames<T>(
         return;
     }
 
-    let converted = data.iter().copied().map(convert).collect::<Vec<_>>();
-    let mono = downmix(&converted, channels as u16);
-    if let Ok(mut samples) = destination.lock() {
-        samples.extend(mono);
+    for frame in data.chunks_exact(channels) {
+        let mono = frame.iter().copied().map(&convert).sum::<f32>() / channels as f32;
+        if destination.push(mono).is_err() {
+            overflowed.store(true, Ordering::Release);
+            return;
+        }
     }
 }
 
@@ -280,18 +337,6 @@ fn normalize_u16(sample: u16) -> f32 {
     } else {
         (sample - MIDPOINT) as f32 / (u16::MAX - MIDPOINT) as f32
     }
-}
-
-fn downmix(samples: &[f32], channels: u16) -> Vec<f32> {
-    let channels = usize::from(channels);
-    if channels == 0 {
-        return Vec::new();
-    }
-
-    samples
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect()
 }
 
 fn prepare_capture(samples: Vec<f32>, source_rate: u32) -> Option<Vec<f32>> {
@@ -321,8 +366,8 @@ fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f
 #[cfg(test)]
 mod tests {
     use super::{
-        downmix, normalize_i16, normalize_u16, prepare_capture, resample_linear, AudioError,
-        AudioRecorder,
+        append_frames, capture_buffer, capture_capacity, normalize_i16, normalize_u16,
+        prepare_capture, resample_linear, AudioError, AudioRecorder,
     };
     use crate::runtime::capture_result_event;
     use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
@@ -338,14 +383,52 @@ mod tests {
     }
 
     #[test]
-    fn stereo_is_averaged_to_mono() {
-        assert_eq!(downmix(&[1.0, -1.0, 0.5, 0.5], 2), vec![0.0, 0.5]);
-    }
-
-    #[test]
     fn resample_48k_to_16k_has_expected_length() {
         let input = vec![0.25; 48_000];
         assert_eq!(resample_linear(&input, 48_000, 16_000).len(), 16_000);
+    }
+
+    #[test]
+    fn capture_capacity_covers_limit_release_grace_and_scheduling_margin() {
+        assert_eq!(capture_capacity(48_000), 1_256_640);
+        assert_eq!(capture_capacity(96_000), 2_513_280);
+    }
+
+    #[test]
+    fn bounded_callback_downmixes_in_one_pass_and_reports_overflow() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut producer, mut consumer) = capture_buffer(2);
+        let overflowed = AtomicBool::new(false);
+
+        append_frames(
+            &mut producer,
+            &[1.0_f32, 3.0, 5.0, 7.0],
+            2,
+            |sample| sample,
+            &overflowed,
+        );
+        assert_eq!(consumer.pop(), Ok(2.0));
+        assert_eq!(consumer.pop(), Ok(6.0));
+        assert!(!overflowed.load(Ordering::Acquire));
+
+        append_frames(
+            &mut producer,
+            &[1.0_f32, 3.0, 5.0, 7.0, 9.0, 11.0],
+            2,
+            |sample| sample,
+            &overflowed,
+        );
+        assert!(overflowed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn overflow_is_a_distinct_capture_error() {
+        let mut recorder =
+            AudioRecorder::with_test_frames_and_capacity(vec![0.25; 3], 48_000, 1, 2);
+        recorder.start().unwrap();
+
+        assert_eq!(recorder.stop(), Err(AudioError::BufferOverflow));
     }
 
     #[test]
