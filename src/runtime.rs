@@ -863,7 +863,17 @@ mod tests {
     }
 
     #[test]
-    fn smoke_watchdog_returns_child_exit_code() {
+    fn smoke_watchdog_returns_success() {
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+
+        assert_eq!(
+            wait_for_smoke_child(&mut child, std::time::Duration::from_secs(1)),
+            0
+        );
+    }
+
+    #[test]
+    fn smoke_watchdog_returns_child_failure() {
         let mut child = std::process::Command::new("/usr/bin/false")
             .spawn()
             .unwrap();

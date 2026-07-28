@@ -19,7 +19,7 @@ The menu contains exactly:
 
 ```text
 <status>
-PTT2me 1.0.0
+PTT2me 1.0.2
 ────────────
 Выйти
 ```
@@ -48,6 +48,24 @@ The script builds only `aarch64-apple-darwin`, obtains the two native runtime
 libraries from the Cargo release output, and creates the self-contained
 `dist/PTT2me.app`.
 
+## Automated checks
+
+Pull requests and pushes to `main` run on an Apple Silicon macOS runner. The
+workflow checks formatting, runs all unit and integration tests (including the
+main-thread NSPasteboard round trip), denies Clippy warnings, and audits locked
+Rust dependencies:
+
+```bash
+cargo fmt --all -- --check
+cargo test --all-targets --features test-support -- --test-threads=1
+cargo clippy --all-targets --features test-support -- -D warnings
+cargo audit --deny warnings
+```
+
+These checks compile and test the program; they do not download or substitute
+an ASR model. PTT2me has one fixed GigaAM v3 RNNT model, supplied as frozen
+build assets and embedded in the application bundle.
+
 ## Local DMG release
 
 To rebuild the app and create a local Apple Silicon DMG, run:
@@ -64,6 +82,21 @@ notarized for public distribution.
 Before each new release, explicitly bump the package version in `Cargo.toml`
 and synchronize `Cargo.lock` with Cargo. Rebuilding an existing release does
 not change its version automatically.
+
+The release gate runs on a controlled Apple Silicon Mac where the four frozen
+model files have already been provisioned in `vendor/models/gigaam-v3-rnnt/`.
+No model is fetched at build or runtime. Before publishing a DMG:
+
+1. Run `scripts/build-dmg.sh`; its bundle check initializes the model embedded
+   in the generated `PTT2me.app` and fails after 180 seconds instead of waiting
+   forever.
+2. Launch the built app in a normal macOS user session and verify the fixed
+   model reaches `Готово`.
+3. With Microphone, Input Monitoring, and Accessibility granted, hold and
+   release Fn/Globe in a text editor and verify recognition, Cmd+V insertion,
+   and restoration of a multi-item pasteboard.
+4. Revoke each permission in turn and verify the corresponding status and
+   recovery path.
 
 ## Permissions and launch
 

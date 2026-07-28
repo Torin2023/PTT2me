@@ -289,6 +289,91 @@ fn post_command_v_up(source: CGEventSource) -> Result<(), InsertError> {
     Ok(())
 }
 
+/// Exercises the real NSPasteboard snapshot/restore path.
+///
+/// This entry point is available only to the custom main-thread test target.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn run_pasteboard_main_thread_tests() -> Result<(), InsertError> {
+    let pasteboard = unsafe { NSPasteboard::pasteboardWithUniqueName() };
+    let expected = PasteboardSnapshot {
+        items: vec![
+            PasteboardItemSnapshot {
+                representations: vec![
+                    PasteboardRepresentation {
+                        type_name: "public.utf8-plain-text".to_owned(),
+                        data: b"plain".to_vec(),
+                    },
+                    PasteboardRepresentation {
+                        type_name: "public.rtf".to_owned(),
+                        data: b"{\\rtf1 rich}".to_vec(),
+                    },
+                ],
+            },
+            PasteboardItemSnapshot {
+                representations: vec![PasteboardRepresentation {
+                    type_name: "public.png".to_owned(),
+                    data: vec![0x89, 0x50, 0x4e, 0x47],
+                }],
+            },
+        ],
+    };
+    write_snapshot_fixture(&pasteboard, &expected)?;
+    let mut system = SystemPasteboard::new(pasteboard);
+
+    let captured = system.snapshot()?;
+    assert_snapshot_contains(&captured, &expected);
+    let temporary = system
+        .write_temporary_text("recognized")
+        .map_err(|failure| failure.error)?;
+    system.restore(&captured, temporary.change_count)?;
+    assert_eq!(system.snapshot()?, captured);
+
+    let empty_pasteboard = unsafe { NSPasteboard::pasteboardWithUniqueName() };
+    unsafe { empty_pasteboard.clearContents() };
+    let mut empty_system = SystemPasteboard::new(empty_pasteboard);
+    let empty_snapshot = empty_system.snapshot()?;
+    let temporary = empty_system
+        .write_temporary_text("recognized")
+        .map_err(|failure| failure.error)?;
+    empty_system.restore(&empty_snapshot, temporary.change_count)?;
+    assert_eq!(empty_system.snapshot()?, PasteboardSnapshot::default());
+
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn write_snapshot_fixture(
+    pasteboard: &NSPasteboard,
+    saved: &PasteboardSnapshot,
+) -> Result<(), InsertError> {
+    let objects = reconstruct_items(saved)?;
+    unsafe {
+        pasteboard.clearContents();
+        if saved.items.is_empty() || pasteboard.writeObjects(&objects) {
+            Ok(())
+        } else {
+            Err(InsertError::PasteboardWrite)
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn assert_snapshot_contains(actual: &PasteboardSnapshot, expected: &PasteboardSnapshot) {
+    assert_eq!(actual.items.len(), expected.items.len());
+    for (actual_item, expected_item) in actual.items.iter().zip(&expected.items) {
+        for expected_representation in &expected_item.representations {
+            assert!(
+                actual_item
+                    .representations
+                    .contains(expected_representation),
+                "missing representation: {}",
+                expected_representation.type_name
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,29 +503,6 @@ mod tests {
         }
     }
 
-    fn write_snapshot_fixture(pasteboard: &NSPasteboard, saved: &PasteboardSnapshot) {
-        let objects = reconstruct_items(saved).unwrap();
-        unsafe {
-            pasteboard.clearContents();
-            assert!(saved.items.is_empty() || pasteboard.writeObjects(&objects));
-        }
-    }
-
-    fn assert_snapshot_contains(actual: &PasteboardSnapshot, expected: &PasteboardSnapshot) {
-        assert_eq!(actual.items.len(), expected.items.len());
-        for (actual_item, expected_item) in actual.items.iter().zip(&expected.items) {
-            for expected_representation in &expected_item.representations {
-                assert!(
-                    actual_item
-                        .representations
-                        .contains(expected_representation),
-                    "missing representation: {}",
-                    expected_representation.type_name
-                );
-            }
-        }
-    }
-
     #[test]
     fn insertion_runs_as_explicit_non_blocking_stages() {
         let original = snapshot(&[&[("public.utf8-plain-text", b"before")]]);
@@ -479,40 +541,6 @@ mod tests {
             InsertError::KeyboardEvent
         );
         assert_eq!(insertion.pasteboard.current, original);
-    }
-
-    #[test]
-    fn round_trips_multiple_items_and_representations() {
-        let pasteboard = unsafe { NSPasteboard::pasteboardWithUniqueName() };
-        let expected = snapshot(&[
-            &[
-                ("public.utf8-plain-text", b"plain"),
-                ("public.rtf", b"{\\rtf1 rich}"),
-            ],
-            &[("public.png", &[0x89, 0x50, 0x4e, 0x47])],
-        ]);
-        write_snapshot_fixture(&pasteboard, &expected);
-        let mut system = SystemPasteboard::new(pasteboard);
-
-        let captured = system.snapshot().unwrap();
-        assert_snapshot_contains(&captured, &expected);
-        let temporary = system.write_temporary_text("recognized").unwrap();
-        system.restore(&captured, temporary.change_count).unwrap();
-
-        assert_eq!(system.snapshot().unwrap(), captured);
-    }
-
-    #[test]
-    fn round_trips_an_empty_pasteboard() {
-        let pasteboard = unsafe { NSPasteboard::pasteboardWithUniqueName() };
-        unsafe { pasteboard.clearContents() };
-        let mut system = SystemPasteboard::new(pasteboard);
-
-        let captured = system.snapshot().unwrap();
-        let temporary = system.write_temporary_text("recognized").unwrap();
-        system.restore(&captured, temporary.change_count).unwrap();
-
-        assert_eq!(system.snapshot().unwrap(), PasteboardSnapshot::default());
     }
 
     #[test]
