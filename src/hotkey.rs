@@ -5,9 +5,10 @@ use core_foundation::{
 };
 use core_graphics::{
     event::{
-        CGEventField, CGEventMask, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
-        CGEventTapProxy, CGEventType, EventField,
+        CGEvent, CGEventField, CGEventFlags, CGEventMask, CGEventTapLocation, CGEventTapOptions,
+        CGEventTapPlacement, CGEventTapProxy, CGEventType, EventField,
     },
+    event_source::{CGEventSource, CGEventSourceStateID},
     sys::CGEventRef,
 };
 use std::{
@@ -24,9 +25,12 @@ use std::{
     time::Instant,
 };
 
+use crate::constants::MIN_HOLD_MS;
+
 const FN_KEYCODE: u16 = 63;
 const GLOBE_KEYCODE: u16 = 179;
 const SECONDARY_FN_FLAG: u64 = 0x0080_0000;
+const REPLAY_EVENT_MARKER: i64 = 0x5054_5432_4D45;
 const KEYBOARD_EVENT_MASK: CGEventMask = (1 << CGEventType::KeyDown as CGEventMask)
     | (1 << CGEventType::KeyUp as CGEventMask)
     | (1 << CGEventType::FlagsChanged as CGEventMask);
@@ -55,9 +59,24 @@ pub struct KeyboardObservation {
     pub fn_flag: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplayRequest {
+    keycode: u16,
+    kind: ObservationKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FnTrackerOutput {
+    signal: HotkeySignal,
+    replay: Option<ReplayRequest>,
+}
+
 #[derive(Default)]
 pub struct FnTracker {
     pressed: bool,
+    pressed_at: Option<Instant>,
+    pressed_keycode: u16,
+    pressed_kind: Option<ObservationKind>,
 }
 
 impl FnTracker {
@@ -66,6 +85,15 @@ impl FnTracker {
         observation: KeyboardObservation,
         observed_at: Instant,
     ) -> Option<HotkeySignal> {
+        self.handle_action_at(observation, observed_at)
+            .map(|output| output.signal)
+    }
+
+    fn handle_action_at(
+        &mut self,
+        observation: KeyboardObservation,
+        observed_at: Instant,
+    ) -> Option<FnTrackerOutput> {
         let next_pressed = match observation.kind {
             ObservationKind::KeyDown if observation.is_fn_or_globe() => Some(true),
             ObservationKind::KeyUp if observation.is_fn_or_globe() => Some(false),
@@ -83,12 +111,42 @@ impl FnTracker {
         }
 
         self.pressed = next_pressed;
-        Some(if next_pressed {
-            HotkeySignal::Pressed { observed_at }
+        let (signal, replay) = if next_pressed {
+            self.pressed_at = Some(observed_at);
+            self.pressed_keycode = observation.keycode;
+            self.pressed_kind = Some(observation.kind);
+            (HotkeySignal::Pressed { observed_at }, None)
         } else {
-            HotkeySignal::Released { observed_at }
-        })
+            let replay = self
+                .pressed_at
+                .take()
+                .zip(self.pressed_kind.take())
+                .filter(|_| {
+                    !matches!(
+                        observation.kind,
+                        ObservationKind::TapDisabledByTimeout
+                            | ObservationKind::TapDisabledByUserInput
+                    )
+                })
+                .filter(|(pressed_at, _)| held_millis(*pressed_at, observed_at) < MIN_HOLD_MS)
+                .map(|(_, kind)| ReplayRequest {
+                    keycode: self.pressed_keycode,
+                    kind,
+                });
+            (HotkeySignal::Released { observed_at }, replay)
+        };
+        Some(FnTrackerOutput { signal, replay })
     }
+}
+
+fn held_millis(pressed_at: Instant, released_at: Instant) -> u64 {
+    u64::try_from(
+        released_at
+            .checked_duration_since(pressed_at)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 impl KeyboardObservation {
@@ -131,22 +189,25 @@ struct CallbackState {
 }
 
 impl CallbackState {
-    fn emit_observation(&self, observation: KeyboardObservation) {
-        let signal = {
+    fn emit_observation(&self, observation: KeyboardObservation) -> Option<ReplayRequest> {
+        let output = {
             let mut tracker = self
                 .tracker
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            tracker.handle_at(observation, Instant::now())
+            tracker.handle_action_at(observation, Instant::now())
         };
 
-        if let Some(signal) = signal {
-            let _ = self.sender.send(signal);
+        if let Some(output) = output {
+            let _ = self.sender.send(output.signal);
+            output.replay
+        } else {
+            None
         }
     }
 
     fn recover_tap(&self, kind: ObservationKind) {
-        self.emit_observation(KeyboardObservation {
+        let _ = self.emit_observation(KeyboardObservation {
             kind,
             keycode: 0,
             fn_flag: false,
@@ -275,6 +336,12 @@ unsafe extern "C" fn hotkey_event_callback(
         if event.is_null() {
             return event;
         }
+        if is_replay_marker(cg_event_get_integer_value_field(
+            event,
+            EventField::EVENT_SOURCE_USER_DATA,
+        )) {
+            return event;
+        }
 
         let keycode = u16::try_from(cg_event_get_integer_value_field(
             event,
@@ -286,7 +353,11 @@ unsafe extern "C" fn hotkey_event_callback(
             keycode,
             fn_flag: cg_event_get_flags(event) & SECONDARY_FN_FLAG != 0,
         };
-        state.emit_observation(observation);
+        if let Some(replay) = state.emit_observation(observation) {
+            if replay_short_fn(replay).is_err() {
+                tracing::warn!(error_category = "fn_replay");
+            }
+        }
 
         if observation.should_suppress() {
             null_mut()
@@ -296,6 +367,29 @@ unsafe extern "C" fn hotkey_event_callback(
     }));
 
     callback.unwrap_or(event)
+}
+
+const fn is_replay_marker(value: i64) -> bool {
+    value == REPLAY_EVENT_MARKER
+}
+
+fn replay_short_fn(request: ReplayRequest) -> Result<(), ()> {
+    let source = CGEventSource::new(CGEventSourceStateID::Private)?;
+    let key_down = CGEvent::new_keyboard_event(source.clone(), request.keycode, true)?;
+    let key_up = CGEvent::new_keyboard_event(source, request.keycode, false)?;
+
+    key_down.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, REPLAY_EVENT_MARKER);
+    key_up.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, REPLAY_EVENT_MARKER);
+    key_down.set_flags(CGEventFlags::CGEventFlagSecondaryFn);
+    key_up.set_flags(CGEventFlags::CGEventFlagNull);
+    if request.kind == ObservationKind::FlagsChanged {
+        key_down.set_type(CGEventType::FlagsChanged);
+        key_up.set_type(CGEventType::FlagsChanged);
+    }
+
+    key_down.post(CGEventTapLocation::HID);
+    key_up.post(CGEventTapLocation::HID);
+    Ok(())
 }
 
 type CGEventTapCallback =
@@ -502,5 +596,77 @@ mod tests {
         ));
         assert_eq!(receiver.recv().unwrap(), HotkeySignal::TapLost);
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn short_fn_requests_one_system_replay() {
+        let mut tracker = FnTracker::default();
+        let pressed_at = Instant::now();
+        let released_at = pressed_at + std::time::Duration::from_millis(249);
+
+        assert_eq!(
+            tracker.handle_action_at(
+                observation(ObservationKind::FlagsChanged, FN_KEYCODE, true),
+                pressed_at,
+            ),
+            Some(FnTrackerOutput {
+                signal: HotkeySignal::Pressed {
+                    observed_at: pressed_at,
+                },
+                replay: None,
+            })
+        );
+        assert_eq!(
+            tracker.handle_action_at(
+                observation(ObservationKind::FlagsChanged, FN_KEYCODE, false),
+                released_at,
+            ),
+            Some(FnTrackerOutput {
+                signal: HotkeySignal::Released {
+                    observed_at: released_at,
+                },
+                replay: Some(ReplayRequest {
+                    keycode: FN_KEYCODE,
+                    kind: ObservationKind::FlagsChanged,
+                }),
+            })
+        );
+        assert_eq!(
+            tracker.handle_action_at(
+                observation(ObservationKind::FlagsChanged, FN_KEYCODE, false),
+                released_at,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn long_fn_is_ptt_without_system_replay() {
+        let mut tracker = FnTracker::default();
+        let pressed_at = Instant::now();
+        let released_at = pressed_at + std::time::Duration::from_millis(250);
+        tracker.handle_action_at(
+            observation(ObservationKind::KeyDown, GLOBE_KEYCODE, false),
+            pressed_at,
+        );
+
+        assert_eq!(
+            tracker.handle_action_at(
+                observation(ObservationKind::KeyUp, GLOBE_KEYCODE, false),
+                released_at,
+            ),
+            Some(FnTrackerOutput {
+                signal: HotkeySignal::Released {
+                    observed_at: released_at,
+                },
+                replay: None,
+            })
+        );
+    }
+
+    #[test]
+    fn replay_marker_bypasses_ptt_tracking() {
+        assert!(is_replay_marker(REPLAY_EVENT_MARKER));
+        assert!(!is_replay_marker(0));
     }
 }
