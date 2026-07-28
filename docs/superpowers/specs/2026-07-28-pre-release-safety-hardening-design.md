@@ -144,8 +144,10 @@ the version and separator rows. It is:
 
 The AppKit target sends a `MenuAction::OpenPermission(PermissionKind)` through
 a main-thread channel. Runtime drains menu actions with its normal event loop
-and calls the existing permission-opening boundary. Permission polling remains
-responsible for returning the UI to `Готово`.
+and calls the existing stateless `permissions::open_settings` function
+directly, so a manual click is never suppressed by the automatic one-shot
+prompt ledger. Permission polling remains responsible for returning the UI to
+`Готово`.
 
 ## Error handling and safety invariants
 

@@ -21,7 +21,7 @@ use crate::hotkey::{HotkeyListener, HotkeySignal};
 use crate::inserter::{
     InsertError, PendingInsertion, PASTEBOARD_RESTORE_DELAY_MS, PASTEBOARD_SETTLE_DELAY_MS,
 };
-use crate::menu::MenuBar;
+use crate::menu::{MenuAction, MenuBar};
 use crate::model::{resources_dir_from_executable, ModelPaths};
 use crate::permissions::{
     self, MicrophoneAuthorization, MicrophonePermissionBoundary, MicrophonePermissionFlow,
@@ -440,6 +440,7 @@ impl Runtime {
     }
 
     fn drain_events(&mut self) {
+        self.drain_menu_actions();
         self.drain_microphone_permission_completions();
 
         if self.pending_insertion.is_none() {
@@ -471,6 +472,18 @@ impl Runtime {
         let hotkey_events: Vec<_> = self.hotkey_events.try_iter().collect();
         for signal in hotkey_events {
             self.handle_hotkey(signal);
+        }
+    }
+
+    fn drain_menu_actions(&mut self) {
+        while let Some(action) = self.menu.take_action() {
+            match action {
+                MenuAction::OpenPermission(permission) => {
+                    if !permissions::open_settings(permission) {
+                        tracing::warn!(error_category = "open_permission_settings");
+                    }
+                }
+            }
         }
     }
 

@@ -425,9 +425,10 @@ permission through an `mpsc::Sender<MenuAction>`.
 - [ ] **Step 4: Drain actions in Runtime**
 
 Drain menu actions with the existing event drain timer. Route
-`MenuAction::OpenPermission(permission)` through the existing
-`Effect::OpenPermission` implementation so microphone request/recheck behavior
-is unchanged.
+`MenuAction::OpenPermission(permission)` directly through the stateless
+`permissions::open_settings(permission)` function. Do not route manual clicks
+through `MicrophonePermissionFlow`, whose automatic settings opening is
+intentionally one-shot while permission remains denied.
 
 - [ ] **Step 5: Verify GREEN and commit**
 
