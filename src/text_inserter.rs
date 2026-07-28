@@ -14,8 +14,9 @@ type AXError = i32;
 const AX_SUCCESS: AXError = 0;
 const AX_FOCUSED_UI_ELEMENT_ATTRIBUTE: &str = "AXFocusedUIElement";
 const AX_ROLE_ATTRIBUTE: &str = "AXRole";
+const AX_SUBROLE_ATTRIBUTE: &str = "AXSubrole";
 const AX_SELECTED_TEXT_ATTRIBUTE: &str = "AXSelectedText";
-const AX_SECURE_TEXT_FIELD_ROLE: &str = "AXSecureTextField";
+const AX_SECURE_TEXT_FIELD_SUBROLE: &str = "AXSecureTextField";
 const UNICODE_CHUNK_CHARS: usize = 32;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -91,7 +92,20 @@ impl AccessibilityInsertion for SystemAccessibility {
             .ok_or(InsertError::Accessibility)?
             .downcast_into::<CFString>()
             .ok_or(InsertError::Accessibility)?;
-        if role == AX_SECURE_TEXT_FIELD_ROLE {
+
+        let subrole_attribute = CFString::from_static_string(AX_SUBROLE_ATTRIBUTE);
+        let subrole = match copy_ax_attribute(focused_ref, subrole_attribute.as_concrete_TypeRef())
+        {
+            Some(value) => Some(
+                value
+                    .downcast_into::<CFString>()
+                    .ok_or(InsertError::Accessibility)?,
+            ),
+            None => None,
+        };
+        let role = role.to_string();
+        let subrole = subrole.map(|value| value.to_string());
+        if is_secure_ax_field(&role, subrole.as_deref()) {
             return Err(InsertError::SecureField);
         }
 
@@ -122,6 +136,10 @@ impl AccessibilityInsertion for SystemAccessibility {
             Err(InsertError::Accessibility)
         }
     }
+}
+
+fn is_secure_ax_field(role: &str, subrole: Option<&str>) -> bool {
+    role == AX_SECURE_TEXT_FIELD_SUBROLE || subrole == Some(AX_SECURE_TEXT_FIELD_SUBROLE)
 }
 
 fn copy_ax_attribute(element: AXUIElementRef, attribute: CFStringRef) -> Option<CFType> {
@@ -221,8 +239,8 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        begin_with, AccessibilityInsertion, ClipboardInsertion, InsertMethod, InsertOutcome,
-        UnicodeInsertion,
+        begin_with, is_secure_ax_field, AccessibilityInsertion, ClipboardInsertion, InsertMethod,
+        InsertOutcome, UnicodeInsertion,
     };
     use crate::inserter::InsertError;
 
@@ -334,5 +352,12 @@ mod tests {
 
         assert_eq!(outcome, Err(InsertError::SecureField));
         assert_eq!(calls.borrow().as_slice(), ["ax"]);
+    }
+
+    #[test]
+    fn secure_text_field_is_detected_from_ax_subrole() {
+        assert!(is_secure_ax_field("AXTextField", Some("AXSecureTextField")));
+        assert!(!is_secure_ax_field("AXTextField", None));
+        assert!(!is_secure_ax_field("AXTextArea", Some("AXStandardWindow")));
     }
 }

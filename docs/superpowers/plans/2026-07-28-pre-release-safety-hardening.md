@@ -213,8 +213,9 @@ AXUIElementIsAttributeSettable
 AXUIElementSetAttributeValue
 ```
 
-Read `AXFocusedUIElement` at call time. Read `AXRole`; return
-`InsertError::SecureField` for `AXSecureTextField`. For other roles, require
+Read `AXFocusedUIElement` at call time. Read `AXRole` and `AXSubrole`; return
+`InsertError::SecureField` when the subrole is `AXSecureTextField` (and retain
+the role check for compatibility with non-standard controls). For other roles, require
 `AXSelectedText` to be settable and set it from a retained `CFString`.
 Release every Create/Copy-owned Core Foundation object.
 
