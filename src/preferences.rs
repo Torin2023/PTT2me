@@ -86,6 +86,23 @@ mod tests {
         assert_eq!(raw.trigger.as_deref(), Some("fn_globe"));
         assert_eq!(raw.threshold, Some(500));
     }
+
+    #[test]
+    fn preference_store_normalizes_directly_constructed_excluded_keycodes() {
+        for keycode in [53, 57, 72, 73, 74, 127] {
+            let mut store = PreferenceRepository::new(MemoryRawStore::default());
+            assert_eq!(
+                store.save(Preferences {
+                    trigger: TriggerKey::KeyCode(keycode),
+                    threshold: HoldThreshold::MS_750,
+                }),
+                Ok(())
+            );
+            let raw = store.into_inner();
+            assert_eq!(raw.trigger.as_deref(), Some("fn_globe"));
+            assert_eq!(raw.threshold, Some(750));
+        }
+    }
 }
 
 use core_graphics::event::KeyCode;
@@ -270,8 +287,11 @@ impl<R: RawPreferenceStore> PreferenceRepository<R> {
     }
 
     pub fn save(&mut self, preferences: Preferences) -> Result<(), ()> {
-        self.raw
-            .set_trigger_value(&preferences.trigger.storage_value())?;
+        let trigger = match preferences.trigger {
+            TriggerKey::FnGlobe => TriggerKey::FnGlobe,
+            TriggerKey::KeyCode(keycode) => TriggerKey::from_keycode(keycode).unwrap_or_default(),
+        };
+        self.raw.set_trigger_value(&trigger.storage_value())?;
         self.raw.set_threshold_value(preferences.threshold.millis())
     }
 
