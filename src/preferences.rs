@@ -59,12 +59,12 @@ mod tests {
             self.threshold
         }
 
-        fn set_trigger_value(&mut self, value: &str) -> Result<(), ()> {
+        fn set_trigger_value(&mut self, value: &str) -> Result<(), PreferenceError> {
             self.trigger = Some(value.to_owned());
             Ok(())
         }
 
-        fn set_threshold_value(&mut self, value: u64) -> Result<(), ()> {
+        fn set_threshold_value(&mut self, value: u64) -> Result<(), PreferenceError> {
             self.threshold = Some(value);
             Ok(())
         }
@@ -138,8 +138,9 @@ impl Default for HoldThreshold {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TriggerKey {
+    #[default]
     FnGlobe,
     KeyCode(u16),
 }
@@ -231,7 +232,7 @@ fn fixed_key_name(keycode: u16) -> Option<&'static str> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Preferences {
     pub trigger: TriggerKey,
     pub threshold: HoldThreshold,
@@ -250,26 +251,17 @@ impl Preferences {
     }
 }
 
-impl Default for TriggerKey {
-    fn default() -> Self {
-        Self::FnGlobe
-    }
-}
-
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            trigger: TriggerKey::default(),
-            threshold: HoldThreshold::default(),
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreferenceError {
+    WriteFailed,
+    ValueOutOfRange,
 }
 
 pub trait RawPreferenceStore {
     fn trigger_value(&self) -> Option<String>;
     fn threshold_value(&self) -> Option<u64>;
-    fn set_trigger_value(&mut self, value: &str) -> Result<(), ()>;
-    fn set_threshold_value(&mut self, value: u64) -> Result<(), ()>;
+    fn set_trigger_value(&mut self, value: &str) -> Result<(), PreferenceError>;
+    fn set_threshold_value(&mut self, value: u64) -> Result<(), PreferenceError>;
 }
 
 pub struct PreferenceRepository<R: RawPreferenceStore> {
@@ -286,7 +278,7 @@ impl<R: RawPreferenceStore> PreferenceRepository<R> {
         Preferences::from_stored(trigger.as_deref(), self.raw.threshold_value())
     }
 
-    pub fn save(&mut self, preferences: Preferences) -> Result<(), ()> {
+    pub fn save(&mut self, preferences: Preferences) -> Result<(), PreferenceError> {
         let trigger = match preferences.trigger {
             TriggerKey::FnGlobe => TriggerKey::FnGlobe,
             TriggerKey::KeyCode(keycode) => TriggerKey::from_keycode(keycode).unwrap_or_default(),
@@ -336,21 +328,27 @@ impl RawPreferenceStore for SystemPreferenceStore {
         }
     }
 
-    fn set_trigger_value(&mut self, value: &str) -> Result<(), ()> {
+    fn set_trigger_value(&mut self, value: &str) -> Result<(), PreferenceError> {
         let key = NSString::from_str(Self::TRIGGER_KEY);
         let value = NSString::from_str(value);
         unsafe {
             self.defaults.setObject_forKey(Some(&value), &key);
-            self.defaults.synchronize().then_some(()).ok_or(())
+            self.defaults
+                .synchronize()
+                .then_some(())
+                .ok_or(PreferenceError::WriteFailed)
         }
     }
 
-    fn set_threshold_value(&mut self, value: u64) -> Result<(), ()> {
+    fn set_threshold_value(&mut self, value: u64) -> Result<(), PreferenceError> {
         let key = NSString::from_str(Self::THRESHOLD_KEY);
-        let value = isize::try_from(value).map_err(|_| ())?;
+        let value = isize::try_from(value).map_err(|_| PreferenceError::ValueOutOfRange)?;
         unsafe {
             self.defaults.setInteger_forKey(value, &key);
-            self.defaults.synchronize().then_some(()).ok_or(())
+            self.defaults
+                .synchronize()
+                .then_some(())
+                .ok_or(PreferenceError::WriteFailed)
         }
     }
 }

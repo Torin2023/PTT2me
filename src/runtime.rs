@@ -24,7 +24,8 @@ use crate::permissions::{
     SystemPermissionProbe,
 };
 use crate::preferences::{
-    PreferenceRepository, Preferences, RawPreferenceStore, SystemPreferenceStore, TriggerKey,
+    PreferenceError, PreferenceRepository, Preferences, RawPreferenceStore, SystemPreferenceStore,
+    TriggerKey,
 };
 use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
 
@@ -54,7 +55,7 @@ impl<R: RawPreferenceStore> RuntimePreferences<R> {
     #[allow(dead_code)]
     fn apply(&mut self, command: MenuCommand) -> Result<(), ()> {
         self.apply_in_memory(command)?;
-        self.persist()
+        self.persist().map_err(|_| ())
     }
 
     fn apply_in_memory(&mut self, command: MenuCommand) -> Result<(), ()> {
@@ -70,7 +71,7 @@ impl<R: RawPreferenceStore> RuntimePreferences<R> {
         self.current.trigger = trigger;
     }
 
-    fn persist(&mut self) -> Result<(), ()> {
+    fn persist(&mut self) -> Result<(), PreferenceError> {
         self.repository.save(self.current)
     }
 
@@ -861,7 +862,8 @@ mod tests {
     use crate::menu::MenuCommand;
     use crate::permissions::{MicrophoneAuthorization, MicrophonePermissionBoundary};
     use crate::preferences::{
-        HoldThreshold, PreferenceRepository, Preferences, RawPreferenceStore, TriggerKey,
+        HoldThreshold, PreferenceError, PreferenceRepository, Preferences, RawPreferenceStore,
+        TriggerKey,
     };
     use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
 
@@ -896,12 +898,12 @@ mod tests {
             self.threshold
         }
 
-        fn set_trigger_value(&mut self, value: &str) -> Result<(), ()> {
+        fn set_trigger_value(&mut self, value: &str) -> Result<(), PreferenceError> {
             self.trigger = Some(value.to_owned());
             Ok(())
         }
 
-        fn set_threshold_value(&mut self, value: u64) -> Result<(), ()> {
+        fn set_threshold_value(&mut self, value: u64) -> Result<(), PreferenceError> {
             self.threshold = Some(value);
             Ok(())
         }

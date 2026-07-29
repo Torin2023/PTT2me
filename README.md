@@ -11,20 +11,44 @@ previous pasteboard contents.
 - macOS 13 Ventura or newer
 
 PTT2me loads its fixed model at startup. When the status becomes `Готово`,
-hold Fn/Globe for at least 250 ms while speaking and release it. The app keeps
-recording for another 180 ms, recognizes the captured phrase, and pastes a
-non-empty result with Cmd+V. A capture ends automatically after 25 seconds.
+hold Fn/Globe while speaking and release it. Fn/Globe and a 500 ms hold
+threshold are the default settings. Recording begins immediately when the
+trigger is pressed; a hold that reaches the selected threshold is recognized
+on release. The app keeps recording for another 180 ms, recognizes the
+captured phrase, and pastes a non-empty result with Cmd+V. A capture ends
+automatically after 25 seconds.
 
-The menu contains exactly:
+A short press is preserved: PTT2me replays it once to macOS, so the normal
+Fn/Globe input-source action still works. The same applies to a short press of
+any assigned ordinary key. If the assigned key is used in a combination, the
+combination is passed through in its original order instead of starting
+dictation.
+
+The menu contains the trigger controls:
 
 ```text
 <status>
 PTT2me 1.0.0
 ────────────
+Клавиша активации
+  <selected key>
+  Назначить…
+  Сбросить на Fn / Globe
+Порог удержания
+  250 мс
+  500 мс
+  750 мс
 Выйти
 ```
 
-The status and version rows are informational; `Выйти` is the only command.
+Choose `Клавиша активации` → `Назначить…`, then press the key to use for
+dictation. Press Escape to cancel assignment. `Сбросить на Fn / Globe` restores
+the default trigger. Escape, Caps Lock, and system volume/mute keys are not
+accepted as assigned triggers and leave the current trigger unchanged.
+
+Choose one of the exact `Порог удержания` values: 250, 500, or 750 ms. A hold
+shorter than the selected value is replayed normally; a longer hold records
+and is consumed so it does not type or invoke its usual system action.
 
 ## Build
 
@@ -82,9 +106,10 @@ and guides their interactive setup.
 
 ## Privacy
 
-Audio and recognized text are processed locally. PTT2me does not save audio,
-transcripts, history, settings, or application data. Recognized text is used
-temporarily for insertion and is not retained by PTT2me; the previous macOS
+Audio and recognized text are processed locally. PTT2me stores only the
+selected trigger and hold threshold in macOS user defaults. It does not retain
+audio, transcripts, recognized text, history, or other application data.
+Recognized text is used temporarily for insertion; the previous macOS
 pasteboard contents are restored unless newer contents were copied during
 insertion.
 
