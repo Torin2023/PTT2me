@@ -1,10 +1,10 @@
 const DOWNLOAD_URL =
-  "https://github.com/Torin2023/PTT2me/releases/download/v1.0.3/PTT2me-1.0.3-macos-arm64.dmg";
+  "https://github.com/Torin2023/PTT2me/releases/download/v1.0.4/PTT2me-1.0.4-macos-arm64.dmg";
 const REPOSITORY_URL = "https://github.com/Torin2023/PTT2me";
-const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.0.3`;
+const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.0.4`;
 
 const steps = [
-  ["01", "Удерживайте", "Нажмите и удерживайте Fn или Globe."],
+  ["01", "Удерживайте", "Нажмите и удерживайте выбранную клавишу."],
   ["02", "Говорите", "Продиктуйте текст по-русски в обычном темпе."],
   ["03", "Отпустите", "Текст появится в активном приложении."],
 ];
@@ -40,7 +40,7 @@ export default function Home() {
           <p className="eyebrow">
             <span aria-hidden="true" />
             Локальная диктовка для macOS
-            <span className="preview-badge">Preview 1.0.3</span>
+            <span className="preview-badge">Preview 1.0.4</span>
           </p>
           <h1>
             Говорите —
@@ -48,13 +48,13 @@ export default function Home() {
             текст уже там<span aria-hidden="true">.</span>
           </h1>
           <p className="lede">
-            Удерживайте Fn, говорите по-русски и отпускайте. PTT2me распознает
-            речь прямо на вашем Mac и вставит результат в поле, где находится
-            курсор к моменту завершения распознавания.
+            Выберите удобную клавишу, удерживайте её и говорите по-русски.
+            PTT2me начинает запись сразу, распознает речь прямо на вашем Mac и
+            вставляет результат в поле, где находится курсор.
           </p>
           <div className="hero-actions">
             <a className="button" href={DOWNLOAD_URL}>
-              Скачать PTT2me 1.0.3
+              Скачать PTT2me 1.0.4
               <span aria-hidden="true">↘</span>
             </a>
             <a className="text-link" href={REPOSITORY_URL}>
@@ -69,7 +69,7 @@ export default function Home() {
 
         <div
           className="dictation-demo"
-          aria-label="Схема: удерживайте Fn, говорите и получите текст"
+          aria-label="Схема: удерживайте выбранную клавишу, говорите и получите текст"
         >
           <div className="demo-topline">
             <span>PTT2me</span>
@@ -101,7 +101,7 @@ export default function Home() {
             <i aria-hidden="true" />
           </div>
           <div className="demo-caption">
-            <span>Fn удерживается</span>
+            <span>Клавиша удерживается</span>
             <span>Локально на Mac</span>
           </div>
         </div>
@@ -115,10 +115,10 @@ export default function Home() {
         </article>
         <article>
           <span>02</span>
-          <h2>Одна клавиша</h2>
+          <h2>Ваша клавиша</h2>
           <p>
-            Короткое нажатие сохраняет системное действие, удержание запускает
-            диктовку.
+            Назначьте удобную клавишу. Короткое нажатие останется обычным,
+            удержание запустит диктовку.
           </p>
         </article>
         <article>
@@ -146,10 +146,11 @@ export default function Home() {
           ))}
         </div>
         <p className="fine-print">
-          Минимальное удержание — 250 мс. После отпускания PTT2me оставляет
-          180 мс, чтобы не обрезать окончание фразы. Максимальная запись —
-          25 секунд. Короткое нажатие возвращается macOS и сохраняет настроенное
-          системное действие.
+          В меню доступны пороги 250, 500 и 750 мс; по умолчанию — 500 мс.
+          Запись начинается сразу при нажатии. Если нажатие оказалось коротким,
+          запись отбрасывается, а клавиша передаётся macOS как обычно. После
+          отпускания PTT2me оставляет 180 мс, чтобы не обрезать окончание фразы.
+          Максимальная запись — 25 секунд.
         </p>
       </section>
 
@@ -198,7 +199,7 @@ export default function Home() {
             </span>
             <div>
               <b>Мониторинг ввода</b>
-              <p>Чтобы реагировать на Fn или Globe.</p>
+              <p>Чтобы реагировать на назначенную клавишу.</p>
             </div>
           </article>
           <article>
@@ -219,7 +220,7 @@ export default function Home() {
 
       <section className="section install" id="install">
         <div className="install-copy">
-          <p className="eyebrow">PTT2me Preview 1.0.3</p>
+          <p className="eyebrow">PTT2me Preview 1.0.4</p>
           <h2>Готовы говорить?</h2>
           <p>Для Mac с Apple Silicon и macOS 13 Ventura или новее.</p>
           <a className="button" href={DOWNLOAD_URL}>
@@ -259,11 +260,11 @@ export default function Home() {
         <p>
           SHA-256{" "}
           <code>
-            513ddace2ca4b8d8bc9f9e5da099cc238ea6476f559d376605b80c76a267e2f4
+            64b54978627ba1f2f1c466222fd2a984b2fcd8623afb66d1714e12da13be83bf
           </code>
         </p>
         <div>
-          <a href={RELEASE_URL}>Preview-релиз 1.0.3</a>
+          <a href={RELEASE_URL}>Preview-релиз 1.0.4</a>
           <a href={REPOSITORY_URL}>GitHub</a>
         </div>
       </footer>
