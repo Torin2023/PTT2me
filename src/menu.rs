@@ -1,15 +1,18 @@
 use std::ptr::NonNull;
+use std::sync::mpsc::Sender;
 
 use objc2::{
     declare_class, msg_send, msg_send_id, mutability, rc::Retained, runtime::AnyClass,
     runtime::AnyObject, sel, ClassType, DeclaredClass,
 };
 use objc2_app_kit::{
-    NSApplication, NSColor, NSImage, NSImageSymbolConfiguration, NSMenu, NSMenuItem, NSStatusBar,
-    NSStatusBarButton, NSStatusItem, NSVariableStatusItemLength,
+    NSApplication, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSImage,
+    NSImageSymbolConfiguration, NSMenu, NSMenuItem, NSStatusBar, NSStatusBarButton, NSStatusItem,
+    NSVariableStatusItemLength,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 
+use crate::preferences::{HoldThreshold, Preferences};
 use crate::state::{AppStatus, PermissionKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,19 +98,49 @@ const fn permission_title(permission: PermissionKind) -> &'static str {
 pub enum MenuEntry {
     Status,
     Version,
+    Trigger,
+    Threshold,
     Separator,
     Quit,
 }
 
-pub const MENU_DESCRIPTOR: [MenuEntry; 4] = [
+pub const MENU_DESCRIPTOR: [MenuEntry; 6] = [
     MenuEntry::Status,
     MenuEntry::Version,
+    MenuEntry::Trigger,
+    MenuEntry::Threshold,
     MenuEntry::Separator,
     MenuEntry::Quit,
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuCommand {
+    BeginTriggerAssignment,
+    ResetTrigger,
+    SetThreshold(HoldThreshold),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreferenceProjection {
+    trigger_title: String,
+    threshold_states: [bool; 3],
+}
+
+impl From<Preferences> for PreferenceProjection {
+    fn from(preferences: Preferences) -> Self {
+        Self {
+            trigger_title: preferences.trigger.display_name(),
+            threshold_states: HoldThreshold::OPTIONS.map(|value| value == preferences.threshold),
+        }
+    }
+}
+
 fn symbol_style(projection: &MenuProjection) -> SymbolStyle {
     projection.style
+}
+
+struct MenuTargetIvars {
+    sender: Sender<MenuCommand>,
 }
 
 declare_class!(
@@ -123,7 +156,7 @@ declare_class!(
     }
 
     impl DeclaredClass for MenuTarget {
-        type Ivars = ();
+        type Ivars = MenuTargetIvars;
     }
 
     unsafe impl NSObjectProtocol for MenuTarget {}
@@ -136,23 +169,53 @@ declare_class!(
             let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
             unsafe { app.terminate(Some(sender)) };
         }
+
+        #[method(assignTrigger:)]
+        fn assign_trigger(&self, _sender: &AnyObject) {
+            let _ = self
+                .ivars()
+                .sender
+                .send(MenuCommand::BeginTriggerAssignment);
+        }
+
+        #[method(resetTrigger:)]
+        fn reset_trigger(&self, _sender: &AnyObject) {
+            let _ = self.ivars().sender.send(MenuCommand::ResetTrigger);
+        }
+
+        #[method(selectThreshold:)]
+        fn select_threshold(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let Ok(milliseconds) = u64::try_from(tag) else {
+                return;
+            };
+            let Some(threshold) = HoldThreshold::from_millis(milliseconds) else {
+                return;
+            };
+            let _ = self
+                .ivars()
+                .sender
+                .send(MenuCommand::SetThreshold(threshold));
+        }
     }
 );
 
 impl MenuTarget {
-    fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = mtm.alloc().set_ivars(());
+    fn new(mtm: MainThreadMarker, sender: Sender<MenuCommand>) -> Retained<Self> {
+        let this = mtm.alloc().set_ivars(MenuTargetIvars { sender });
         unsafe { msg_send_id![super(this), init] }
     }
 }
 
-/// Owns the permanent four-row status menu and projects application state onto
-/// the existing status row and status-bar button.
+/// Owns the permanent status menu and projects application and preference state
+/// onto its retained rows without rebuilding it.
 pub struct MenuBar {
     _status_bar: Retained<NSStatusBar>,
     _status_item: Retained<NSStatusItem>,
     _menu: Retained<NSMenu>,
     status_row: Retained<NSMenuItem>,
+    current_trigger_row: Retained<NSMenuItem>,
+    threshold_rows: [Retained<NSMenuItem>; 3],
     button: Retained<NSStatusBarButton>,
     _target: Retained<MenuTarget>,
     pulse_active: bool,
@@ -165,13 +228,15 @@ impl MenuBar {
     ///
     /// Panics when called outside the AppKit main thread or if AppKit does not
     /// provide a button for its newly-created status item.
-    pub fn new() -> Self {
+    pub fn new(preferences: Preferences, sender: Sender<MenuCommand>) -> Self {
         let mtm = main_thread_marker();
-        let target = MenuTarget::new(mtm);
+        let target = MenuTarget::new(mtm, sender);
         let menu = unsafe { NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("PTT2me")) };
         unsafe { menu.setAutoenablesItems(false) };
 
         let mut status_row = None;
+        let mut current_trigger_row = None;
+        let mut threshold_rows = Vec::with_capacity(HoldThreshold::OPTIONS.len());
         for entry in MENU_DESCRIPTOR {
             match entry {
                 MenuEntry::Status => {
@@ -184,6 +249,60 @@ impl MenuBar {
                     let item = menu_item(mtm, concat!("PTT2me ", env!("CARGO_PKG_VERSION")), None);
                     unsafe { item.setEnabled(false) };
                     menu.addItem(&item);
+                }
+                MenuEntry::Trigger => {
+                    let parent = menu_item(mtm, "Клавиша активации", None);
+                    let submenu = unsafe {
+                        NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Клавиша активации"))
+                    };
+                    unsafe { submenu.setAutoenablesItems(false) };
+
+                    let current = menu_item(mtm, "", None);
+                    unsafe { current.setEnabled(false) };
+                    submenu.addItem(&current);
+
+                    let assign = menu_item(mtm, "Назначить…", Some(sel!(assignTrigger:)));
+                    unsafe {
+                        assign.setTarget(Some(&target));
+                        assign.setEnabled(true);
+                    }
+                    submenu.addItem(&assign);
+
+                    let reset = menu_item(mtm, "Сбросить на Fn / Globe", Some(sel!(resetTrigger:)));
+                    unsafe {
+                        reset.setTarget(Some(&target));
+                        reset.setEnabled(true);
+                    }
+                    submenu.addItem(&reset);
+
+                    parent.setSubmenu(Some(&submenu));
+                    menu.addItem(&parent);
+                    current_trigger_row = Some(current);
+                }
+                MenuEntry::Threshold => {
+                    let parent = menu_item(mtm, "Порог удержания", None);
+                    let submenu = unsafe {
+                        NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Порог удержания"))
+                    };
+                    unsafe { submenu.setAutoenablesItems(false) };
+
+                    for threshold in HoldThreshold::OPTIONS {
+                        let item = menu_item(
+                            mtm,
+                            &format!("{} мс", threshold.millis()),
+                            Some(sel!(selectThreshold:)),
+                        );
+                        unsafe {
+                            item.setTarget(Some(&target));
+                            item.setTag(threshold.millis() as isize);
+                            item.setEnabled(true);
+                        }
+                        submenu.addItem(&item);
+                        threshold_rows.push(item);
+                    }
+
+                    parent.setSubmenu(Some(&submenu));
+                    menu.addItem(&parent);
                 }
                 MenuEntry::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
                 MenuEntry::Quit => {
@@ -214,11 +333,17 @@ impl MenuBar {
             _status_item: status_item,
             _menu: menu,
             status_row: status_row.expect("menu descriptor must contain the status row"),
+            current_trigger_row: current_trigger_row
+                .expect("menu descriptor must contain the current trigger row"),
+            threshold_rows: threshold_rows
+                .try_into()
+                .unwrap_or_else(|_| panic!("menu descriptor must contain three threshold rows")),
             button,
             _target: target,
             pulse_active: false,
         };
         menu_bar.render(&AppStatus::Starting);
+        menu_bar.render_preferences(preferences);
         menu_bar
     }
 
@@ -244,11 +369,34 @@ impl MenuBar {
             self.pulse_active = projection.pulse;
         }
     }
-}
 
-impl Default for MenuBar {
-    fn default() -> Self {
-        Self::new()
+    pub fn render_assignment(&mut self) {
+        let _mtm = main_thread_marker();
+        unsafe {
+            self.status_row
+                .setTitle(&NSString::from_str("● Нажмите клавишу…"));
+        }
+    }
+
+    pub fn render_preferences(&mut self, preferences: Preferences) {
+        let _mtm = main_thread_marker();
+        let projection = PreferenceProjection::from(preferences);
+        unsafe {
+            self.current_trigger_row
+                .setTitle(&NSString::from_str(&format!(
+                    "Текущая: {}",
+                    projection.trigger_title
+                )));
+        }
+        for (row, selected) in self.threshold_rows.iter().zip(projection.threshold_states) {
+            unsafe {
+                row.setState(if selected {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+            }
+        }
     }
 }
 
@@ -351,6 +499,7 @@ fn set_recognition_pulse(button: &NSStatusBarButton, enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preferences::{HoldThreshold, Preferences, TriggerKey};
     use crate::state::PermissionKind;
 
     #[test]
@@ -466,16 +615,28 @@ mod tests {
     }
 
     #[test]
-    fn menu_descriptor_contains_only_the_four_approved_entries() {
+    fn menu_descriptor_has_adjacent_trigger_and_threshold_controls() {
         assert_eq!(
             MENU_DESCRIPTOR,
             [
                 MenuEntry::Status,
                 MenuEntry::Version,
+                MenuEntry::Trigger,
+                MenuEntry::Threshold,
                 MenuEntry::Separator,
                 MenuEntry::Quit,
             ]
         );
+    }
+
+    #[test]
+    fn preference_projection_marks_only_the_selected_threshold() {
+        let projection = PreferenceProjection::from(Preferences {
+            trigger: TriggerKey::KeyCode(54),
+            threshold: HoldThreshold::MS_750,
+        });
+        assert_eq!(projection.trigger_title, "Правый Command");
+        assert_eq!(projection.threshold_states, [false, false, true]);
     }
 
     #[test]

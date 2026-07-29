@@ -17,16 +17,68 @@ use crate::audio::{AudioError, AudioRecorder};
 use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS};
 use crate::hotkey::{HotkeyListener, HotkeySignal};
 use crate::inserter;
-use crate::menu::MenuBar;
+use crate::menu::{MenuBar, MenuCommand};
 use crate::model::{resources_dir_from_executable, ModelPaths};
 use crate::permissions::{
     self, MicrophoneAuthorization, MicrophonePermissionBoundary, MicrophonePermissionFlow,
     SystemPermissionProbe,
 };
+use crate::preferences::{
+    PreferenceRepository, Preferences, RawPreferenceStore, SystemPreferenceStore, TriggerKey,
+};
 use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
 
 const EVENT_DRAIN_MS: u64 = 50;
 const PERMISSION_POLL_MS: u64 = 1_000;
+
+struct RuntimePreferences<R: RawPreferenceStore> {
+    current: Preferences,
+    repository: PreferenceRepository<R>,
+}
+
+impl<R: RawPreferenceStore> RuntimePreferences<R> {
+    fn new(current: Preferences, repository: PreferenceRepository<R>) -> Self {
+        Self {
+            current,
+            repository,
+        }
+    }
+
+    fn current(&self) -> Preferences {
+        self.current
+    }
+
+    // The live UI splits mutation from persistence so menu and gate state are
+    // updated before synchronous user-defaults I/O; this combined form is the
+    // repository-level command contract exercised by the focused unit test.
+    #[allow(dead_code)]
+    fn apply(&mut self, command: MenuCommand) -> Result<(), ()> {
+        self.apply_in_memory(command)?;
+        self.persist()
+    }
+
+    fn apply_in_memory(&mut self, command: MenuCommand) -> Result<(), ()> {
+        match command {
+            MenuCommand::ResetTrigger => self.current.trigger = TriggerKey::FnGlobe,
+            MenuCommand::SetThreshold(threshold) => self.current.threshold = threshold,
+            MenuCommand::BeginTriggerAssignment => return Err(()),
+        }
+        Ok(())
+    }
+
+    fn select_trigger(&mut self, trigger: TriggerKey) {
+        self.current.trigger = trigger;
+    }
+
+    fn persist(&mut self) -> Result<(), ()> {
+        self.repository.save(self.current)
+    }
+
+    #[cfg(test)]
+    fn saved(&self) -> Preferences {
+        self.repository.load()
+    }
+}
 
 struct MicrophonePermissionRuntime {
     flow: MicrophonePermissionFlow,
@@ -215,6 +267,8 @@ extern "C" fn timer_fired(_timer: CFRunLoopTimerRef, raw_context: *mut c_void) {
 pub struct Runtime {
     controller: AppController,
     menu: MenuBar,
+    preferences: RuntimePreferences<SystemPreferenceStore>,
+    menu_commands: Receiver<MenuCommand>,
     recorder: AudioRecorder,
     hotkey: Option<HotkeyListener>,
     hotkey_sender: Sender<HotkeySignal>,
@@ -241,13 +295,18 @@ impl Runtime {
     /// alive until `NSApplication::run` returns.
     pub fn start(_mtm: MainThreadMarker) -> Pin<Box<Self>> {
         let (hotkey_sender, hotkey_events) = mpsc::channel();
+        let (menu_sender, menu_commands) = mpsc::channel();
         let (asr_commands, asr_command_receiver) = mpsc::channel();
         let (asr_event_sender, asr_events) = mpsc::channel();
         let asr_worker = spawn_asr_worker(asr_command_receiver, asr_event_sender);
+        let preference_repository = PreferenceRepository::new(SystemPreferenceStore::new());
+        let preferences = preference_repository.load();
 
         let mut runtime = Box::pin(Self {
             controller: AppController::new(),
-            menu: MenuBar::new(),
+            menu: MenuBar::new(preferences, menu_sender),
+            preferences: RuntimePreferences::new(preferences, preference_repository),
+            menu_commands,
             recorder: AudioRecorder::new(),
             hotkey: None,
             hotkey_sender,
@@ -334,6 +393,11 @@ impl Runtime {
     fn drain_events(&mut self) {
         self.drain_microphone_permission_completions();
 
+        let menu_commands: Vec<_> = self.menu_commands.try_iter().collect();
+        for command in menu_commands {
+            self.handle_menu_command(command);
+        }
+
         let hotkey_events: Vec<_> = self.hotkey_events.try_iter().collect();
         for signal in hotkey_events {
             self.handle_hotkey(signal);
@@ -392,7 +456,41 @@ impl Runtime {
                 self.tap_needs_retry = false;
                 self.observe_tap_state(TapState::Restored);
             }
-            HotkeySignal::AssignmentSelected(_) | HotkeySignal::AssignmentCancelled => {}
+            HotkeySignal::AssignmentSelected(trigger) => {
+                self.preferences.select_trigger(trigger);
+                self.publish_preferences();
+                self.menu.render(self.controller.status());
+            }
+            HotkeySignal::AssignmentCancelled => {
+                self.menu.render(self.controller.status());
+            }
+        }
+    }
+
+    fn handle_menu_command(&mut self, command: MenuCommand) {
+        if command == MenuCommand::BeginTriggerAssignment {
+            if self.controller.status() == &AppStatus::Ready {
+                self.menu.render_assignment();
+                if let Some(hotkey) = &self.hotkey {
+                    hotkey.begin_assignment();
+                }
+            }
+            return;
+        }
+
+        if self.preferences.apply_in_memory(command).is_ok() {
+            self.publish_preferences();
+        }
+    }
+
+    fn publish_preferences(&mut self) {
+        let preferences = self.preferences.current();
+        self.menu.render_preferences(preferences);
+        if let Some(hotkey) = &self.hotkey {
+            hotkey.set_preferences(preferences);
+        }
+        if self.preferences.persist().is_err() {
+            tracing::warn!(error_category = "preference_persistence");
         }
     }
 
@@ -426,6 +524,7 @@ impl Runtime {
         if self.hotkey.is_none() {
             match HotkeyListener::install(self.hotkey_sender.clone()) {
                 Ok(listener) => {
+                    listener.set_preferences(self.preferences.current());
                     self.hotkey = Some(listener);
                     self.tap_needs_retry = false;
                     self.observe_tap_state(TapState::Restored);
@@ -675,10 +774,14 @@ mod tests {
 
     use super::{
         milliseconds_to_seconds, status_name, DeferredTapState, MicrophonePermissionRuntime,
-        TapState, EVENT_DRAIN_MS, PERMISSION_POLL_MS,
+        RuntimePreferences, TapState, EVENT_DRAIN_MS, PERMISSION_POLL_MS,
     };
     use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
+    use crate::menu::MenuCommand;
     use crate::permissions::{MicrophoneAuthorization, MicrophonePermissionBoundary};
+    use crate::preferences::{
+        HoldThreshold, PreferenceRepository, Preferences, RawPreferenceStore,
+    };
     use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
 
     struct RecordingMicrophoneBoundary {
@@ -695,6 +798,46 @@ mod tests {
             self.events.borrow_mut().push("open");
             true
         }
+    }
+
+    #[derive(Default)]
+    struct MemoryRawStore {
+        trigger: Option<String>,
+        threshold: Option<u64>,
+    }
+
+    impl RawPreferenceStore for MemoryRawStore {
+        fn trigger_value(&self) -> Option<String> {
+            self.trigger.clone()
+        }
+
+        fn threshold_value(&self) -> Option<u64> {
+            self.threshold
+        }
+
+        fn set_trigger_value(&mut self, value: &str) -> Result<(), ()> {
+            self.trigger = Some(value.to_owned());
+            Ok(())
+        }
+
+        fn set_threshold_value(&mut self, value: u64) -> Result<(), ()> {
+            self.threshold = Some(value);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn threshold_command_updates_menu_store_and_future_gate_preferences() {
+        let mut model = RuntimePreferences::new(
+            Preferences::default(),
+            PreferenceRepository::new(MemoryRawStore::default()),
+        );
+        assert_eq!(
+            model.apply(MenuCommand::SetThreshold(HoldThreshold::MS_750)),
+            Ok(())
+        );
+        assert_eq!(model.current().threshold, HoldThreshold::MS_750);
+        assert_eq!(model.saved().threshold, HoldThreshold::MS_750);
     }
 
     fn recognizing_controller() -> AppController {
