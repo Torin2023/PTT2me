@@ -73,6 +73,26 @@ enum EventDisposition {
 struct InputGate {
     preferences: Preferences,
     mode: GateMode,
+    modifier_state: ModifierState,
+}
+
+struct ModifierState {
+    pressed: [bool; 256],
+}
+
+impl Default for ModifierState {
+    fn default() -> Self {
+        Self {
+            pressed: [false; 256],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservationEdge {
+    Press,
+    Release,
+    None,
 }
 
 enum GateMode {
@@ -90,6 +110,13 @@ enum GateMode {
     AssignmentConsumed {
         physical_keycode: u16,
     },
+}
+
+struct PendingPress {
+    physical_keycode: u16,
+    pressed_at: Instant,
+    threshold: HoldThreshold,
+    down: ReplayEvent,
 }
 
 struct GateDecision {
@@ -116,20 +143,52 @@ impl ReplayEvent {
             }
         }
     }
+}
 
-    fn post_from_tap(self, proxy: CGEventTapProxy) -> Result<(), ()> {
+trait ReplayBackend {
+    type Prepared;
+
+    fn prepare(&mut self, replay: ReplayEvent) -> Result<Self::Prepared, ()>;
+    fn post(&mut self, prepared: Self::Prepared, proxy: CGEventTapProxy);
+}
+
+struct CoreGraphicsReplayBackend;
+
+impl ReplayBackend for CoreGraphicsReplayBackend {
+    type Prepared = CGEvent;
+
+    fn prepare(&mut self, replay: ReplayEvent) -> Result<Self::Prepared, ()> {
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)?;
         let event = CGEvent::new_keyboard_event(
             source,
-            self.keycode,
-            !matches!(self.kind, ObservationKind::KeyUp),
+            replay.keycode,
+            !matches!(replay.kind, ObservationKind::KeyUp),
         )?;
-        event.set_type(self.event_type());
-        event.set_flags(CGEventFlags::from_bits_retain(self.flags));
+        event.set_type(replay.event_type());
+        event.set_flags(CGEventFlags::from_bits_retain(replay.flags));
         event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, REPLAY_MARKER);
-        event.post_from_tap(proxy);
-        Ok(())
+        Ok(event)
     }
+
+    fn post(&mut self, prepared: Self::Prepared, proxy: CGEventTapProxy) {
+        prepared.post_from_tap(proxy);
+    }
+}
+
+fn post_replay_batch<B: ReplayBackend>(
+    replay: &[ReplayEvent],
+    proxy: CGEventTapProxy,
+    backend: &mut B,
+) -> Result<(), ()> {
+    let prepared = replay
+        .iter()
+        .copied()
+        .map(|event| backend.prepare(event))
+        .collect::<Result<Vec<_>, _>>()?;
+    for event in prepared {
+        backend.post(event, proxy);
+    }
+    Ok(())
 }
 
 impl GateDecision {
@@ -155,6 +214,7 @@ impl InputGate {
         Self {
             preferences,
             mode: GateMode::Idle,
+            modifier_state: ModifierState::default(),
         }
     }
 
@@ -182,11 +242,13 @@ impl InputGate {
             let signal =
                 matches!(self.mode, GateMode::Pending { .. }).then_some(HotkeySignal::Cancelled);
             self.mode = GateMode::Idle;
+            self.modifier_state.clear();
             return GateDecision::suppress(signal);
         }
+        let edge = self.modifier_state.observe(observation);
 
         match self.mode {
-            GateMode::Idle => self.handle_idle(observation, now),
+            GateMode::Idle => self.handle_idle(observation, edge, now),
             GateMode::Pending {
                 physical_keycode,
                 pressed_at,
@@ -195,24 +257,27 @@ impl InputGate {
             } => self.handle_pending(
                 observation,
                 now,
-                physical_keycode,
-                pressed_at,
-                threshold,
-                down,
+                edge,
+                PendingPress {
+                    physical_keycode,
+                    pressed_at,
+                    threshold,
+                    down,
+                },
             ),
             GateMode::Combination { physical_keycode } => {
-                if observation.is_physical_release(physical_keycode) {
+                if observation.is_physical_release(physical_keycode, edge) {
                     self.mode = GateMode::Idle;
                 }
                 GateDecision::pass()
             }
-            GateMode::Assigning => self.handle_assigning(observation),
+            GateMode::Assigning => self.handle_assigning(observation, edge),
             GateMode::AssignmentConsumed { physical_keycode } => {
-                if observation.is_physical_release(physical_keycode) {
+                if observation.is_physical_release(physical_keycode, edge) {
                     self.mode = GateMode::Idle;
                     GateDecision::suppress(None)
                 } else if observation.keycode == physical_keycode
-                    && (observation.autorepeat || observation.is_press_edge())
+                    && (observation.autorepeat || edge == ObservationEdge::Press)
                 {
                     GateDecision::suppress(None)
                 } else {
@@ -222,8 +287,13 @@ impl InputGate {
         }
     }
 
-    fn handle_idle(&mut self, observation: KeyboardObservation, now: Instant) -> GateDecision {
-        if !observation.is_trigger_press(self.preferences.trigger) {
+    fn handle_idle(
+        &mut self,
+        observation: KeyboardObservation,
+        edge: ObservationEdge,
+        now: Instant,
+    ) -> GateDecision {
+        if !observation.is_trigger_press(self.preferences.trigger, edge) {
             return GateDecision::pass();
         }
 
@@ -244,16 +314,15 @@ impl InputGate {
         &mut self,
         observation: KeyboardObservation,
         now: Instant,
-        physical_keycode: u16,
-        pressed_at: Instant,
-        threshold: HoldThreshold,
-        down: ReplayEvent,
+        edge: ObservationEdge,
+        pending: PendingPress,
     ) -> GateDecision {
-        if observation.is_physical_release(physical_keycode) {
+        if observation.is_physical_release(pending.physical_keycode, edge) {
             self.mode = GateMode::Idle;
-            let short = now.duration_since(pressed_at).as_millis() < u128::from(threshold.millis());
+            let short = now.duration_since(pending.pressed_at).as_millis()
+                < u128::from(pending.threshold.millis());
             let replay = if short {
-                vec![down, observation.into_replay()]
+                vec![pending.down, observation.into_replay()]
             } else {
                 Vec::new()
             };
@@ -264,28 +333,34 @@ impl InputGate {
             };
         }
 
-        if observation.keycode != physical_keycode && observation.is_press_edge() {
-            self.mode = GateMode::Combination { physical_keycode };
+        if observation.keycode != pending.physical_keycode && edge == ObservationEdge::Press {
+            self.mode = GateMode::Combination {
+                physical_keycode: pending.physical_keycode,
+            };
             return GateDecision {
                 disposition: EventDisposition::Suppress,
                 signal: Some(HotkeySignal::Cancelled),
-                replay: vec![down, observation.into_replay()],
+                replay: vec![pending.down, observation.into_replay()],
             };
         }
 
-        if observation.keycode != physical_keycode {
+        if observation.keycode != pending.physical_keycode {
             return GateDecision::pass();
         }
 
-        if observation.autorepeat || observation.is_press_edge() {
+        if observation.autorepeat || edge == ObservationEdge::Press {
             return GateDecision::suppress(None);
         }
 
         GateDecision::pass()
     }
 
-    fn handle_assigning(&mut self, observation: KeyboardObservation) -> GateDecision {
-        if !observation.is_press_edge() {
+    fn handle_assigning(
+        &mut self,
+        observation: KeyboardObservation,
+        edge: ObservationEdge,
+    ) -> GateDecision {
+        if edge != ObservationEdge::Press {
             return GateDecision::pass();
         }
 
@@ -322,33 +397,16 @@ impl KeyboardObservation {
         matches!(self.keycode, FN_KEYCODE | GLOBE_KEYCODE)
     }
 
-    fn is_trigger_press(self, trigger: TriggerKey) -> bool {
+    fn is_trigger_press(self, trigger: TriggerKey, edge: ObservationEdge) -> bool {
         let matches_trigger = match trigger {
             TriggerKey::FnGlobe => self.is_fn_or_globe(),
             TriggerKey::KeyCode(keycode) => self.keycode == keycode,
         };
-        matches_trigger
-            && match self.kind {
-                ObservationKind::KeyDown => true,
-                ObservationKind::FlagsChanged => self.modifier_flag_is_set(),
-                _ => false,
-            }
+        matches_trigger && edge == ObservationEdge::Press
     }
 
-    fn is_press_edge(self) -> bool {
-        match self.kind {
-            ObservationKind::KeyDown => true,
-            ObservationKind::FlagsChanged => self.modifier_flag_is_set(),
-            _ => false,
-        }
-    }
-
-    fn is_physical_release(self, physical_keycode: u16) -> bool {
-        self.keycode == physical_keycode
-            && matches!(
-                self.kind,
-                ObservationKind::KeyUp | ObservationKind::FlagsChanged
-            )
+    fn is_physical_release(self, physical_keycode: u16, edge: ObservationEdge) -> bool {
+        self.keycode == physical_keycode && edge == ObservationEdge::Release
     }
 
     fn modifier_flag_is_set(self) -> bool {
@@ -362,6 +420,51 @@ impl KeyboardObservation {
             keycode: self.keycode,
             flags: self.flags,
         }
+    }
+}
+
+impl ModifierState {
+    fn observe(&mut self, observation: KeyboardObservation) -> ObservationEdge {
+        let is_modifier = observation.is_modifier();
+        match observation.kind {
+            ObservationKind::KeyDown => {
+                if is_modifier {
+                    self.pressed[usize::from(observation.keycode)] = true;
+                }
+                ObservationEdge::Press
+            }
+            ObservationKind::KeyUp => {
+                if is_modifier {
+                    self.pressed[usize::from(observation.keycode)] = false;
+                }
+                ObservationEdge::Release
+            }
+            ObservationKind::FlagsChanged if is_modifier => {
+                let pressed = &mut self.pressed[usize::from(observation.keycode)];
+                if *pressed {
+                    *pressed = false;
+                    ObservationEdge::Release
+                } else if observation.modifier_flag_is_set() {
+                    *pressed = true;
+                    ObservationEdge::Press
+                } else {
+                    ObservationEdge::Release
+                }
+            }
+            ObservationKind::FlagsChanged
+            | ObservationKind::TapDisabledByTimeout
+            | ObservationKind::TapDisabledByUserInput => ObservationEdge::None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.pressed.fill(false);
+    }
+}
+
+impl KeyboardObservation {
+    fn is_modifier(self) -> bool {
+        modifier_flag(self.keycode).is_some() || self.is_fn_or_globe()
     }
 }
 
@@ -586,10 +689,9 @@ unsafe extern "C" fn hotkey_event_callback(
             ) == REPLAY_MARKER,
         };
         let decision = state.emit_observation(observation);
-        for replay in decision.replay.iter().copied() {
-            if replay.post_from_tap(proxy).is_err() {
-                tracing::warn!(error_category = "hotkey_replay");
-            }
+        let mut replay_backend = CoreGraphicsReplayBackend;
+        if post_replay_batch(&decision.replay, proxy, &mut replay_backend).is_err() {
+            tracing::warn!(error_category = "hotkey_replay");
         }
 
         match decision.disposition {
@@ -900,5 +1002,79 @@ mod tests {
             .signal,
             Some(HotkeySignal::Released { short: true })
         );
+    }
+
+    #[test]
+    fn released_modifier_with_opposite_side_held_does_not_cancel_pending() {
+        let start = Instant::now();
+        let mut gate = InputGate::new(Preferences::default());
+        gate.handle(flags_changed(55, COMMAND), start);
+        gate.handle(flags_changed(54, COMMAND), start);
+        gate.handle(key_down(63), start);
+
+        let released_right_command = gate.handle(
+            flags_changed(54, COMMAND),
+            start + Duration::from_millis(100),
+        );
+        assert_eq!(released_right_command.disposition, EventDisposition::Pass);
+        assert_eq!(released_right_command.signal, None);
+        assert_eq!(
+            gate.handle(key_up(63), start + Duration::from_millis(200))
+                .signal,
+            Some(HotkeySignal::Released { short: true })
+        );
+    }
+
+    #[test]
+    fn released_modifier_with_opposite_side_held_does_not_assign() {
+        let now = Instant::now();
+        let mut gate = InputGate::new(Preferences::default());
+        gate.handle(flags_changed(55, COMMAND), now);
+        gate.handle(flags_changed(54, COMMAND), now);
+        gate.begin_assignment();
+
+        let released_right_command = gate.handle(flags_changed(54, COMMAND), now);
+        assert_eq!(released_right_command.disposition, EventDisposition::Pass);
+        assert_eq!(released_right_command.signal, None);
+        assert_eq!(
+            gate.handle(key_down(49), now).signal,
+            Some(HotkeySignal::AssignmentSelected(TriggerKey::KeyCode(49)))
+        );
+    }
+
+    #[derive(Default)]
+    struct FailingSecondReplayBackend {
+        construction_attempts: usize,
+        posted: Vec<ReplayEvent>,
+    }
+
+    impl ReplayBackend for FailingSecondReplayBackend {
+        type Prepared = ReplayEvent;
+
+        fn prepare(&mut self, replay: ReplayEvent) -> Result<Self::Prepared, ()> {
+            self.construction_attempts += 1;
+            if self.construction_attempts == 2 {
+                Err(())
+            } else {
+                Ok(replay)
+            }
+        }
+
+        fn post(&mut self, replay: Self::Prepared, _proxy: CGEventTapProxy) {
+            self.posted.push(replay);
+        }
+    }
+
+    #[test]
+    fn second_replay_construction_failure_posts_nothing() {
+        let replay = [replay_down(63), replay_up(63)];
+        let mut backend = FailingSecondReplayBackend::default();
+
+        assert_eq!(
+            post_replay_batch(&replay, std::ptr::null(), &mut backend),
+            Err(())
+        );
+        assert_eq!(backend.construction_attempts, 2);
+        assert!(backend.posted.is_empty());
     }
 }
