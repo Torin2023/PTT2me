@@ -376,8 +376,8 @@ mod tests {
         let mut controller = AppController::new();
         controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
         controller.handle(AppEvent::ModelLoaded(Ok(())));
-        controller.handle(AppEvent::FnPressed);
-        controller.handle(AppEvent::FnReleased { held_ms: 900 });
+        controller.handle(AppEvent::TriggerPressed);
+        controller.handle(AppEvent::TriggerReleased { short: false });
         assert_eq!(controller.status(), &AppStatus::Recognizing);
         controller
     }

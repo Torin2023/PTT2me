@@ -17,15 +17,20 @@ use objc2_foundation::MainThreadMarker;
 use crate::asr::{spawn_asr_worker, AsrCommand, AsrEvent};
 use crate::audio::{AudioError, AudioRecorder};
 use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS};
-use crate::hotkey::{HotkeyListener, HotkeySignal};
+use crate::hotkey::{AssignmentEpoch, HotkeyControl, HotkeyListener, HotkeySignal};
 use crate::inserter::{
     InsertError, PendingInsertion, PASTEBOARD_RESTORE_DELAY_MS, PASTEBOARD_SETTLE_DELAY_MS,
 };
-use crate::menu::{MenuAction, MenuBar};
+use crate::menu::MenuAction;
+use crate::menu::{MenuBar, MenuCommand, MenuReadiness};
 use crate::model::{resources_dir_from_executable, ModelPaths};
 use crate::permissions::{
     self, MicrophoneAuthorization, MicrophonePermissionBoundary, MicrophonePermissionFlow,
     SystemPermissionProbe,
+};
+use crate::preferences::{
+    PreferenceError, PreferenceRepository, Preferences, RawPreferenceStore, SystemPreferenceStore,
+    TriggerKey,
 };
 use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
 use crate::text_inserter::{self, InsertMethod, InsertOutcome};
@@ -35,6 +40,55 @@ const PERMISSION_POLL_MS: u64 = 1_000;
 const SMOKE_MODEL_TIMEOUT: Duration = Duration::from_secs(180);
 const SMOKE_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SMOKE_TIMEOUT_EXIT_CODE: i32 = 124;
+
+struct RuntimePreferences<R: RawPreferenceStore> {
+    current: Preferences,
+    repository: PreferenceRepository<R>,
+}
+
+impl<R: RawPreferenceStore> RuntimePreferences<R> {
+    fn new(current: Preferences, repository: PreferenceRepository<R>) -> Self {
+        Self {
+            current,
+            repository,
+        }
+    }
+
+    fn current(&self) -> Preferences {
+        self.current
+    }
+
+    // The live UI splits mutation from persistence so menu and gate state are
+    // updated before synchronous user-defaults I/O; this combined form is the
+    // repository-level command contract exercised by the focused unit test.
+    #[allow(dead_code)]
+    fn apply(&mut self, command: MenuCommand) -> Result<(), ()> {
+        self.apply_in_memory(command)?;
+        self.persist().map_err(|_| ())
+    }
+
+    fn apply_in_memory(&mut self, command: MenuCommand) -> Result<(), ()> {
+        match command {
+            MenuCommand::ResetTrigger => self.current.trigger = TriggerKey::FnGlobe,
+            MenuCommand::SetThreshold(threshold) => self.current.threshold = threshold,
+            MenuCommand::BeginTriggerAssignment { .. } => return Err(()),
+        }
+        Ok(())
+    }
+
+    fn select_trigger(&mut self, trigger: TriggerKey) {
+        self.current.trigger = trigger;
+    }
+
+    fn persist(&mut self) -> Result<(), PreferenceError> {
+        self.repository.save(self.current)
+    }
+
+    #[cfg(test)]
+    fn saved(&self) -> Preferences {
+        self.repository.load()
+    }
+}
 
 struct MicrophonePermissionRuntime {
     flow: MicrophonePermissionFlow,
@@ -133,6 +187,55 @@ impl DeferredTapState {
         } else {
             self.pending.take().map(TapState::event)
         }
+    }
+}
+
+#[derive(Default)]
+struct AssignmentTracker {
+    active_epoch: Option<AssignmentEpoch>,
+}
+
+impl AssignmentTracker {
+    fn begin(&mut self, epoch: AssignmentEpoch) {
+        self.active_epoch = Some(epoch);
+    }
+
+    fn cancel_unless_ready(&mut self, status: &AppStatus, control: &HotkeyControl) {
+        if status == &AppStatus::Ready {
+            return;
+        }
+        if let Some(epoch) = self.active_epoch.take() {
+            control.cancel_assignment(epoch);
+        }
+        control.cancel_current_assignment();
+    }
+
+    fn accept_selection(
+        &mut self,
+        trigger: TriggerKey,
+        epoch: AssignmentEpoch,
+        status: &AppStatus,
+    ) -> Option<TriggerKey> {
+        if status == &AppStatus::Ready && self.active_epoch == Some(epoch) {
+            self.active_epoch = None;
+            Some(trigger)
+        } else {
+            None
+        }
+    }
+
+    fn accept_cancellation(&mut self, epoch: AssignmentEpoch) -> bool {
+        if self.active_epoch == Some(epoch) {
+            self.active_epoch = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn is_active(&self) -> bool {
+        self.active_epoch.is_some()
     }
 }
 
@@ -313,6 +416,11 @@ extern "C" fn timer_fired(_timer: CFRunLoopTimerRef, raw_context: *mut c_void) {
 pub struct Runtime {
     controller: AppController,
     menu: MenuBar,
+    preferences: RuntimePreferences<SystemPreferenceStore>,
+    menu_commands: Receiver<MenuCommand>,
+    hotkey_control: HotkeyControl,
+    assignment: AssignmentTracker,
+    menu_readiness: MenuReadiness,
     recorder: AudioRecorder,
     hotkey: Option<HotkeyListener>,
     hotkey_sender: Sender<HotkeySignal>,
@@ -329,7 +437,6 @@ pub struct Runtime {
     insertion_timer: Option<ScheduledTimer>,
     error_timer: Option<ScheduledTimer>,
     pending_insertion: Option<PasteFlow<PendingInsertion>>,
-    press_started: Option<Instant>,
     applied_permissions: PermissionSnapshot,
     microphone_permissions: MicrophonePermissionRuntime,
     tap_needs_retry: bool,
@@ -342,13 +449,28 @@ impl Runtime {
     /// alive until `NSApplication::run` returns.
     pub fn start(_mtm: MainThreadMarker) -> Pin<Box<Self>> {
         let (hotkey_sender, hotkey_events) = mpsc::channel();
+        let (menu_sender, menu_commands) = mpsc::channel();
         let (asr_commands, asr_command_receiver) = mpsc::channel();
         let (asr_event_sender, asr_events) = mpsc::channel();
         let asr_worker = spawn_asr_worker(asr_command_receiver, asr_event_sender);
+        let preference_repository = PreferenceRepository::new(SystemPreferenceStore::new());
+        let preferences = preference_repository.load();
+        let hotkey_control = HotkeyControl::new(preferences);
+        let menu_readiness = MenuReadiness::new(false);
 
         let mut runtime = Box::pin(Self {
             controller: AppController::new(),
-            menu: MenuBar::new(),
+            menu: MenuBar::new(
+                preferences,
+                menu_sender,
+                hotkey_control.clone(),
+                menu_readiness.clone(),
+            ),
+            preferences: RuntimePreferences::new(preferences, preference_repository),
+            menu_commands,
+            hotkey_control,
+            assignment: AssignmentTracker::default(),
+            menu_readiness,
             recorder: AudioRecorder::new(),
             hotkey: None,
             hotkey_sender,
@@ -365,7 +487,6 @@ impl Runtime {
             insertion_timer: None,
             error_timer: None,
             pending_insertion: None,
-            press_started: None,
             applied_permissions: PermissionSnapshot::default(),
             microphone_permissions: MicrophonePermissionRuntime::default(),
             tap_needs_retry: false,
@@ -429,7 +550,6 @@ impl Runtime {
             TimerKind::PollPermissions => self.poll_permissions(),
             TimerKind::FinishCapture => self.finish_capture(),
             TimerKind::CaptureLimit => {
-                self.press_started = None;
                 self.dispatch(AppEvent::CaptureLimitReached);
             }
             TimerKind::PasteCommand | TimerKind::RestorePasteboard => {
@@ -442,6 +562,8 @@ impl Runtime {
     fn drain_events(&mut self) {
         self.drain_menu_actions();
         self.drain_microphone_permission_completions();
+
+        self.drain_menu_commands();
 
         if self.pending_insertion.is_none() {
             self.drain_hotkey_events();
@@ -475,6 +597,13 @@ impl Runtime {
         }
     }
 
+    fn drain_menu_commands(&mut self) {
+        let menu_commands: Vec<_> = self.menu_commands.try_iter().collect();
+        for command in menu_commands {
+            self.handle_menu_command(command);
+        }
+    }
+
     fn drain_menu_actions(&mut self) {
         while let Some(action) = self.menu.take_action() {
             match action {
@@ -502,19 +631,14 @@ impl Runtime {
 
     fn handle_hotkey(&mut self, signal: HotkeySignal) {
         match signal {
-            HotkeySignal::Pressed { observed_at } => {
-                if self.controller.status() == &AppStatus::Ready {
-                    self.press_started = Some(observed_at);
-                }
-                self.dispatch(AppEvent::FnPressed);
+            HotkeySignal::Pressed => {
+                self.dispatch(AppEvent::TriggerPressed);
             }
-            HotkeySignal::Released { observed_at } => {
-                let held_ms = self
-                    .press_started
-                    .take()
-                    .map(|started| held_millis(started, observed_at))
-                    .unwrap_or(0);
-                self.dispatch(AppEvent::FnReleased { held_ms });
+            HotkeySignal::Released { short } => {
+                self.dispatch(AppEvent::TriggerReleased { short });
+            }
+            HotkeySignal::Cancelled => {
+                self.dispatch(AppEvent::TriggerCancelled);
             }
             HotkeySignal::TapLost => {
                 self.tap_needs_retry = true;
@@ -524,6 +648,47 @@ impl Runtime {
                 self.tap_needs_retry = false;
                 self.observe_tap_state(TapState::Restored);
             }
+            HotkeySignal::AssignmentSelected { trigger, epoch } => {
+                if let Some(trigger) =
+                    self.assignment
+                        .accept_selection(trigger, epoch, self.controller.status())
+                {
+                    self.preferences.select_trigger(trigger);
+                    self.publish_preferences();
+                    self.menu.render(self.controller.status());
+                }
+            }
+            HotkeySignal::AssignmentCancelled { epoch }
+                if self.assignment.accept_cancellation(epoch) =>
+            {
+                self.menu.render(self.controller.status());
+            }
+            HotkeySignal::AssignmentCancelled { .. } => {}
+        }
+    }
+
+    fn handle_menu_command(&mut self, command: MenuCommand) {
+        if let MenuCommand::BeginTriggerAssignment { epoch } = command {
+            if self.controller.status() == &AppStatus::Ready {
+                self.assignment.begin(epoch);
+                self.menu.render_assignment();
+            } else {
+                self.hotkey_control.cancel_assignment(epoch);
+            }
+            return;
+        }
+
+        if self.preferences.apply_in_memory(command).is_ok() {
+            self.publish_preferences();
+        }
+    }
+
+    fn publish_preferences(&mut self) {
+        let preferences = self.preferences.current();
+        self.menu.render_preferences(preferences);
+        self.hotkey_control.set_preferences(preferences);
+        if self.preferences.persist().is_err() {
+            tracing::warn!(error_category = "preference_persistence");
         }
     }
 
@@ -547,15 +712,17 @@ impl Runtime {
 
         if !permissions.input_monitoring {
             self.tap_needs_retry = false;
+            reset_hotkey_before_drop(&self.hotkey_control, &self.hotkey_sender);
             self.hotkey.take();
             return;
         }
 
         if self.tap_needs_retry {
+            reset_hotkey_before_drop(&self.hotkey_control, &self.hotkey_sender);
             self.hotkey.take();
         }
         if self.hotkey.is_none() {
-            match HotkeyListener::install(self.hotkey_sender.clone()) {
+            match HotkeyListener::install(self.hotkey_sender.clone(), self.hotkey_control.clone()) {
                 Ok(listener) => {
                     self.hotkey = Some(listener);
                     self.tap_needs_retry = false;
@@ -571,6 +738,10 @@ impl Runtime {
 
     fn dispatch(&mut self, event: AppEvent) {
         let effects = self.controller.handle(event);
+        self.menu_readiness
+            .set_ready(self.controller.status() == &AppStatus::Ready);
+        self.assignment
+            .cancel_unless_ready(self.controller.status(), &self.hotkey_control);
         self.menu.render(self.controller.status());
         tracing::debug!(state = status_name(self.controller.status()));
         for effect in effects {
@@ -611,17 +782,18 @@ impl Runtime {
                     tracing::warn!(error_category = "open_permission_settings");
                 }
             }
-            Effect::StartCapture => match self.recorder.start() {
-                Ok(()) => {
-                    self.replace_capture_limit_timer(MAX_CAPTURE_MS);
-                    tracing::debug!(lifecycle = "capture_started");
+            Effect::StartCapture => {
+                match capture_start_result_event(self.recorder.start(), &self.hotkey_control) {
+                    Ok(()) => {
+                        self.replace_capture_limit_timer(MAX_CAPTURE_MS);
+                        tracing::debug!(lifecycle = "capture_started");
+                    }
+                    Err(event) => {
+                        tracing::warn!(error_category = "microphone_start");
+                        self.dispatch(event);
+                    }
                 }
-                Err(_) => {
-                    self.press_started = None;
-                    tracing::warn!(error_category = "microphone_start");
-                    self.dispatch(AppEvent::CaptureFailed);
-                }
-            },
+            }
             Effect::AbortCapture => {
                 self.cancel_finish_timer();
                 self.cancel_capture_limit_timer();
@@ -678,7 +850,6 @@ impl Runtime {
     }
 
     fn finish_capture(&mut self) {
-        self.press_started = None;
         let stop_result = self.recorder.stop();
         match &stop_result {
             Ok(samples) => {
@@ -759,6 +930,22 @@ impl Runtime {
     }
 }
 
+fn reset_hotkey_before_drop(control: &HotkeyControl, sender: &Sender<HotkeySignal>) {
+    if control.reset_for_listener_removal() {
+        let _ = sender.send(HotkeySignal::Cancelled);
+    }
+}
+
+fn capture_start_result_event(
+    result: Result<(), AudioError>,
+    control: &HotkeyControl,
+) -> Result<(), AppEvent> {
+    result.map_err(|_| {
+        control.guard_pending_release_after_capture_failure();
+        AppEvent::CaptureFailed
+    })
+}
+
 impl PasteFlowBoundary for Runtime {
     fn schedule(&mut self, kind: TimerKind, delay_ms: u64) {
         self.replace_insertion_timer(kind, delay_ms);
@@ -770,15 +957,9 @@ impl PasteFlowBoundary for Runtime {
             tracing::warn!(error_category = "text_insertion");
         }
         self.dispatch(AppEvent::PasteFinished(result));
+        self.drain_menu_commands();
         self.drain_hotkey_events();
     }
-}
-
-fn held_millis(pressed_at: Instant, released_at: Instant) -> u64 {
-    let duration = released_at
-        .checked_duration_since(pressed_at)
-        .unwrap_or_default();
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub(crate) fn capture_result_event(result: Result<Option<Vec<f32>>, AudioError>) -> AppEvent {
@@ -905,13 +1086,21 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        held_millis, milliseconds_to_seconds, status_name, wait_for_smoke_child, DeferredTapState,
-        MicrophonePermissionRuntime, PasteFlow, PasteFlowBoundary, PasteInsertion, TapState,
-        TimerKind, EVENT_DRAIN_MS, PERMISSION_POLL_MS,
+        capture_start_result_event, milliseconds_to_seconds, reset_hotkey_before_drop, status_name,
+        wait_for_smoke_child, AssignmentTracker, DeferredTapState, MicrophonePermissionRuntime,
+        PasteFlow, PasteFlowBoundary, PasteInsertion, RuntimePreferences, TapState, TimerKind,
+        EVENT_DRAIN_MS, PERMISSION_POLL_MS,
     };
+    use crate::audio::AudioError;
     use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
+    use crate::hotkey::{HotkeyControl, HotkeySignal, KeyboardObservation, ObservationKind};
     use crate::inserter::InsertError;
+    use crate::menu::MenuCommand;
     use crate::permissions::{MicrophoneAuthorization, MicrophonePermissionBoundary};
+    use crate::preferences::{
+        HoldThreshold, PreferenceError, PreferenceRepository, Preferences, RawPreferenceStore,
+        TriggerKey,
+    };
     use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
 
     struct RecordingMicrophoneBoundary {
@@ -930,12 +1119,262 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MemoryRawStore {
+        trigger: Option<String>,
+        threshold: Option<u64>,
+    }
+
+    impl RawPreferenceStore for MemoryRawStore {
+        fn trigger_value(&self) -> Option<String> {
+            self.trigger.clone()
+        }
+
+        fn threshold_value(&self) -> Option<u64> {
+            self.threshold
+        }
+
+        fn set_trigger_value(&mut self, value: &str) -> Result<(), PreferenceError> {
+            self.trigger = Some(value.to_owned());
+            Ok(())
+        }
+
+        fn set_threshold_value(&mut self, value: u64) -> Result<(), PreferenceError> {
+            self.threshold = Some(value);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn threshold_command_updates_menu_store_and_future_gate_preferences() {
+        let mut model = RuntimePreferences::new(
+            Preferences::default(),
+            PreferenceRepository::new(MemoryRawStore::default()),
+        );
+        assert_eq!(
+            model.apply(MenuCommand::SetThreshold(HoldThreshold::MS_750)),
+            Ok(())
+        );
+        assert_eq!(model.current().threshold, HoldThreshold::MS_750);
+        assert_eq!(model.saved().threshold, HoldThreshold::MS_750);
+    }
+
+    fn key_down(keycode: u16) -> KeyboardObservation {
+        KeyboardObservation {
+            kind: ObservationKind::KeyDown,
+            keycode,
+            flags: 0,
+            autorepeat: false,
+            replay_marker: false,
+        }
+    }
+
+    #[test]
+    fn recorder_start_failure_guards_pending_trigger_release_without_replay() {
+        let start = std::time::Instant::now();
+        let control = HotkeyControl::new(Preferences::default());
+        assert_eq!(
+            control.observe_for_test(key_down(63), start),
+            Some(HotkeySignal::Pressed)
+        );
+
+        let mut controller = AppController::new();
+        controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
+        controller.handle(AppEvent::ModelLoaded(Ok(())));
+        assert_eq!(
+            controller.handle(AppEvent::TriggerPressed),
+            vec![Effect::StartCapture]
+        );
+
+        let failure = capture_start_result_event(
+            Err(AudioError::StartStream("test failure".to_owned())),
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(failure, AppEvent::CaptureFailed);
+        controller.handle(failure);
+
+        assert_eq!(
+            control.observe_outcome_for_test(
+                KeyboardObservation {
+                    kind: ObservationKind::KeyUp,
+                    ..key_down(63)
+                },
+                start + std::time::Duration::from_millis(100),
+            ),
+            (true, None, 0)
+        );
+        assert!(matches!(
+            controller.status(),
+            AppStatus::Error {
+                recoverable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn assignment_is_cancelled_when_status_leaves_ready_for_permission_or_error() {
+        for status in [
+            AppStatus::PermissionBlocked(crate::state::PermissionKind::InputMonitoring),
+            AppStatus::Error {
+                message: "runtime error",
+                recoverable: true,
+            },
+        ] {
+            let control = HotkeyControl::new(Preferences::default());
+            let epoch = control.begin_assignment().unwrap();
+            let mut assignment = AssignmentTracker::default();
+            assignment.begin(epoch);
+
+            assignment.cancel_unless_ready(&status, &control);
+
+            assert!(!assignment.is_active());
+            assert_eq!(
+                control.observe_for_test(key_down(49), std::time::Instant::now()),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn stale_assignment_selection_cannot_replace_a_newer_assignment() {
+        let control = HotkeyControl::new(Preferences::default());
+        let first_epoch = control.begin_assignment().unwrap();
+        let first_signal = control.observe_for_test(key_down(49), std::time::Instant::now());
+        control.observe_for_test(
+            KeyboardObservation {
+                kind: ObservationKind::KeyUp,
+                ..key_down(49)
+            },
+            std::time::Instant::now(),
+        );
+
+        let second_epoch = control.begin_assignment().unwrap();
+        let mut assignment = AssignmentTracker::default();
+        assignment.begin(second_epoch);
+        let mut model = RuntimePreferences::new(
+            Preferences::default(),
+            PreferenceRepository::new(MemoryRawStore::default()),
+        );
+
+        let Some(HotkeySignal::AssignmentSelected {
+            trigger,
+            epoch: stale_epoch,
+        }) = first_signal
+        else {
+            panic!("first assignment must produce a selected signal");
+        };
+        assert_eq!(stale_epoch, first_epoch);
+        assert_eq!(
+            assignment.accept_selection(trigger, stale_epoch, &AppStatus::Ready),
+            None
+        );
+        assert_eq!(model.current().trigger, TriggerKey::FnGlobe);
+        assert_eq!(
+            assignment.accept_selection(TriggerKey::KeyCode(54), second_epoch, &AppStatus::Ready,),
+            Some(TriggerKey::KeyCode(54))
+        );
+        model.select_trigger(TriggerKey::KeyCode(54));
+        assert_eq!(model.current().trigger, TriggerKey::KeyCode(54));
+    }
+
+    #[test]
+    fn status_cancellation_keeps_only_the_consumed_release_guard() {
+        let control = HotkeyControl::new(Preferences::default());
+        let epoch = control.begin_assignment().unwrap();
+        control.observe_for_test(key_down(49), std::time::Instant::now());
+        let mut assignment = AssignmentTracker::default();
+        assignment.begin(epoch);
+
+        assignment.cancel_unless_ready(
+            &AppStatus::Error {
+                message: "runtime error",
+                recoverable: true,
+            },
+            &control,
+        );
+
+        assert_eq!(control.current_assignment_epoch(), None);
+        assert!(control.suppresses_for_test(
+            KeyboardObservation {
+                kind: ObservationKind::KeyUp,
+                ..key_down(49)
+            },
+            std::time::Instant::now(),
+        ));
+    }
+
+    #[test]
+    fn listener_removal_cancels_after_an_already_queued_press() {
+        let control = HotkeyControl::new(Preferences::default());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let pressed = control
+            .observe_for_test(key_down(63), std::time::Instant::now())
+            .unwrap();
+        sender.send(pressed).unwrap();
+
+        reset_hotkey_before_drop(&control, &sender);
+
+        assert_eq!(receiver.recv().unwrap(), HotkeySignal::Pressed);
+        assert_eq!(receiver.recv().unwrap(), HotkeySignal::Cancelled);
+        assert!(control.begin_assignment().is_some());
+    }
+
+    #[test]
+    fn quick_assignment_release_before_drain_persists_selected_trigger() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let control = HotkeyControl::new(Preferences::default());
+        let epoch = control.begin_assignment().unwrap();
+        sender
+            .send(MenuCommand::BeginTriggerAssignment { epoch })
+            .unwrap();
+        let selected = control
+            .observe_for_test(key_down(49), std::time::Instant::now())
+            .unwrap();
+        assert!(control.suppresses_for_test(
+            KeyboardObservation {
+                kind: ObservationKind::KeyUp,
+                ..key_down(49)
+            },
+            std::time::Instant::now(),
+        ));
+
+        let mut assignment = AssignmentTracker::default();
+        let MenuCommand::BeginTriggerAssignment {
+            epoch: command_epoch,
+        } = receiver.recv().unwrap()
+        else {
+            panic!("assignment command must retain its gate epoch");
+        };
+        assignment.begin(command_epoch);
+        let HotkeySignal::AssignmentSelected {
+            trigger,
+            epoch: selected_epoch,
+        } = selected
+        else {
+            panic!("assignment key must produce a selected signal");
+        };
+        let trigger = assignment
+            .accept_selection(trigger, selected_epoch, &AppStatus::Ready)
+            .unwrap();
+        let mut model = RuntimePreferences::new(
+            Preferences::default(),
+            PreferenceRepository::new(MemoryRawStore::default()),
+        );
+        model.select_trigger(trigger);
+        model.persist().unwrap();
+
+        assert_eq!(command_epoch, epoch);
+        assert_eq!(model.saved().trigger, TriggerKey::KeyCode(49));
+    }
+
     fn recognizing_controller() -> AppController {
         let mut controller = AppController::new();
         controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
         controller.handle(AppEvent::ModelLoaded(Ok(())));
-        controller.handle(AppEvent::FnPressed);
-        controller.handle(AppEvent::FnReleased { held_ms: 900 });
+        controller.handle(AppEvent::TriggerPressed);
+        controller.handle(AppEvent::TriggerReleased { short: false });
         assert_eq!(controller.status(), &AppStatus::Recognizing);
         controller
     }
@@ -948,14 +1387,6 @@ mod tests {
         assert_eq!(MAX_CAPTURE_MS, 25_000);
         assert_eq!(ERROR_VISIBLE_MS, 3_000);
         assert_eq!(milliseconds_to_seconds(RELEASE_GRACE_MS), 0.18);
-    }
-
-    #[test]
-    fn delayed_hotkey_drain_uses_callback_times_for_hold_duration() {
-        let pressed_at = std::time::Instant::now();
-        let released_at = pressed_at + std::time::Duration::from_millis(900);
-
-        assert_eq!(held_millis(pressed_at, released_at), 900);
     }
 
     #[test]
@@ -1214,7 +1645,7 @@ mod tests {
 
         assert_eq!(tap.observe(controller.status(), TapState::Lost), None);
         assert_eq!(tap.observe(controller.status(), TapState::Restored), None);
-        assert!(controller.handle(AppEvent::FnPressed).is_empty());
+        assert!(controller.handle(AppEvent::TriggerPressed).is_empty());
         assert_eq!(controller.status(), &AppStatus::Recognizing);
 
         assert_eq!(
@@ -1229,7 +1660,7 @@ mod tests {
         controller.handle(AppEvent::EventTapRestored);
 
         assert_eq!(
-            controller.handle(AppEvent::FnPressed),
+            controller.handle(AppEvent::TriggerPressed),
             vec![Effect::StartCapture]
         );
     }
@@ -1240,7 +1671,7 @@ mod tests {
         let mut tap = DeferredTapState::default();
 
         assert_eq!(tap.observe(controller.status(), TapState::Lost), None);
-        assert!(controller.handle(AppEvent::FnPressed).is_empty());
+        assert!(controller.handle(AppEvent::TriggerPressed).is_empty());
         assert_eq!(
             controller.handle(AppEvent::RecognitionFinished(Ok("первый".into()))),
             vec![Effect::InsertText("первый".into())]
@@ -1256,14 +1687,14 @@ mod tests {
                 ..
             }
         ));
-        assert!(controller.handle(AppEvent::FnPressed).is_empty());
+        assert!(controller.handle(AppEvent::TriggerPressed).is_empty());
 
         let restored = tap
             .observe(controller.status(), TapState::Restored)
             .unwrap();
         controller.handle(restored);
         assert_eq!(
-            controller.handle(AppEvent::FnPressed),
+            controller.handle(AppEvent::TriggerPressed),
             vec![Effect::StartCapture]
         );
     }

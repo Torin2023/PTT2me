@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use objc2::{
@@ -7,11 +8,14 @@ use objc2::{
     runtime::AnyObject, sel, ClassType, DeclaredClass,
 };
 use objc2_app_kit::{
-    NSApplication, NSColor, NSImage, NSImageSymbolConfiguration, NSMenu, NSMenuItem, NSStatusBar,
-    NSStatusBarButton, NSStatusItem, NSVariableStatusItemLength,
+    NSApplication, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSImage,
+    NSImageSymbolConfiguration, NSMenu, NSMenuItem, NSStatusBar, NSStatusBarButton, NSStatusItem,
+    NSVariableStatusItemLength,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 
+use crate::hotkey::{AssignmentEpoch, HotkeyControl};
+use crate::preferences::{HoldThreshold, Preferences, TriggerKey};
 use crate::state::{AppStatus, PermissionKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,20 +126,27 @@ pub enum MenuEntry {
     Status,
     Version,
     PermissionSettings,
+    Trigger,
+    Threshold,
     Separator,
     Quit,
 }
 
-pub const MENU_DESCRIPTOR: [MenuEntry; 5] = [
+pub const MENU_DESCRIPTOR: [MenuEntry; 7] = [
     MenuEntry::Status,
     MenuEntry::Version,
     MenuEntry::PermissionSettings,
+    MenuEntry::Trigger,
+    MenuEntry::Threshold,
     MenuEntry::Separator,
     MenuEntry::Quit,
 ];
 
-fn symbol_style(projection: &MenuProjection) -> SymbolStyle {
-    projection.style
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuCommand {
+    BeginTriggerAssignment { epoch: AssignmentEpoch },
+    ResetTrigger,
+    SetThreshold(HoldThreshold),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,9 +154,100 @@ pub(crate) enum MenuAction {
     OpenPermission(PermissionKind),
 }
 
+#[derive(Clone)]
+pub struct MenuReadiness {
+    ready: Rc<Cell<bool>>,
+}
+
+impl MenuReadiness {
+    pub fn new(ready: bool) -> Self {
+        Self {
+            ready: Rc::new(Cell::new(ready)),
+        }
+    }
+
+    pub fn set_ready(&self, ready: bool) {
+        self.ready.set(ready);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.get()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreferenceProjection {
+    trigger_title: String,
+    threshold_states: [bool; 3],
+}
+
+impl From<Preferences> for PreferenceProjection {
+    fn from(preferences: Preferences) -> Self {
+        Self {
+            trigger_title: preferences.trigger.display_name(),
+            threshold_states: HoldThreshold::OPTIONS.map(|value| value == preferences.threshold),
+        }
+    }
+}
+
+fn symbol_style(projection: &MenuProjection) -> SymbolStyle {
+    projection.style
+}
+
 struct MenuTargetIvars {
+    publisher: MenuCommandPublisher,
     action_sender: Sender<MenuAction>,
     permission: Cell<Option<PermissionKind>>,
+}
+
+#[derive(Clone)]
+struct MenuCommandPublisher {
+    sender: Sender<MenuCommand>,
+    hotkey: HotkeyControl,
+    readiness: MenuReadiness,
+}
+
+impl MenuCommandPublisher {
+    fn new(sender: Sender<MenuCommand>, hotkey: HotkeyControl, readiness: MenuReadiness) -> Self {
+        Self {
+            sender,
+            hotkey,
+            readiness,
+        }
+    }
+
+    fn send(&self, command: MenuCommand) -> bool {
+        match command {
+            MenuCommand::BeginTriggerAssignment { .. } => false,
+            MenuCommand::ResetTrigger => {
+                self.hotkey.set_trigger(TriggerKey::FnGlobe);
+                self.sender.send(command).is_ok()
+            }
+            MenuCommand::SetThreshold(threshold) => {
+                self.hotkey.set_threshold(threshold);
+                self.sender.send(command).is_ok()
+            }
+        }
+    }
+
+    fn begin_assignment(&self) -> bool {
+        if !self.readiness.is_ready() {
+            return false;
+        }
+        let Some(epoch) = self.hotkey.begin_assignment() else {
+            return false;
+        };
+        if self
+            .sender
+            .send(MenuCommand::BeginTriggerAssignment { epoch })
+            .is_ok()
+        {
+            true
+        } else {
+            self.hotkey.cancel_assignment(epoch);
+            false
+        }
+    }
 }
 
 declare_class!(
@@ -184,12 +286,43 @@ declare_class!(
                     .send(MenuAction::OpenPermission(permission));
             }
         }
+
+        #[method(assignTrigger:)]
+        fn assign_trigger(&self, _sender: &AnyObject) {
+            self.ivars().publisher.begin_assignment();
+        }
+
+        #[method(resetTrigger:)]
+        fn reset_trigger(&self, _sender: &AnyObject) {
+            self.ivars().publisher.send(MenuCommand::ResetTrigger);
+        }
+
+        #[method(selectThreshold:)]
+        fn select_threshold(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let Ok(milliseconds) = u64::try_from(tag) else {
+                return;
+            };
+            let Some(threshold) = HoldThreshold::from_millis(milliseconds) else {
+                return;
+            };
+            self.ivars()
+                .publisher
+                .send(MenuCommand::SetThreshold(threshold));
+        }
     }
 );
 
 impl MenuTarget {
-    fn new(mtm: MainThreadMarker, action_sender: Sender<MenuAction>) -> Retained<Self> {
+    fn new(
+        mtm: MainThreadMarker,
+        sender: Sender<MenuCommand>,
+        hotkey: HotkeyControl,
+        readiness: MenuReadiness,
+        action_sender: Sender<MenuAction>,
+    ) -> Retained<Self> {
         let this = mtm.alloc().set_ivars(MenuTargetIvars {
+            publisher: MenuCommandPublisher::new(sender, hotkey, readiness),
             action_sender,
             permission: Cell::new(None),
         });
@@ -197,14 +330,16 @@ impl MenuTarget {
     }
 }
 
-/// Owns the permanent four-row status menu and projects application state onto
-/// the existing status row and status-bar button.
+/// Owns the permanent status menu and projects application and preference state
+/// onto its retained rows without rebuilding it.
 pub struct MenuBar {
     _status_bar: Retained<NSStatusBar>,
     _status_item: Retained<NSStatusItem>,
     _menu: Retained<NSMenu>,
     status_row: Retained<NSMenuItem>,
     permission_row: Retained<NSMenuItem>,
+    current_trigger_row: Retained<NSMenuItem>,
+    threshold_rows: [Retained<NSMenuItem>; 3],
     button: Retained<NSStatusBarButton>,
     _target: Retained<MenuTarget>,
     action_receiver: Receiver<MenuAction>,
@@ -218,15 +353,22 @@ impl MenuBar {
     ///
     /// Panics when called outside the AppKit main thread or if AppKit does not
     /// provide a button for its newly-created status item.
-    pub fn new() -> Self {
+    pub fn new(
+        preferences: Preferences,
+        sender: Sender<MenuCommand>,
+        hotkey: HotkeyControl,
+        readiness: MenuReadiness,
+    ) -> Self {
         let mtm = main_thread_marker();
         let (action_sender, action_receiver) = mpsc::channel();
-        let target = MenuTarget::new(mtm, action_sender);
+        let target = MenuTarget::new(mtm, sender, hotkey, readiness, action_sender);
         let menu = unsafe { NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("PTT2me")) };
         unsafe { menu.setAutoenablesItems(false) };
 
         let mut status_row = None;
         let mut permission_row = None;
+        let mut current_trigger_row = None;
+        let mut threshold_rows = Vec::with_capacity(HoldThreshold::OPTIONS.len());
         for entry in MENU_DESCRIPTOR {
             match entry {
                 MenuEntry::Status => {
@@ -253,6 +395,60 @@ impl MenuBar {
                     }
                     menu.addItem(&item);
                     permission_row = Some(item);
+                }
+                MenuEntry::Trigger => {
+                    let parent = menu_item(mtm, "Клавиша активации", None);
+                    let submenu = unsafe {
+                        NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Клавиша активации"))
+                    };
+                    unsafe { submenu.setAutoenablesItems(false) };
+
+                    let current = menu_item(mtm, "", None);
+                    unsafe { current.setEnabled(false) };
+                    submenu.addItem(&current);
+
+                    let assign = menu_item(mtm, "Назначить…", Some(sel!(assignTrigger:)));
+                    unsafe {
+                        assign.setTarget(Some(&target));
+                        assign.setEnabled(true);
+                    }
+                    submenu.addItem(&assign);
+
+                    let reset = menu_item(mtm, "Сбросить на Fn / Globe", Some(sel!(resetTrigger:)));
+                    unsafe {
+                        reset.setTarget(Some(&target));
+                        reset.setEnabled(true);
+                    }
+                    submenu.addItem(&reset);
+
+                    parent.setSubmenu(Some(&submenu));
+                    menu.addItem(&parent);
+                    current_trigger_row = Some(current);
+                }
+                MenuEntry::Threshold => {
+                    let parent = menu_item(mtm, "Порог удержания", None);
+                    let submenu = unsafe {
+                        NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Порог удержания"))
+                    };
+                    unsafe { submenu.setAutoenablesItems(false) };
+
+                    for threshold in HoldThreshold::OPTIONS {
+                        let item = menu_item(
+                            mtm,
+                            &format!("{} мс", threshold.millis()),
+                            Some(sel!(selectThreshold:)),
+                        );
+                        unsafe {
+                            item.setTarget(Some(&target));
+                            item.setTag(threshold.millis() as isize);
+                            item.setEnabled(true);
+                        }
+                        submenu.addItem(&item);
+                        threshold_rows.push(item);
+                    }
+
+                    parent.setSubmenu(Some(&submenu));
+                    menu.addItem(&parent);
                 }
                 MenuEntry::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
                 MenuEntry::Quit => {
@@ -285,12 +481,18 @@ impl MenuBar {
             status_row: status_row.expect("menu descriptor must contain the status row"),
             permission_row: permission_row
                 .expect("menu descriptor must contain the permission action row"),
+            current_trigger_row: current_trigger_row
+                .expect("menu descriptor must contain the current trigger row"),
+            threshold_rows: threshold_rows
+                .try_into()
+                .unwrap_or_else(|_| panic!("menu descriptor must contain three threshold rows")),
             button,
             _target: target,
             action_receiver,
             pulse_active: false,
         };
         menu_bar.render(&AppStatus::Starting);
+        menu_bar.render_preferences(preferences);
         menu_bar
     }
 
@@ -324,14 +526,37 @@ impl MenuBar {
         }
     }
 
+    pub fn render_assignment(&mut self) {
+        let _mtm = main_thread_marker();
+        unsafe {
+            self.status_row
+                .setTitle(&NSString::from_str("● Нажмите клавишу…"));
+        }
+    }
+
+    pub fn render_preferences(&mut self, preferences: Preferences) {
+        let _mtm = main_thread_marker();
+        let projection = PreferenceProjection::from(preferences);
+        unsafe {
+            self.current_trigger_row
+                .setTitle(&NSString::from_str(&format!(
+                    "Текущая: {}",
+                    projection.trigger_title
+                )));
+        }
+        for (row, selected) in self.threshold_rows.iter().zip(projection.threshold_states) {
+            unsafe {
+                row.setState(if selected {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+            }
+        }
+    }
+
     pub(crate) fn take_action(&self) -> Option<MenuAction> {
         self.action_receiver.try_recv().ok()
-    }
-}
-
-impl Default for MenuBar {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -434,6 +659,11 @@ fn set_recognition_pulse(button: &NSStatusBarButton, enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use crate::hotkey::{HotkeyControl, HotkeySignal, KeyboardObservation, ObservationKind};
+    use crate::preferences::{HoldThreshold, Preferences, TriggerKey};
     use crate::state::PermissionKind;
 
     #[test]
@@ -549,13 +779,15 @@ mod tests {
     }
 
     #[test]
-    fn menu_descriptor_contains_the_five_approved_entries() {
+    fn menu_descriptor_has_adjacent_trigger_and_threshold_controls() {
         assert_eq!(
             MENU_DESCRIPTOR,
             [
                 MenuEntry::Status,
                 MenuEntry::Version,
                 MenuEntry::PermissionSettings,
+                MenuEntry::Trigger,
+                MenuEntry::Threshold,
                 MenuEntry::Separator,
                 MenuEntry::Quit,
             ]
@@ -586,6 +818,113 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn preference_projection_marks_only_the_selected_threshold() {
+        let projection = PreferenceProjection::from(Preferences {
+            trigger: TriggerKey::KeyCode(54),
+            threshold: HoldThreshold::MS_750,
+        });
+        assert_eq!(projection.trigger_title, "Правый Command");
+        assert_eq!(projection.threshold_states, [false, false, true]);
+    }
+
+    fn observation(kind: ObservationKind, keycode: u16) -> KeyboardObservation {
+        KeyboardObservation {
+            kind,
+            keycode,
+            flags: 0,
+            autorepeat: false,
+            replay_marker: false,
+        }
+    }
+
+    #[test]
+    fn threshold_command_reaches_gate_before_runtime_drain() {
+        let (sender, receiver) = mpsc::channel();
+        let control = HotkeyControl::new(Preferences::default());
+        let publisher =
+            MenuCommandPublisher::new(sender, control.clone(), MenuReadiness::new(true));
+        let start = Instant::now();
+
+        assert!(publisher.send(MenuCommand::SetThreshold(HoldThreshold::MS_750)));
+        assert_eq!(
+            control.observe_for_test(observation(ObservationKind::KeyDown, 63), start),
+            Some(HotkeySignal::Pressed)
+        );
+        assert_eq!(
+            control.observe_for_test(
+                observation(ObservationKind::KeyUp, 63),
+                start + Duration::from_millis(500),
+            ),
+            Some(HotkeySignal::Released { short: true })
+        );
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(MenuCommand::SetThreshold(HoldThreshold::MS_750))
+        );
+    }
+
+    #[test]
+    fn reset_trigger_command_reaches_gate_before_runtime_drain() {
+        let (sender, receiver) = mpsc::channel();
+        let control = HotkeyControl::new(Preferences {
+            trigger: TriggerKey::KeyCode(54),
+            threshold: HoldThreshold::MS_500,
+        });
+        let publisher =
+            MenuCommandPublisher::new(sender, control.clone(), MenuReadiness::new(true));
+
+        assert!(publisher.send(MenuCommand::ResetTrigger));
+        assert_eq!(
+            control.observe_for_test(observation(ObservationKind::KeyDown, 63), Instant::now(),),
+            Some(HotkeySignal::Pressed)
+        );
+        assert_eq!(receiver.try_recv(), Ok(MenuCommand::ResetTrigger));
+    }
+
+    #[test]
+    fn assignment_command_arms_gate_before_runtime_drain() {
+        let (sender, receiver) = mpsc::channel();
+        let control = HotkeyControl::new(Preferences::default());
+        let publisher =
+            MenuCommandPublisher::new(sender, control.clone(), MenuReadiness::new(true));
+
+        assert!(publisher.begin_assignment());
+        let selected_epoch = match control
+            .observe_for_test(observation(ObservationKind::KeyDown, 49), Instant::now())
+        {
+            Some(HotkeySignal::AssignmentSelected {
+                trigger: TriggerKey::KeyCode(49),
+                epoch,
+            }) => epoch,
+            other => panic!("expected selected assignment, got {other:?}"),
+        };
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(MenuCommand::BeginTriggerAssignment {
+                epoch: selected_epoch,
+            })
+        );
+    }
+
+    #[test]
+    fn non_ready_assignment_command_does_not_consume_the_next_key() {
+        let (sender, receiver) = mpsc::channel();
+        let control = HotkeyControl::new(Preferences::default());
+        let readiness = MenuReadiness::new(false);
+        let publisher = MenuCommandPublisher::new(sender, control.clone(), readiness);
+
+        assert!(!publisher.begin_assignment());
+        assert_eq!(
+            control.observe_for_test(observation(ObservationKind::KeyDown, 49), Instant::now(),),
+            None
+        );
+        assert_eq!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
     }
 
     #[test]

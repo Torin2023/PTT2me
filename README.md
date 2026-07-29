@@ -11,11 +11,12 @@ pasteboard whenever compatibility requires Command-V fallback.
 - Apple Silicon (`arm64`) Mac
 - macOS 13 Ventura or newer
 
-PTT2me loads its fixed model at startup. A short Fn/Globe press below 250 ms is
-replayed to macOS, so it remains available for the configured system action,
-including input-source switching. When the status becomes `Готово`, hold
-Fn/Globe for at least 250 ms while speaking and release it. The app keeps
-recording for another 180 ms, recognizes the captured phrase, and inserts a
+PTT2me loads its fixed model at startup. When the status becomes `Готово`,
+hold Fn/Globe while speaking and release it. Fn/Globe and a 500 ms hold
+threshold are the default settings. Recording begins immediately when the
+trigger is pressed; a hold that reaches the selected threshold is recognized
+on release. The app keeps recording for another 180 ms, recognizes the
+captured phrase, and inserts a
 non-empty result into whichever editable field owns the cursor at that moment.
 A capture ends automatically after 25 seconds.
 
@@ -25,19 +26,44 @@ available, PTT2me temporarily uses the full macOS pasteboard and Command-V,
 then performs a guarded restore after one second. A newer pasteboard change is
 never overwritten.
 
-The menu contains exactly:
+A short press is preserved: PTT2me replays it once to macOS, so the normal
+Fn/Globe input-source action still works. The same applies to a short press of
+any assigned ordinary key. If the assigned key is used in a combination, the
+combination is passed through in its original order instead of starting
+dictation.
+
+The menu contains the trigger controls:
 
 ```text
 <status>
-PTT2me 1.0.3
+PTT2me 1.0.4
 Открыть настройки…   (only while a required permission is missing)
+Клавиша активации
+  <selected key>
+  Назначить…
+  Сбросить на Fn / Globe
+Порог удержания
+  250 мс
+  500 мс
+  750 мс
 ────────────
 Выйти
 ```
 
 The status and version rows are informational. While a permission is missing,
 `Открыть настройки…` opens its exact Privacy & Security pane and can be used
-repeatedly. `Выйти` terminates the app.
+repeatedly.
+
+Choose `Клавиша активации` → `Назначить…`, then press the key to use for
+dictation. Press Escape to cancel assignment. `Сбросить на Fn / Globe` restores
+the default trigger. Escape, Caps Lock, media keys, Power, and Touch ID are
+not accepted as assigned triggers and leave the current trigger unchanged.
+
+Choose one of the exact `Порог удержания` values: 250, 500, or 750 ms. A hold
+shorter than the selected value is replayed normally; a longer hold records
+and is consumed so it does not type or invoke its usual system action.
+
+`Выйти` terminates the app.
 
 ## Build
 
@@ -87,7 +113,7 @@ To rebuild the app and create a local Apple Silicon DMG, run:
 scripts/build-dmg.sh
 ```
 
-The command creates `dist/PTT2me-1.0.3-macos-arm64.dmg` and its
+The command creates `dist/PTT2me-1.0.4-macos-arm64.dmg` and its
 `.sha256` checksum. The image contains `PTT2me.app` and an `Applications`
 link for drag-and-drop installation. It uses ad-hoc signing and is not
 notarized for public distribution.
@@ -111,9 +137,9 @@ No model is fetched at build or runtime. Before publishing a DMG:
    Command-V must still produce it.
 4. Verify rich text, an image, and a Finder file URL survive a fallback
    insertion.
-5. Perform 20 short Fn/Globe presses and 20 long holds. Short presses must
-   perform the configured macOS action without ASR; long holds must run PTT
-   without the short system action.
+5. Perform 20 short presses and 20 long holds with Fn/Globe and an assigned
+   ordinary trigger. Short presses must perform the configured macOS action
+   without ASR; long holds must run PTT without the short system action.
 6. Revoke each permission in turn and verify the corresponding status,
    repeatable `Открыть настройки…` action, and return to `Готово`.
 7. Move the cursor to another editable field during recognition and verify the
@@ -136,9 +162,10 @@ and guides their interactive setup.
 
 ## Privacy
 
-Audio and recognized text are processed locally. PTT2me does not save audio,
-transcripts, history, settings, or application data. Recognized text is used
-temporarily for insertion and is not retained by PTT2me. Direct Accessibility
+Audio and recognized text are processed locally. PTT2me stores only the
+selected trigger and hold threshold in macOS user defaults. It does not retain
+audio, transcripts, recognized text, history, or other application data.
+Recognized text is used temporarily for insertion. Direct Accessibility
 and Unicode insertion do not modify the pasteboard. The compatibility fallback
 restores every previous pasteboard item and representation unless newer
 contents were copied during insertion.

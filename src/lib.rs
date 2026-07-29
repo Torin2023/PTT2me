@@ -10,6 +10,7 @@ pub mod logging;
 pub mod menu;
 pub mod model;
 pub mod permissions;
+pub mod preferences;
 pub mod runtime;
 pub mod single_instance;
 pub mod state;
