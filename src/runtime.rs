@@ -3,8 +3,10 @@ use std::marker::PhantomPinned;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::process::{Child, Command};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use core_foundation::date::CFDate;
 use core_foundation::runloop::{
@@ -16,7 +18,10 @@ use crate::asr::{spawn_asr_worker, AsrCommand, AsrEvent};
 use crate::audio::{AudioError, AudioRecorder};
 use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS};
 use crate::hotkey::{AssignmentEpoch, HotkeyControl, HotkeyListener, HotkeySignal};
-use crate::inserter;
+use crate::inserter::{
+    InsertError, PendingInsertion, PASTEBOARD_RESTORE_DELAY_MS, PASTEBOARD_SETTLE_DELAY_MS,
+};
+use crate::menu::MenuAction;
 use crate::menu::{MenuBar, MenuCommand, MenuReadiness};
 use crate::model::{resources_dir_from_executable, ModelPaths};
 use crate::permissions::{
@@ -28,9 +33,13 @@ use crate::preferences::{
     TriggerKey,
 };
 use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
+use crate::text_inserter::{self, InsertMethod, InsertOutcome};
 
 const EVENT_DRAIN_MS: u64 = 50;
 const PERMISSION_POLL_MS: u64 = 1_000;
+const SMOKE_MODEL_TIMEOUT: Duration = Duration::from_secs(180);
+const SMOKE_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SMOKE_TIMEOUT_EXIT_CODE: i32 = 124;
 
 struct RuntimePreferences<R: RawPreferenceStore> {
     current: Preferences,
@@ -234,13 +243,103 @@ const fn is_dictation_in_flight(status: &AppStatus) -> bool {
     matches!(status, AppStatus::Recording | AppStatus::Recognizing)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimerKind {
     DrainEvents,
     PollPermissions,
     FinishCapture,
     CaptureLimit,
+    PasteCommand,
+    RestorePasteboard,
     ResetError,
+}
+
+trait PasteInsertion {
+    fn paste(&mut self) -> Result<(), InsertError>;
+    fn restore(&mut self) -> Result<(), InsertError>;
+    fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError;
+}
+
+impl PasteInsertion for PendingInsertion {
+    fn paste(&mut self) -> Result<(), InsertError> {
+        PendingInsertion::paste(self)
+    }
+
+    fn restore(&mut self) -> Result<(), InsertError> {
+        PendingInsertion::restore(self)
+    }
+
+    fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {
+        PendingInsertion::restore_after_paste_failure(self, primary)
+    }
+}
+
+trait PasteFlowBoundary {
+    fn schedule(&mut self, kind: TimerKind, delay_ms: u64);
+    fn finish_and_drain_hotkeys(&mut self, result: Result<(), String>);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasteFlowState {
+    AwaitingPaste,
+    AwaitingRestore,
+    Finished,
+}
+
+struct PasteFlow<I> {
+    insertion: I,
+    state: PasteFlowState,
+}
+
+impl<I: PasteInsertion> PasteFlow<I> {
+    fn begin(insertion: I, boundary: &mut impl PasteFlowBoundary) -> Self {
+        boundary.schedule(TimerKind::PasteCommand, PASTEBOARD_SETTLE_DELAY_MS);
+        Self {
+            insertion,
+            state: PasteFlowState::AwaitingPaste,
+        }
+    }
+
+    fn handle_timer(&mut self, kind: TimerKind, boundary: &mut impl PasteFlowBoundary) {
+        match (self.state, kind) {
+            (PasteFlowState::AwaitingPaste, TimerKind::PasteCommand) => {
+                match self.insertion.paste() {
+                    Ok(()) => {
+                        self.state = PasteFlowState::AwaitingRestore;
+                        boundary
+                            .schedule(TimerKind::RestorePasteboard, PASTEBOARD_RESTORE_DELAY_MS);
+                    }
+                    Err(primary) => {
+                        let _ = self.insertion.restore_after_paste_failure(primary);
+                        self.state = PasteFlowState::Finished;
+                        boundary.finish_and_drain_hotkeys(Err("insert failed".to_owned()));
+                    }
+                }
+            }
+            (PasteFlowState::AwaitingRestore, TimerKind::RestorePasteboard) => {
+                let result = self
+                    .insertion
+                    .restore()
+                    .map_err(|_| "insert failed".to_owned());
+                self.state = PasteFlowState::Finished;
+                boundary.finish_and_drain_hotkeys(result);
+            }
+            _ => {}
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.state == PasteFlowState::Finished
+    }
+
+    fn restore_on_shutdown(&mut self) -> Result<(), InsertError> {
+        if self.is_finished() {
+            return Ok(());
+        }
+        let result = self.insertion.restore();
+        self.state = PasteFlowState::Finished;
+        result
+    }
 }
 
 struct TimerContext {
@@ -335,7 +434,9 @@ pub struct Runtime {
     permission_timer: Option<ScheduledTimer>,
     finish_timer: Option<ScheduledTimer>,
     capture_limit_timer: Option<ScheduledTimer>,
+    insertion_timer: Option<ScheduledTimer>,
     error_timer: Option<ScheduledTimer>,
+    pending_insertion: Option<PasteFlow<PendingInsertion>>,
     applied_permissions: PermissionSnapshot,
     microphone_permissions: MicrophonePermissionRuntime,
     tap_needs_retry: bool,
@@ -383,7 +484,9 @@ impl Runtime {
             permission_timer: None,
             finish_timer: None,
             capture_limit_timer: None,
+            insertion_timer: None,
             error_timer: None,
+            pending_insertion: None,
             applied_permissions: PermissionSnapshot::default(),
             microphone_permissions: MicrophonePermissionRuntime::default(),
             tap_needs_retry: false,
@@ -449,21 +552,21 @@ impl Runtime {
             TimerKind::CaptureLimit => {
                 self.dispatch(AppEvent::CaptureLimitReached);
             }
+            TimerKind::PasteCommand | TimerKind::RestorePasteboard => {
+                self.advance_pending_paste(kind);
+            }
             TimerKind::ResetError => self.dispatch(AppEvent::ErrorTimerFired),
         }
     }
 
     fn drain_events(&mut self) {
+        self.drain_menu_actions();
         self.drain_microphone_permission_completions();
 
-        let menu_commands: Vec<_> = self.menu_commands.try_iter().collect();
-        for command in menu_commands {
-            self.handle_menu_command(command);
-        }
+        self.drain_menu_commands();
 
-        let hotkey_events: Vec<_> = self.hotkey_events.try_iter().collect();
-        for signal in hotkey_events {
-            self.handle_hotkey(signal);
+        if self.pending_insertion.is_none() {
+            self.drain_hotkey_events();
         }
 
         loop {
@@ -482,6 +585,32 @@ impl Runtime {
                         )));
                     }
                     break;
+                }
+            }
+        }
+    }
+
+    fn drain_hotkey_events(&mut self) {
+        let hotkey_events: Vec<_> = self.hotkey_events.try_iter().collect();
+        for signal in hotkey_events {
+            self.handle_hotkey(signal);
+        }
+    }
+
+    fn drain_menu_commands(&mut self) {
+        let menu_commands: Vec<_> = self.menu_commands.try_iter().collect();
+        for command in menu_commands {
+            self.handle_menu_command(command);
+        }
+    }
+
+    fn drain_menu_actions(&mut self) {
+        while let Some(action) = self.menu.take_action() {
+            match action {
+                MenuAction::OpenPermission(permission) => {
+                    if !permissions::open_settings(permission) {
+                        tracing::warn!(error_category = "open_permission_settings");
+                    }
                 }
             }
         }
@@ -696,13 +825,24 @@ impl Runtime {
                     )));
                 }
             }
-            Effect::InsertText(text) => {
-                let result = inserter::insert_text(&text).map_err(|_| "insert failed".to_owned());
-                if result.is_err() {
-                    tracing::warn!(error_category = "text_insertion");
+            Effect::InsertText(text) => match text_inserter::begin(&text) {
+                Ok(InsertOutcome::Complete(method)) => {
+                    let method = match method {
+                        InsertMethod::Accessibility => "accessibility",
+                        InsertMethod::UnicodeEvents => "unicode_events",
+                    };
+                    tracing::debug!(method, lifecycle = "text_inserted");
+                    self.dispatch(AppEvent::PasteFinished(Ok(())));
                 }
-                self.dispatch(AppEvent::PasteFinished(result));
-            }
+                Ok(InsertOutcome::PendingClipboard(insertion)) => {
+                    let flow = PasteFlow::begin(insertion, self);
+                    self.pending_insertion = Some(flow);
+                }
+                Err(_) => {
+                    tracing::warn!(error_category = "text_insertion");
+                    self.dispatch(AppEvent::PasteFinished(Err("insert failed".to_owned())));
+                }
+            },
             Effect::ScheduleErrorReset { delay_ms } => {
                 self.replace_error_timer(delay_ms);
             }
@@ -759,6 +899,28 @@ impl Runtime {
         ));
     }
 
+    fn replace_insertion_timer(&mut self, kind: TimerKind, delay_ms: u64) {
+        cancel_timer(&self.run_loop, &mut self.insertion_timer);
+        let runtime = self as *mut Self;
+        self.insertion_timer = Some(ScheduledTimer::new(
+            &self.run_loop,
+            runtime,
+            kind,
+            delay_ms,
+            None,
+        ));
+    }
+
+    fn advance_pending_paste(&mut self, kind: TimerKind) {
+        let Some(mut flow) = self.pending_insertion.take() else {
+            return;
+        };
+        flow.handle_timer(kind, self);
+        if !flow.is_finished() {
+            self.pending_insertion = Some(flow);
+        }
+    }
+
     fn cancel_finish_timer(&mut self) {
         cancel_timer(&self.run_loop, &mut self.finish_timer);
     }
@@ -784,6 +946,22 @@ fn capture_start_result_event(
     })
 }
 
+impl PasteFlowBoundary for Runtime {
+    fn schedule(&mut self, kind: TimerKind, delay_ms: u64) {
+        self.replace_insertion_timer(kind, delay_ms);
+    }
+
+    fn finish_and_drain_hotkeys(&mut self, result: Result<(), String>) {
+        cancel_timer(&self.run_loop, &mut self.insertion_timer);
+        if result.is_err() {
+            tracing::warn!(error_category = "text_insertion");
+        }
+        self.dispatch(AppEvent::PasteFinished(result));
+        self.drain_menu_commands();
+        self.drain_hotkey_events();
+    }
+}
+
 pub(crate) fn capture_result_event(result: Result<Option<Vec<f32>>, AudioError>) -> AppEvent {
     match result {
         Ok(samples) => AppEvent::AudioReady(samples),
@@ -797,7 +975,13 @@ impl Drop for Runtime {
         cancel_timer(&self.run_loop, &mut self.permission_timer);
         cancel_timer(&self.run_loop, &mut self.finish_timer);
         cancel_timer(&self.run_loop, &mut self.capture_limit_timer);
+        cancel_timer(&self.run_loop, &mut self.insertion_timer);
         cancel_timer(&self.run_loop, &mut self.error_timer);
+        if let Some(mut flow) = self.pending_insertion.take() {
+            if flow.restore_on_shutdown().is_err() {
+                tracing::warn!(error_category = "pasteboard_restore_on_shutdown");
+            }
+        }
         self.recorder.abort();
         self.hotkey.take();
         let _ = self.asr_commands.send(AsrCommand::Shutdown);
@@ -836,8 +1020,21 @@ fn bundled_model_paths_from_executable(executable: PathBuf) -> Result<ModelPaths
     ModelPaths::from_resources(&resources)
 }
 
-/// Loads the embedded model once and returns a shell-compatible smoke status.
+/// Starts a bounded child process that initializes the embedded model.
 pub fn smoke_bundled_model() -> i32 {
+    let Ok(executable) = std::env::current_exe() else {
+        tracing::error!(error_category = "current_executable");
+        return 1;
+    };
+    let Ok(mut child) = Command::new(executable).arg("--smoke-model-child").spawn() else {
+        tracing::error!(error_category = "model_smoke_spawn");
+        return 1;
+    };
+    wait_for_smoke_child(&mut child, SMOKE_MODEL_TIMEOUT)
+}
+
+/// Initializes the embedded model inside the watchdog child process.
+pub fn smoke_bundled_model_child() -> i32 {
     let Ok(paths) = bundled_model_paths() else {
         tracing::error!(error_category = "model_resources");
         return 1;
@@ -859,6 +1056,30 @@ pub fn smoke_bundled_model() -> i32 {
     }
 }
 
+fn wait_for_smoke_child(child: &mut Child, timeout: Duration) -> i32 {
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code().unwrap_or(1),
+            Ok(None) => {}
+            Err(_) => {
+                tracing::error!(error_category = "model_smoke_wait");
+                let _ = child.kill();
+                let _ = child.wait();
+                return 1;
+            }
+        }
+
+        if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+            tracing::error!(error_category = "model_load_timeout");
+            let _ = child.kill();
+            let _ = child.wait();
+            return SMOKE_TIMEOUT_EXIT_CODE;
+        }
+        thread::sleep(SMOKE_CHILD_POLL_INTERVAL);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -866,12 +1087,14 @@ mod tests {
 
     use super::{
         capture_start_result_event, milliseconds_to_seconds, reset_hotkey_before_drop, status_name,
-        AssignmentTracker, DeferredTapState, MicrophonePermissionRuntime, RuntimePreferences,
-        TapState, EVENT_DRAIN_MS, PERMISSION_POLL_MS,
+        wait_for_smoke_child, AssignmentTracker, DeferredTapState, MicrophonePermissionRuntime,
+        PasteFlow, PasteFlowBoundary, PasteInsertion, RuntimePreferences, TapState, TimerKind,
+        EVENT_DRAIN_MS, PERMISSION_POLL_MS,
     };
     use crate::audio::AudioError;
     use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
     use crate::hotkey::{HotkeyControl, HotkeySignal, KeyboardObservation, ObservationKind};
+    use crate::inserter::InsertError;
     use crate::menu::MenuCommand;
     use crate::permissions::{MicrophoneAuthorization, MicrophonePermissionBoundary};
     use crate::preferences::{
@@ -1164,6 +1387,201 @@ mod tests {
         assert_eq!(MAX_CAPTURE_MS, 25_000);
         assert_eq!(ERROR_VISIBLE_MS, 3_000);
         assert_eq!(milliseconds_to_seconds(RELEASE_GRACE_MS), 0.18);
+    }
+
+    #[test]
+    fn paste_flow_orders_command_restore_finish_and_hotkey_drain() {
+        struct RecordingInsertion {
+            events: Rc<RefCell<Vec<&'static str>>>,
+        }
+
+        impl PasteInsertion for RecordingInsertion {
+            fn paste(&mut self) -> Result<(), InsertError> {
+                self.events.borrow_mut().push("paste");
+                Ok(())
+            }
+
+            fn restore(&mut self) -> Result<(), InsertError> {
+                self.events.borrow_mut().push("restore");
+                Ok(())
+            }
+
+            fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {
+                self.events.borrow_mut().push("failure_restore");
+                primary
+            }
+        }
+
+        struct RecordingBoundary {
+            events: Rc<RefCell<Vec<&'static str>>>,
+        }
+
+        impl PasteFlowBoundary for RecordingBoundary {
+            fn schedule(&mut self, kind: TimerKind, delay_ms: u64) {
+                match (kind, delay_ms) {
+                    (TimerKind::PasteCommand, 30) => {
+                        self.events.borrow_mut().push("schedule_paste")
+                    }
+                    (TimerKind::RestorePasteboard, 1_000) => {
+                        self.events.borrow_mut().push("schedule_restore")
+                    }
+                    _ => panic!("unexpected timer"),
+                }
+            }
+
+            fn finish_and_drain_hotkeys(&mut self, result: Result<(), String>) {
+                assert_eq!(result, Ok(()));
+                self.events.borrow_mut().push("finish");
+                self.events.borrow_mut().push("drain_hotkeys");
+            }
+        }
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let insertion = RecordingInsertion {
+            events: Rc::clone(&events),
+        };
+        let mut boundary = RecordingBoundary {
+            events: Rc::clone(&events),
+        };
+        let mut flow = PasteFlow::begin(insertion, &mut boundary);
+
+        flow.handle_timer(TimerKind::RestorePasteboard, &mut boundary);
+        flow.handle_timer(TimerKind::PasteCommand, &mut boundary);
+        flow.handle_timer(TimerKind::PasteCommand, &mut boundary);
+        flow.handle_timer(TimerKind::RestorePasteboard, &mut boundary);
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "schedule_paste",
+                "paste",
+                "schedule_restore",
+                "restore",
+                "finish",
+                "drain_hotkeys",
+            ]
+        );
+    }
+
+    #[test]
+    fn paste_flow_drops_its_restoration_owner_if_boundary_panics() {
+        struct RestoringInsertion {
+            events: Rc<RefCell<Vec<&'static str>>>,
+            restored: bool,
+        }
+
+        impl PasteInsertion for RestoringInsertion {
+            fn paste(&mut self) -> Result<(), InsertError> {
+                self.events.borrow_mut().push("paste");
+                Ok(())
+            }
+
+            fn restore(&mut self) -> Result<(), InsertError> {
+                self.restored = true;
+                self.events.borrow_mut().push("restore");
+                Ok(())
+            }
+
+            fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {
+                self.restore().unwrap();
+                primary
+            }
+        }
+
+        impl Drop for RestoringInsertion {
+            fn drop(&mut self) {
+                if !self.restored {
+                    self.events.borrow_mut().push("restore_on_drop");
+                    self.restored = true;
+                }
+            }
+        }
+
+        struct PanickingBoundary {
+            events: Rc<RefCell<Vec<&'static str>>>,
+        }
+
+        impl PasteFlowBoundary for PanickingBoundary {
+            fn schedule(&mut self, kind: TimerKind, _delay_ms: u64) {
+                match kind {
+                    TimerKind::PasteCommand => {
+                        self.events.borrow_mut().push("schedule_paste");
+                    }
+                    TimerKind::RestorePasteboard => {
+                        self.events.borrow_mut().push("schedule_restore");
+                        panic!("timer scheduling failed");
+                    }
+                    _ => panic!("unexpected timer"),
+                }
+            }
+
+            fn finish_and_drain_hotkeys(&mut self, _result: Result<(), String>) {
+                panic!("paste flow must not finish after scheduling panic");
+            }
+        }
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let events = Rc::clone(&events);
+            move || {
+                let insertion = RestoringInsertion {
+                    events: Rc::clone(&events),
+                    restored: false,
+                };
+                let mut boundary = PanickingBoundary {
+                    events: Rc::clone(&events),
+                };
+                let mut flow = PasteFlow::begin(insertion, &mut boundary);
+                flow.handle_timer(TimerKind::PasteCommand, &mut boundary);
+            }
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "schedule_paste",
+                "paste",
+                "schedule_restore",
+                "restore_on_drop",
+            ]
+        );
+    }
+
+    #[test]
+    fn smoke_watchdog_returns_success() {
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+
+        assert_eq!(
+            wait_for_smoke_child(&mut child, std::time::Duration::from_secs(1)),
+            0
+        );
+    }
+
+    #[test]
+    fn smoke_watchdog_returns_child_failure() {
+        let mut child = std::process::Command::new("/usr/bin/false")
+            .spawn()
+            .unwrap();
+
+        assert_eq!(
+            wait_for_smoke_child(&mut child, std::time::Duration::from_secs(1)),
+            1
+        );
+    }
+
+    #[test]
+    fn smoke_watchdog_terminates_a_hung_child() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+
+        assert_eq!(
+            wait_for_smoke_child(&mut child, std::time::Duration::from_millis(10)),
+            124
+        );
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[test]

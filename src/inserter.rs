@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, thread, time::Duration};
+use std::{error::Error, fmt};
 
 use core_graphics::{
     event::{CGEvent, CGEventFlags, CGEventTapLocation},
@@ -9,8 +9,8 @@ use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSPa
 use objc2_foundation::{NSArray, NSData, NSString};
 
 const PASTE_KEYCODE: u16 = 9;
-const PASTEBOARD_SETTLE_DELAY: Duration = Duration::from_millis(30);
-const PASTEBOARD_RESTORE_DELAY: Duration = Duration::from_millis(100);
+pub(crate) const PASTEBOARD_SETTLE_DELAY_MS: u64 = 30;
+pub(crate) const PASTEBOARD_RESTORE_DELAY_MS: u64 = 1_000;
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 struct PasteboardSnapshot {
@@ -54,13 +54,12 @@ trait PasteCommand {
     fn send_command_v(&mut self) -> Result<(), InsertError>;
 }
 
-trait Sleeper {
-    fn sleep(&mut self, duration: Duration);
-}
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InsertError {
     EmptyText,
+    SecureField,
+    Accessibility,
+    UnicodeEvent,
     PasteboardSnapshot,
     PasteboardWrite,
     PasteboardRestore,
@@ -72,6 +71,9 @@ impl fmt::Display for InsertError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::EmptyText => "cannot insert empty text",
+            Self::SecureField => "cannot insert into a secure text field",
+            Self::Accessibility => "could not insert through Accessibility",
+            Self::UnicodeEvent => "could not create a Unicode keyboard event",
             Self::PasteboardSnapshot => "could not snapshot the pasteboard",
             Self::PasteboardWrite => "could not write to the pasteboard",
             Self::PasteboardRestore => "could not restore the pasteboard",
@@ -184,11 +186,99 @@ impl PasteCommand for SystemPasteCommand {
     }
 }
 
-struct ThreadSleeper;
+struct InsertionTransaction<P: PasteboardAccess, C> {
+    pasteboard: P,
+    command: C,
+    snapshot: PasteboardSnapshot,
+    temporary: TemporaryWrite,
+    restore_required: bool,
+}
 
-impl Sleeper for ThreadSleeper {
-    fn sleep(&mut self, duration: Duration) {
-        thread::sleep(duration);
+pub(crate) struct PendingInsertion {
+    inner: InsertionTransaction<SystemPasteboard, SystemPasteCommand>,
+}
+
+impl PendingInsertion {
+    pub(crate) fn begin(text: &str) -> Result<Self, InsertError> {
+        let pasteboard = unsafe { NSPasteboard::generalPasteboard() };
+        InsertionTransaction::begin_with(
+            text,
+            SystemPasteboard::new(pasteboard),
+            SystemPasteCommand,
+        )
+        .map(|inner| Self { inner })
+    }
+
+    pub(crate) fn paste(&mut self) -> Result<(), InsertError> {
+        self.inner.paste()
+    }
+
+    pub(crate) fn restore(&mut self) -> Result<(), InsertError> {
+        self.inner.restore()
+    }
+
+    pub(crate) fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {
+        self.inner.restore_after_paste_failure(primary)
+    }
+}
+
+impl<P: PasteboardAccess, C: PasteCommand> InsertionTransaction<P, C> {
+    fn begin_with(text: &str, mut pasteboard: P, command: C) -> Result<Self, InsertError> {
+        let text = normalize_text(text).ok_or(InsertError::EmptyText)?;
+        let snapshot = pasteboard.snapshot()?;
+        let temporary = match pasteboard.write_temporary_text(&text) {
+            Ok(temporary) => temporary,
+            Err(failure) => {
+                if pasteboard.restore(&snapshot, failure.change_count).is_err() {
+                    tracing::warn!(
+                        error_category = "pasteboard_restore_after_temporary_write_failure"
+                    );
+                }
+                return Err(failure.error);
+            }
+        };
+        Ok(Self {
+            pasteboard,
+            command,
+            snapshot,
+            temporary,
+            restore_required: true,
+        })
+    }
+
+    pub(crate) fn paste(&mut self) -> Result<(), InsertError> {
+        self.command.send_command_v()
+    }
+
+    pub(crate) fn restore(&mut self) -> Result<(), InsertError> {
+        if !self.restore_required {
+            return Ok(());
+        }
+        self.pasteboard
+            .restore(&self.snapshot, self.temporary.change_count)?;
+        self.restore_required = false;
+        Ok(())
+    }
+
+    pub(crate) fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {
+        if self.restore().is_err() {
+            tracing::warn!(error_category = "pasteboard_restore_after_insert_failure");
+        }
+        primary
+    }
+}
+
+impl<P: PasteboardAccess, C> Drop for InsertionTransaction<P, C> {
+    fn drop(&mut self) {
+        if self.restore_required
+            && self
+                .pasteboard
+                .restore(&self.snapshot, self.temporary.change_count)
+                .is_err()
+        {
+            tracing::warn!(error_category = "pasteboard_restore_on_drop");
+        }
+        self.restore_required = false;
     }
 }
 
@@ -210,54 +300,6 @@ fn reconstruct_items(
     Ok(NSArray::from_vec(objects))
 }
 
-fn insert_with(
-    text: &str,
-    pasteboard: &mut impl PasteboardAccess,
-    command: &mut impl PasteCommand,
-    sleeper: &mut impl Sleeper,
-) -> Result<(), InsertError> {
-    let text = normalize_text(text).ok_or(InsertError::EmptyText)?;
-    let snapshot = pasteboard.snapshot()?;
-    let temporary = match pasteboard.write_temporary_text(&text) {
-        Ok(temporary) => temporary,
-        Err(failure) => {
-            if pasteboard.restore(&snapshot, failure.change_count).is_err() {
-                tracing::warn!(error_category = "pasteboard_restore_after_temporary_write_failure");
-            }
-            return Err(failure.error);
-        }
-    };
-
-    sleeper.sleep(PASTEBOARD_SETTLE_DELAY);
-    let paste_result = command.send_command_v();
-    if paste_result.is_ok() {
-        sleeper.sleep(PASTEBOARD_RESTORE_DELAY);
-    }
-
-    let restore_result = pasteboard.restore(&snapshot, temporary.change_count);
-
-    match (paste_result, restore_result) {
-        (Err(primary), Err(_restore)) => {
-            tracing::warn!(error_category = "pasteboard_restore_after_insert_failure");
-            Err(primary)
-        }
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(()), restore) => restore,
-    }
-}
-
-/// Temporarily writes `text`, sends Command-V to the frontmost application,
-/// then restores the previous pasteboard contents when they are still current.
-pub fn insert_text(text: &str) -> Result<(), InsertError> {
-    let pasteboard = unsafe { NSPasteboard::generalPasteboard() };
-    insert_with(
-        text,
-        &mut SystemPasteboard::new(pasteboard),
-        &mut SystemPasteCommand,
-        &mut ThreadSleeper,
-    )
-}
-
 fn post_command_v(source: CGEventSource) -> Result<(), InsertError> {
     let event = CGEvent::new_keyboard_event(source, PASTE_KEYCODE, true)
         .map_err(|_| InsertError::KeyboardEvent)?;
@@ -274,9 +316,96 @@ fn post_command_v_up(source: CGEventSource) -> Result<(), InsertError> {
     Ok(())
 }
 
+/// Exercises the real NSPasteboard snapshot/restore path.
+///
+/// This entry point is available only to the custom main-thread test target.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn run_pasteboard_main_thread_tests() -> Result<(), InsertError> {
+    let pasteboard = unsafe { NSPasteboard::pasteboardWithUniqueName() };
+    let expected = PasteboardSnapshot {
+        items: vec![
+            PasteboardItemSnapshot {
+                representations: vec![
+                    PasteboardRepresentation {
+                        type_name: "public.utf8-plain-text".to_owned(),
+                        data: b"plain".to_vec(),
+                    },
+                    PasteboardRepresentation {
+                        type_name: "public.rtf".to_owned(),
+                        data: b"{\\rtf1 rich}".to_vec(),
+                    },
+                ],
+            },
+            PasteboardItemSnapshot {
+                representations: vec![PasteboardRepresentation {
+                    type_name: "public.png".to_owned(),
+                    data: vec![0x89, 0x50, 0x4e, 0x47],
+                }],
+            },
+        ],
+    };
+    write_snapshot_fixture(&pasteboard, &expected)?;
+    let mut system = SystemPasteboard::new(pasteboard);
+
+    let captured = system.snapshot()?;
+    assert_snapshot_contains(&captured, &expected);
+    let temporary = system
+        .write_temporary_text("recognized")
+        .map_err(|failure| failure.error)?;
+    system.restore(&captured, temporary.change_count)?;
+    assert_eq!(system.snapshot()?, captured);
+
+    let empty_pasteboard = unsafe { NSPasteboard::pasteboardWithUniqueName() };
+    unsafe { empty_pasteboard.clearContents() };
+    let mut empty_system = SystemPasteboard::new(empty_pasteboard);
+    let empty_snapshot = empty_system.snapshot()?;
+    let temporary = empty_system
+        .write_temporary_text("recognized")
+        .map_err(|failure| failure.error)?;
+    empty_system.restore(&empty_snapshot, temporary.change_count)?;
+    assert_eq!(empty_system.snapshot()?, PasteboardSnapshot::default());
+
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn write_snapshot_fixture(
+    pasteboard: &NSPasteboard,
+    saved: &PasteboardSnapshot,
+) -> Result<(), InsertError> {
+    let objects = reconstruct_items(saved)?;
+    unsafe {
+        pasteboard.clearContents();
+        if saved.items.is_empty() || pasteboard.writeObjects(&objects) {
+            Ok(())
+        } else {
+            Err(InsertError::PasteboardWrite)
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn assert_snapshot_contains(actual: &PasteboardSnapshot, expected: &PasteboardSnapshot) {
+    assert_eq!(actual.items.len(), expected.items.len());
+    for (actual_item, expected_item) in actual.items.iter().zip(&expected.items) {
+        for expected_representation in &expected_item.representations {
+            assert!(
+                actual_item
+                    .representations
+                    .contains(expected_representation),
+                "missing representation: {}",
+                expected_representation.type_name
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     struct FakePasteboard {
         current: PasteboardSnapshot,
@@ -288,6 +417,8 @@ mod tests {
         replace_during_restore: Option<PasteboardSnapshot>,
         temporary_write_calls: usize,
         restore_calls: usize,
+        temporary_write_counter: Rc<Cell<usize>>,
+        restore_counter: Rc<Cell<usize>>,
     }
 
     impl FakePasteboard {
@@ -302,6 +433,8 @@ mod tests {
                 replace_during_restore: None,
                 temporary_write_calls: 0,
                 restore_calls: 0,
+                temporary_write_counter: Rc::new(Cell::new(0)),
+                restore_counter: Rc::new(Cell::new(0)),
             }
         }
     }
@@ -317,6 +450,8 @@ mod tests {
             text: &str,
         ) -> Result<TemporaryWrite, TemporaryWriteFailure> {
             self.temporary_write_calls += 1;
+            self.temporary_write_counter
+                .set(self.temporary_write_counter.get() + 1);
             self.change_count += 1;
             self.current = snapshot(&[&[("public.utf8-plain-text", text.as_bytes())]]);
             let result = TemporaryWrite {
@@ -348,6 +483,7 @@ mod tests {
                 return Ok(());
             }
             self.restore_calls += 1;
+            self.restore_counter.set(self.restore_counter.get() + 1);
             if let Some(error) = self.restore_error {
                 return Err(error);
             }
@@ -377,17 +513,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct FakeSleeper {
-        delays: Vec<Duration>,
-    }
-
-    impl Sleeper for FakeSleeper {
-        fn sleep(&mut self, duration: Duration) {
-            self.delays.push(duration);
-        }
-    }
-
     fn snapshot(items: &[&[(&str, &[u8])]]) -> PasteboardSnapshot {
         PasteboardSnapshot {
             items: items
@@ -405,61 +530,44 @@ mod tests {
         }
     }
 
-    fn write_snapshot_fixture(pasteboard: &NSPasteboard, saved: &PasteboardSnapshot) {
-        let objects = reconstruct_items(saved).unwrap();
-        unsafe {
-            pasteboard.clearContents();
-            assert!(saved.items.is_empty() || pasteboard.writeObjects(&objects));
-        }
-    }
+    #[test]
+    fn insertion_runs_as_explicit_non_blocking_stages() {
+        let original = snapshot(&[&[("public.utf8-plain-text", b"before")]]);
+        let pasteboard = FakePasteboard::with_snapshot(original.clone());
+        let command = FakePasteCommand::succeed();
 
-    fn assert_snapshot_contains(actual: &PasteboardSnapshot, expected: &PasteboardSnapshot) {
-        assert_eq!(actual.items.len(), expected.items.len());
-        for (actual_item, expected_item) in actual.items.iter().zip(&expected.items) {
-            for expected_representation in &expected_item.representations {
-                assert!(
-                    actual_item
-                        .representations
-                        .contains(expected_representation),
-                    "missing representation: {}",
-                    expected_representation.type_name
-                );
-            }
-        }
+        let mut insertion =
+            InsertionTransaction::begin_with("recognized", pasteboard, command).unwrap();
+        assert_eq!(
+            insertion.pasteboard.current,
+            snapshot(&[&[("public.utf8-plain-text", b"recognized")]])
+        );
+
+        assert_eq!(insertion.paste(), Ok(()));
+        assert_eq!(
+            insertion.pasteboard.current,
+            snapshot(&[&[("public.utf8-plain-text", b"recognized")]])
+        );
+
+        assert_eq!(insertion.restore(), Ok(()));
+        assert_eq!(insertion.pasteboard.current, original);
     }
 
     #[test]
-    fn round_trips_multiple_items_and_representations() {
-        let pasteboard = unsafe { NSPasteboard::pasteboardWithUniqueName() };
-        let expected = snapshot(&[
-            &[
-                ("public.utf8-plain-text", b"plain"),
-                ("public.rtf", b"{\\rtf1 rich}"),
-            ],
-            &[("public.png", &[0x89, 0x50, 0x4e, 0x47])],
-        ]);
-        write_snapshot_fixture(&pasteboard, &expected);
-        let mut system = SystemPasteboard::new(pasteboard);
+    fn failed_paste_restores_immediately_and_keeps_primary_error() {
+        let original = snapshot(&[&[("public.utf8-plain-text", b"before")]]);
+        let pasteboard = FakePasteboard::with_snapshot(original.clone());
+        let command = FakePasteCommand::fail(InsertError::KeyboardEvent);
+        let mut insertion =
+            InsertionTransaction::begin_with("recognized", pasteboard, command).unwrap();
 
-        let captured = system.snapshot().unwrap();
-        assert_snapshot_contains(&captured, &expected);
-        let temporary = system.write_temporary_text("recognized").unwrap();
-        system.restore(&captured, temporary.change_count).unwrap();
+        let primary = insertion.paste().unwrap_err();
 
-        assert_eq!(system.snapshot().unwrap(), captured);
-    }
-
-    #[test]
-    fn round_trips_an_empty_pasteboard() {
-        let pasteboard = unsafe { NSPasteboard::pasteboardWithUniqueName() };
-        unsafe { pasteboard.clearContents() };
-        let mut system = SystemPasteboard::new(pasteboard);
-
-        let captured = system.snapshot().unwrap();
-        let temporary = system.write_temporary_text("recognized").unwrap();
-        system.restore(&captured, temporary.change_count).unwrap();
-
-        assert_eq!(system.snapshot().unwrap(), PasteboardSnapshot::default());
+        assert_eq!(
+            insertion.restore_after_paste_failure(primary),
+            InsertError::KeyboardEvent
+        );
+        assert_eq!(insertion.pasteboard.current, original);
     }
 
     #[test]
@@ -468,19 +576,16 @@ mod tests {
             &[("public.utf8-plain-text", b"before")],
             &[("public.png", &[0x89, 0x50, 0x4e, 0x47])],
         ]);
-        let mut pasteboard = FakePasteboard::with_snapshot(original.clone());
-        let mut command = FakePasteCommand::succeed();
-        let mut sleeper = FakeSleeper::default();
+        let mut insertion = InsertionTransaction::begin_with(
+            "recognized",
+            FakePasteboard::with_snapshot(original.clone()),
+            FakePasteCommand::succeed(),
+        )
+        .unwrap();
 
-        assert_eq!(
-            insert_with("recognized", &mut pasteboard, &mut command, &mut sleeper),
-            Ok(())
-        );
-        assert_eq!(pasteboard.current, original);
-        assert_eq!(
-            sleeper.delays,
-            vec![PASTEBOARD_SETTLE_DELAY, PASTEBOARD_RESTORE_DELAY]
-        );
+        assert_eq!(insertion.paste(), Ok(()));
+        assert_eq!(insertion.restore(), Ok(()));
+        assert_eq!(insertion.pasteboard.current, original);
     }
 
     #[test]
@@ -489,18 +594,14 @@ mod tests {
         let newer = snapshot(&[&[("public.utf8-plain-text", b"newer")]]);
         let mut pasteboard = FakePasteboard::with_snapshot(original);
         pasteboard.replace_before_ownership_check = Some(newer.clone());
+        let mut insertion =
+            InsertionTransaction::begin_with("recognized", pasteboard, FakePasteCommand::succeed())
+                .unwrap();
 
-        assert_eq!(
-            insert_with(
-                "recognized",
-                &mut pasteboard,
-                &mut FakePasteCommand::succeed(),
-                &mut FakeSleeper::default(),
-            ),
-            Ok(())
-        );
-        assert_eq!(pasteboard.current, newer);
-        assert_eq!(pasteboard.restore_calls, 0);
+        assert_eq!(insertion.paste(), Ok(()));
+        assert_eq!(insertion.restore(), Ok(()));
+        assert_eq!(insertion.pasteboard.current, newer);
+        assert_eq!(insertion.pasteboard.restore_calls, 0);
     }
 
     #[test]
@@ -509,33 +610,54 @@ mod tests {
         let newer = snapshot(&[&[("public.utf8-plain-text", b"newer")]]);
         let mut pasteboard = FakePasteboard::with_snapshot(original);
         pasteboard.replace_during_restore = Some(newer.clone());
+        let mut insertion =
+            InsertionTransaction::begin_with("recognized", pasteboard, FakePasteCommand::succeed())
+                .unwrap();
 
-        assert_eq!(
-            insert_with(
-                "recognized",
-                &mut pasteboard,
-                &mut FakePasteCommand::succeed(),
-                &mut FakeSleeper::default(),
-            ),
-            Ok(())
-        );
-        assert_eq!(pasteboard.current, newer);
+        assert_eq!(insertion.paste(), Ok(()));
+        assert_eq!(insertion.restore(), Ok(()));
+        assert_eq!(insertion.pasteboard.current, newer);
     }
 
     #[test]
     fn reports_restore_failure_after_successful_paste() {
         let mut pasteboard = FakePasteboard::with_snapshot(PasteboardSnapshot::default());
         pasteboard.restore_error = Some(InsertError::PasteboardRestore);
+        let mut insertion =
+            InsertionTransaction::begin_with("recognized", pasteboard, FakePasteCommand::succeed())
+                .unwrap();
 
-        assert_eq!(
-            insert_with(
-                "recognized",
-                &mut pasteboard,
-                &mut FakePasteCommand::succeed(),
-                &mut FakeSleeper::default(),
-            ),
-            Err(InsertError::PasteboardRestore)
+        assert_eq!(insertion.paste(), Ok(()));
+        assert_eq!(insertion.restore(), Err(InsertError::PasteboardRestore));
+    }
+
+    #[test]
+    fn dropping_an_active_transaction_restores_the_original_pasteboard() {
+        let pasteboard =
+            FakePasteboard::with_snapshot(snapshot(&[&[("public.utf8-plain-text", b"before")]]));
+        let restore_counter = Rc::clone(&pasteboard.restore_counter);
+
+        drop(
+            InsertionTransaction::begin_with("recognized", pasteboard, FakePasteCommand::succeed())
+                .unwrap(),
         );
+
+        assert_eq!(restore_counter.get(), 1);
+    }
+
+    #[test]
+    fn explicit_restore_then_drop_does_not_restore_twice() {
+        let pasteboard =
+            FakePasteboard::with_snapshot(snapshot(&[&[("public.utf8-plain-text", b"before")]]));
+        let restore_counter = Rc::clone(&pasteboard.restore_counter);
+        let mut insertion =
+            InsertionTransaction::begin_with("recognized", pasteboard, FakePasteCommand::succeed())
+                .unwrap();
+
+        insertion.restore().unwrap();
+        drop(insertion);
+
+        assert_eq!(restore_counter.get(), 1);
     }
 
     #[test]
@@ -543,17 +665,19 @@ mod tests {
         let original = snapshot(&[&[("public.utf8-plain-text", b"before")]]);
         let mut pasteboard = FakePasteboard::with_snapshot(original);
         pasteboard.restore_error = Some(InsertError::PasteboardRestore);
+        let mut insertion = InsertionTransaction::begin_with(
+            "recognized",
+            pasteboard,
+            FakePasteCommand::fail(InsertError::KeyboardEvent),
+        )
+        .unwrap();
 
+        let primary = insertion.paste().unwrap_err();
         assert_eq!(
-            insert_with(
-                "recognized",
-                &mut pasteboard,
-                &mut FakePasteCommand::fail(InsertError::KeyboardEvent),
-                &mut FakeSleeper::default(),
-            ),
-            Err(InsertError::KeyboardEvent)
+            insertion.restore_after_paste_failure(primary),
+            InsertError::KeyboardEvent
         );
-        assert_eq!(pasteboard.restore_calls, 1);
+        assert_eq!(insertion.pasteboard.restore_calls, 1);
     }
 
     #[test]
@@ -561,34 +685,36 @@ mod tests {
         let original = snapshot(&[&[("public.utf8-plain-text", b"before")]]);
         let mut pasteboard = FakePasteboard::with_snapshot(original);
         pasteboard.temporary_write_error = Some(InsertError::PasteboardWrite);
+        let restore_counter = Rc::clone(&pasteboard.restore_counter);
 
         assert_eq!(
-            insert_with(
+            InsertionTransaction::begin_with(
                 "recognized",
-                &mut pasteboard,
-                &mut FakePasteCommand::succeed(),
-                &mut FakeSleeper::default(),
-            ),
+                pasteboard,
+                FakePasteCommand::succeed(),
+            )
+            .map(|_| ()),
             Err(InsertError::PasteboardWrite)
         );
-        assert_eq!(pasteboard.restore_calls, 1);
+        assert_eq!(restore_counter.get(), 1);
     }
 
     #[test]
     fn snapshot_failure_aborts_before_temporary_write() {
         let mut pasteboard = FakePasteboard::with_snapshot(PasteboardSnapshot::default());
         pasteboard.snapshot_error = Some(InsertError::PasteboardSnapshot);
+        let temporary_write_counter = Rc::clone(&pasteboard.temporary_write_counter);
 
         assert_eq!(
-            insert_with(
+            InsertionTransaction::begin_with(
                 "recognized",
-                &mut pasteboard,
-                &mut FakePasteCommand::succeed(),
-                &mut FakeSleeper::default(),
-            ),
+                pasteboard,
+                FakePasteCommand::succeed(),
+            )
+            .map(|_| ()),
             Err(InsertError::PasteboardSnapshot)
         );
-        assert_eq!(pasteboard.temporary_write_calls, 0);
+        assert_eq!(temporary_write_counter.get(), 0);
     }
 
     #[test]
