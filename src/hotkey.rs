@@ -441,7 +441,14 @@ impl ModifierState {
             }
             ObservationKind::FlagsChanged if is_modifier => {
                 let pressed = &mut self.pressed[usize::from(observation.keycode)];
-                if *pressed {
+                if let Some(flag) = physical_modifier_flag(observation.keycode) {
+                    *pressed = observation.flags & flag != 0;
+                    if *pressed {
+                        ObservationEdge::Press
+                    } else {
+                        ObservationEdge::Release
+                    }
+                } else if *pressed {
                     *pressed = false;
                     ObservationEdge::Release
                 } else if observation.modifier_flag_is_set() {
@@ -475,6 +482,22 @@ fn modifier_flag(keycode: u16) -> Option<u64> {
         56 | 60 => 0x0002_0000,
         58 | 61 => 0x0008_0000,
         59 | 62 => 0x0004_0000,
+        _ => return None,
+    })
+}
+
+// Device-dependent bits from IOKit/hidsystem/IOLLEvent.h. Unlike the
+// aggregate flags above, these preserve the physical left/right key state.
+fn physical_modifier_flag(keycode: u16) -> Option<u64> {
+    Some(match keycode {
+        59 => 0x0000_0001,
+        56 => 0x0000_0002,
+        60 => 0x0000_0004,
+        55 => 0x0000_0008,
+        54 => 0x0000_0010,
+        58 => 0x0000_0020,
+        61 => 0x0000_0040,
+        62 => 0x0000_2000,
         _ => return None,
     })
 }
@@ -742,6 +765,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const COMMAND: u64 = 0x0010_0000;
+    const DEVICE_LEFT_COMMAND: u64 = 0x0000_0008;
+    const DEVICE_RIGHT_COMMAND: u64 = 0x0000_0010;
 
     fn key_down(keycode: u16) -> KeyboardObservation {
         key_down_with_flags(keycode, 0)
@@ -776,6 +801,16 @@ mod tests {
             kind: ObservationKind::FlagsChanged,
             keycode,
             flags,
+            autorepeat: false,
+            replay_marker: false,
+        }
+    }
+
+    fn tap_disabled() -> KeyboardObservation {
+        KeyboardObservation {
+            kind: ObservationKind::TapDisabledByTimeout,
+            keycode: 0,
+            flags: 0,
             autorepeat: false,
             replay_marker: false,
         }
@@ -849,10 +884,11 @@ mod tests {
             trigger: TriggerKey::KeyCode(55),
             threshold: HoldThreshold::MS_500,
         });
-        gate.handle(flags_changed(55, COMMAND), start);
+        let left_command = COMMAND | DEVICE_LEFT_COMMAND;
+        gate.handle(flags_changed(55, left_command), start);
 
         let chord = gate.handle(
-            key_down_with_flags(8, COMMAND),
+            key_down_with_flags(8, left_command),
             start + Duration::from_millis(600),
         );
         assert_eq!(chord.signal, Some(HotkeySignal::Cancelled));
@@ -862,14 +898,14 @@ mod tests {
                 ReplayEvent {
                     kind: ObservationKind::FlagsChanged,
                     keycode: 55,
-                    flags: COMMAND,
+                    flags: left_command,
                 },
-                replay_down_with_flags(8, COMMAND),
+                replay_down_with_flags(8, left_command),
             ]
         );
         assert_eq!(
             gate.handle(
-                key_up_with_flags(8, COMMAND),
+                key_up_with_flags(8, left_command),
                 start + Duration::from_millis(610)
             )
             .disposition,
@@ -901,7 +937,8 @@ mod tests {
         let mut gate = InputGate::new(Preferences::default());
         gate.begin_assignment();
         assert_eq!(
-            gate.handle(flags_changed(54, COMMAND), now).signal,
+            gate.handle(flags_changed(54, COMMAND | DEVICE_RIGHT_COMMAND), now)
+                .signal,
             Some(HotkeySignal::AssignmentSelected(TriggerKey::KeyCode(54)))
         );
 
@@ -992,11 +1029,15 @@ mod tests {
             trigger: TriggerKey::KeyCode(54),
             threshold: HoldThreshold::MS_500,
         });
-        gate.handle(flags_changed(54, COMMAND), start);
+        gate.handle(flags_changed(55, COMMAND | DEVICE_LEFT_COMMAND), start);
+        gate.handle(
+            flags_changed(54, COMMAND | DEVICE_LEFT_COMMAND | DEVICE_RIGHT_COMMAND),
+            start,
+        );
 
         assert_eq!(
             gate.handle(
-                flags_changed(54, COMMAND),
+                flags_changed(54, COMMAND | DEVICE_LEFT_COMMAND),
                 start + Duration::from_millis(100)
             )
             .signal,
@@ -1008,12 +1049,15 @@ mod tests {
     fn released_modifier_with_opposite_side_held_does_not_cancel_pending() {
         let start = Instant::now();
         let mut gate = InputGate::new(Preferences::default());
-        gate.handle(flags_changed(55, COMMAND), start);
-        gate.handle(flags_changed(54, COMMAND), start);
+        gate.handle(flags_changed(55, COMMAND | DEVICE_LEFT_COMMAND), start);
+        gate.handle(
+            flags_changed(54, COMMAND | DEVICE_LEFT_COMMAND | DEVICE_RIGHT_COMMAND),
+            start,
+        );
         gate.handle(key_down(63), start);
 
         let released_right_command = gate.handle(
-            flags_changed(54, COMMAND),
+            flags_changed(54, COMMAND | DEVICE_LEFT_COMMAND),
             start + Duration::from_millis(100),
         );
         assert_eq!(released_right_command.disposition, EventDisposition::Pass);
@@ -1029,11 +1073,15 @@ mod tests {
     fn released_modifier_with_opposite_side_held_does_not_assign() {
         let now = Instant::now();
         let mut gate = InputGate::new(Preferences::default());
-        gate.handle(flags_changed(55, COMMAND), now);
-        gate.handle(flags_changed(54, COMMAND), now);
+        gate.handle(flags_changed(55, COMMAND | DEVICE_LEFT_COMMAND), now);
+        gate.handle(
+            flags_changed(54, COMMAND | DEVICE_LEFT_COMMAND | DEVICE_RIGHT_COMMAND),
+            now,
+        );
         gate.begin_assignment();
 
-        let released_right_command = gate.handle(flags_changed(54, COMMAND), now);
+        let released_right_command =
+            gate.handle(flags_changed(54, COMMAND | DEVICE_LEFT_COMMAND), now);
         assert_eq!(released_right_command.disposition, EventDisposition::Pass);
         assert_eq!(released_right_command.signal, None);
         assert_eq!(
@@ -1076,5 +1124,45 @@ mod tests {
         );
         assert_eq!(backend.construction_attempts, 2);
         assert!(backend.posted.is_empty());
+    }
+
+    #[test]
+    fn tap_loss_reset_does_not_turn_right_command_release_into_pending_chord() {
+        let start = Instant::now();
+        let mut gate = InputGate::new(Preferences::default());
+        gate.handle(
+            flags_changed(54, COMMAND | DEVICE_LEFT_COMMAND | DEVICE_RIGHT_COMMAND),
+            start,
+        );
+        gate.handle(tap_disabled(), start);
+        gate.handle(key_down(63), start);
+
+        let released_right_command = gate.handle(
+            flags_changed(54, COMMAND | DEVICE_LEFT_COMMAND),
+            start + Duration::from_millis(100),
+        );
+        assert_eq!(released_right_command.disposition, EventDisposition::Pass);
+        assert_eq!(released_right_command.signal, None);
+        assert_eq!(
+            gate.handle(key_up(63), start + Duration::from_millis(200))
+                .signal,
+            Some(HotkeySignal::Released { short: true })
+        );
+    }
+
+    #[test]
+    fn cold_assignment_ignores_right_command_release_with_left_held() {
+        let now = Instant::now();
+        let mut gate = InputGate::new(Preferences::default());
+        gate.begin_assignment();
+
+        let released_right_command =
+            gate.handle(flags_changed(54, COMMAND | DEVICE_LEFT_COMMAND), now);
+        assert_eq!(released_right_command.disposition, EventDisposition::Pass);
+        assert_eq!(released_right_command.signal, None);
+        assert_eq!(
+            gate.handle(key_down(49), now).signal,
+            Some(HotkeySignal::AssignmentSelected(TriggerKey::KeyCode(49)))
+        );
     }
 }
