@@ -383,7 +383,7 @@ impl Runtime {
                 if self.controller.status() == &AppStatus::Ready {
                     self.press_started = Some(Instant::now());
                 }
-                self.dispatch(AppEvent::FnPressed);
+                self.dispatch(AppEvent::TriggerPressed);
             }
             HotkeySignal::Released => {
                 let held_ms = self
@@ -391,7 +391,9 @@ impl Runtime {
                     .take()
                     .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
                     .unwrap_or(0);
-                self.dispatch(AppEvent::FnReleased { held_ms });
+                self.dispatch(AppEvent::TriggerReleased {
+                    short: held_ms < 250,
+                });
             }
             HotkeySignal::TapLost => {
                 self.tap_needs_retry = true;
@@ -711,8 +713,8 @@ mod tests {
         let mut controller = AppController::new();
         controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
         controller.handle(AppEvent::ModelLoaded(Ok(())));
-        controller.handle(AppEvent::FnPressed);
-        controller.handle(AppEvent::FnReleased { held_ms: 900 });
+        controller.handle(AppEvent::TriggerPressed);
+        controller.handle(AppEvent::TriggerReleased { short: false });
         assert_eq!(controller.status(), &AppStatus::Recognizing);
         controller
     }
@@ -788,7 +790,7 @@ mod tests {
 
         assert_eq!(tap.observe(controller.status(), TapState::Lost), None);
         assert_eq!(tap.observe(controller.status(), TapState::Restored), None);
-        assert!(controller.handle(AppEvent::FnPressed).is_empty());
+        assert!(controller.handle(AppEvent::TriggerPressed).is_empty());
         assert_eq!(controller.status(), &AppStatus::Recognizing);
 
         assert_eq!(
@@ -803,7 +805,7 @@ mod tests {
         controller.handle(AppEvent::EventTapRestored);
 
         assert_eq!(
-            controller.handle(AppEvent::FnPressed),
+            controller.handle(AppEvent::TriggerPressed),
             vec![Effect::StartCapture]
         );
     }
@@ -814,7 +816,7 @@ mod tests {
         let mut tap = DeferredTapState::default();
 
         assert_eq!(tap.observe(controller.status(), TapState::Lost), None);
-        assert!(controller.handle(AppEvent::FnPressed).is_empty());
+        assert!(controller.handle(AppEvent::TriggerPressed).is_empty());
         assert_eq!(
             controller.handle(AppEvent::RecognitionFinished(Ok("первый".into()))),
             vec![Effect::InsertText("первый".into())]
@@ -830,14 +832,14 @@ mod tests {
                 ..
             }
         ));
-        assert!(controller.handle(AppEvent::FnPressed).is_empty());
+        assert!(controller.handle(AppEvent::TriggerPressed).is_empty());
 
         let restored = tap
             .observe(controller.status(), TapState::Restored)
             .unwrap();
         controller.handle(restored);
         assert_eq!(
-            controller.handle(AppEvent::FnPressed),
+            controller.handle(AppEvent::TriggerPressed),
             vec![Effect::StartCapture]
         );
     }

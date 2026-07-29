@@ -10,11 +10,11 @@ fn push_to_talk_flow_reaches_ready_after_paste() {
     assert_eq!(controller.status(), &AppStatus::Ready);
 
     assert_eq!(
-        controller.handle(AppEvent::FnPressed),
+        controller.handle(AppEvent::TriggerPressed),
         vec![Effect::StartCapture]
     );
     assert_eq!(
-        controller.handle(AppEvent::FnReleased { held_ms: 900 }),
+        controller.handle(AppEvent::TriggerReleased { short: false }),
         vec![Effect::FinishCaptureAfter { delay_ms: 180 }]
     );
 

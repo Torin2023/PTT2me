@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::constants::{ERROR_VISIBLE_MS, MIN_HOLD_MS, RELEASE_GRACE_MS};
+use crate::constants::{ERROR_VISIBLE_MS, RELEASE_GRACE_MS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermissionKind {
@@ -55,8 +55,9 @@ pub enum AppStatus {
 pub enum AppEvent {
     ModelLoaded(Result<(), String>),
     PermissionsChanged(PermissionSnapshot),
-    FnPressed,
-    FnReleased { held_ms: u64 },
+    TriggerPressed,
+    TriggerReleased { short: bool },
+    TriggerCancelled,
     CaptureLimitReached,
     CaptureFailed,
     AudioReady(Option<Vec<f32>>),
@@ -122,12 +123,12 @@ impl AppController {
                     Vec::new()
                 }
             }
-            AppEvent::FnPressed if self.status == AppStatus::Ready => {
+            AppEvent::TriggerPressed if self.status == AppStatus::Ready => {
                 self.status = AppStatus::Recording;
                 vec![Effect::StartCapture]
             }
-            AppEvent::FnReleased { held_ms } if self.status == AppStatus::Recording => {
-                if held_ms < MIN_HOLD_MS {
+            AppEvent::TriggerReleased { short } if self.status == AppStatus::Recording => {
+                if short {
                     self.status = AppStatus::Ready;
                     vec![Effect::AbortCapture]
                 } else {
@@ -136,6 +137,10 @@ impl AppController {
                         delay_ms: RELEASE_GRACE_MS,
                     }]
                 }
+            }
+            AppEvent::TriggerCancelled if self.status == AppStatus::Recording => {
+                self.status = AppStatus::Ready;
+                vec![Effect::AbortCapture]
             }
             AppEvent::CaptureLimitReached if self.status == AppStatus::Recording => {
                 self.status = AppStatus::Recognizing;
@@ -282,30 +287,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ready_press_starts_capture() {
-        let mut c = AppController::ready_for_test();
-        assert_eq!(c.handle(AppEvent::FnPressed), vec![Effect::StartCapture]);
-        assert_eq!(c.status(), &AppStatus::Recording);
-    }
-
-    #[test]
-    fn short_release_aborts_without_recognition() {
-        let mut c = AppController::recording_for_test();
+    fn trigger_press_starts_capture_immediately() {
+        let mut controller = AppController::ready_for_test();
         assert_eq!(
-            c.handle(AppEvent::FnReleased { held_ms: 249 }),
-            vec![Effect::AbortCapture]
+            controller.handle(AppEvent::TriggerPressed),
+            vec![Effect::StartCapture]
         );
-        assert_eq!(c.status(), &AppStatus::Ready);
     }
 
     #[test]
-    fn valid_release_waits_for_release_grace() {
-        let mut c = AppController::recording_for_test();
+    fn short_release_and_combination_cancel_capture() {
+        for event in [
+            AppEvent::TriggerReleased { short: true },
+            AppEvent::TriggerCancelled,
+        ] {
+            let mut controller = AppController::recording_for_test();
+            assert_eq!(controller.handle(event), vec![Effect::AbortCapture]);
+            assert_eq!(controller.status(), &AppStatus::Ready);
+        }
+    }
+
+    #[test]
+    fn long_release_finishes_capture() {
+        let mut controller = AppController::recording_for_test();
         assert_eq!(
-            c.handle(AppEvent::FnReleased { held_ms: 250 }),
+            controller.handle(AppEvent::TriggerReleased { short: false }),
             vec![Effect::FinishCaptureAfter { delay_ms: 180 }]
         );
-        assert_eq!(c.status(), &AppStatus::Recognizing);
     }
 
     #[test]
@@ -320,7 +328,7 @@ mod tests {
     #[test]
     fn busy_press_is_ignored() {
         let mut c = AppController::recognizing_for_test();
-        assert!(c.handle(AppEvent::FnPressed).is_empty());
+        assert!(c.handle(AppEvent::TriggerPressed).is_empty());
     }
 
     #[test]
