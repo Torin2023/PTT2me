@@ -459,6 +459,7 @@ enum GateMode {
     },
     Combination { physical_keycode: u16 },
     Assigning,
+    AssignmentConsumed { physical_keycode: u16 },
 }
 
 struct GateDecision {
@@ -579,7 +580,9 @@ Expected: assignment tests fail.
 Implement `begin_assignment`, supported selection consumption, Escape
 cancellation consumption, excluded-key pass-through, and modifier press-edge
 detection from `FlagsChanged` flags. A modifier release is never accepted as a
-new assignment.
+new assignment. After consuming a supported selection or Escape press, enter
+`AssignmentConsumed` and suppress the matching release before returning to
+`Idle`; this prevents an unmatched key-up from leaking to macOS.
 
 Run after implementation: `cargo test hotkey::tests --lib`
 
