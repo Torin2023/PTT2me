@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
-use std::time::Instant;
 
 use core_foundation::date::CFDate;
 use core_foundation::runloop::{
@@ -230,7 +229,6 @@ pub struct Runtime {
     finish_timer: Option<ScheduledTimer>,
     capture_limit_timer: Option<ScheduledTimer>,
     error_timer: Option<ScheduledTimer>,
-    press_started: Option<Instant>,
     applied_permissions: PermissionSnapshot,
     microphone_permissions: MicrophonePermissionRuntime,
     tap_needs_retry: bool,
@@ -264,7 +262,6 @@ impl Runtime {
             finish_timer: None,
             capture_limit_timer: None,
             error_timer: None,
-            press_started: None,
             applied_permissions: PermissionSnapshot::default(),
             microphone_permissions: MicrophonePermissionRuntime::default(),
             tap_needs_retry: false,
@@ -328,7 +325,6 @@ impl Runtime {
             TimerKind::PollPermissions => self.poll_permissions(),
             TimerKind::FinishCapture => self.finish_capture(),
             TimerKind::CaptureLimit => {
-                self.press_started = None;
                 self.dispatch(AppEvent::CaptureLimitReached);
             }
             TimerKind::ResetError => self.dispatch(AppEvent::ErrorTimerFired),
@@ -380,20 +376,13 @@ impl Runtime {
     fn handle_hotkey(&mut self, signal: HotkeySignal) {
         match signal {
             HotkeySignal::Pressed => {
-                if self.controller.status() == &AppStatus::Ready {
-                    self.press_started = Some(Instant::now());
-                }
                 self.dispatch(AppEvent::TriggerPressed);
             }
-            HotkeySignal::Released => {
-                let held_ms = self
-                    .press_started
-                    .take()
-                    .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
-                    .unwrap_or(0);
-                self.dispatch(AppEvent::TriggerReleased {
-                    short: held_ms < 250,
-                });
+            HotkeySignal::Released { short } => {
+                self.dispatch(AppEvent::TriggerReleased { short });
+            }
+            HotkeySignal::Cancelled => {
+                self.dispatch(AppEvent::TriggerCancelled);
             }
             HotkeySignal::TapLost => {
                 self.tap_needs_retry = true;
@@ -403,6 +392,7 @@ impl Runtime {
                 self.tap_needs_retry = false;
                 self.observe_tap_state(TapState::Restored);
             }
+            HotkeySignal::AssignmentSelected(_) | HotkeySignal::AssignmentCancelled => {}
         }
     }
 
@@ -496,7 +486,6 @@ impl Runtime {
                     tracing::debug!(lifecycle = "capture_started");
                 }
                 Err(_) => {
-                    self.press_started = None;
                     tracing::warn!(error_category = "microphone_start");
                     self.dispatch(AppEvent::CaptureFailed);
                 }
@@ -546,7 +535,6 @@ impl Runtime {
     }
 
     fn finish_capture(&mut self) {
-        self.press_started = None;
         let stop_result = self.recorder.stop();
         match &stop_result {
             Ok(samples) => {
