@@ -12,7 +12,8 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 
-use crate::preferences::{HoldThreshold, Preferences};
+use crate::hotkey::HotkeyControl;
+use crate::preferences::{HoldThreshold, Preferences, TriggerKey};
 use crate::state::{AppStatus, PermissionKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,7 +141,34 @@ fn symbol_style(projection: &MenuProjection) -> SymbolStyle {
 }
 
 struct MenuTargetIvars {
+    publisher: MenuCommandPublisher,
+}
+
+#[derive(Clone)]
+struct MenuCommandPublisher {
     sender: Sender<MenuCommand>,
+    hotkey: HotkeyControl,
+}
+
+impl MenuCommandPublisher {
+    fn new(sender: Sender<MenuCommand>, hotkey: HotkeyControl) -> Self {
+        Self { sender, hotkey }
+    }
+
+    fn send(&self, command: MenuCommand) -> bool {
+        let accepted = match command {
+            MenuCommand::BeginTriggerAssignment => self.hotkey.begin_assignment().is_some(),
+            MenuCommand::ResetTrigger => {
+                self.hotkey.set_trigger(TriggerKey::FnGlobe);
+                true
+            }
+            MenuCommand::SetThreshold(threshold) => {
+                self.hotkey.set_threshold(threshold);
+                true
+            }
+        };
+        accepted && self.sender.send(command).is_ok()
+    }
 }
 
 declare_class!(
@@ -172,15 +200,14 @@ declare_class!(
 
         #[method(assignTrigger:)]
         fn assign_trigger(&self, _sender: &AnyObject) {
-            let _ = self
-                .ivars()
-                .sender
+            self.ivars()
+                .publisher
                 .send(MenuCommand::BeginTriggerAssignment);
         }
 
         #[method(resetTrigger:)]
         fn reset_trigger(&self, _sender: &AnyObject) {
-            let _ = self.ivars().sender.send(MenuCommand::ResetTrigger);
+            self.ivars().publisher.send(MenuCommand::ResetTrigger);
         }
 
         #[method(selectThreshold:)]
@@ -192,17 +219,22 @@ declare_class!(
             let Some(threshold) = HoldThreshold::from_millis(milliseconds) else {
                 return;
             };
-            let _ = self
-                .ivars()
-                .sender
+            self.ivars()
+                .publisher
                 .send(MenuCommand::SetThreshold(threshold));
         }
     }
 );
 
 impl MenuTarget {
-    fn new(mtm: MainThreadMarker, sender: Sender<MenuCommand>) -> Retained<Self> {
-        let this = mtm.alloc().set_ivars(MenuTargetIvars { sender });
+    fn new(
+        mtm: MainThreadMarker,
+        sender: Sender<MenuCommand>,
+        hotkey: HotkeyControl,
+    ) -> Retained<Self> {
+        let this = mtm.alloc().set_ivars(MenuTargetIvars {
+            publisher: MenuCommandPublisher::new(sender, hotkey),
+        });
         unsafe { msg_send_id![super(this), init] }
     }
 }
@@ -228,9 +260,13 @@ impl MenuBar {
     ///
     /// Panics when called outside the AppKit main thread or if AppKit does not
     /// provide a button for its newly-created status item.
-    pub fn new(preferences: Preferences, sender: Sender<MenuCommand>) -> Self {
+    pub fn new(
+        preferences: Preferences,
+        sender: Sender<MenuCommand>,
+        hotkey: HotkeyControl,
+    ) -> Self {
         let mtm = main_thread_marker();
-        let target = MenuTarget::new(mtm, sender);
+        let target = MenuTarget::new(mtm, sender, hotkey);
         let menu = unsafe { NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("PTT2me")) };
         unsafe { menu.setAutoenablesItems(false) };
 
@@ -499,6 +535,10 @@ fn set_recognition_pulse(button: &NSStatusBarButton, enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use crate::hotkey::{HotkeyControl, HotkeySignal, KeyboardObservation, ObservationKind};
     use crate::preferences::{HoldThreshold, Preferences, TriggerKey};
     use crate::state::PermissionKind;
 
@@ -637,6 +677,75 @@ mod tests {
         });
         assert_eq!(projection.trigger_title, "Правый Command");
         assert_eq!(projection.threshold_states, [false, false, true]);
+    }
+
+    fn observation(kind: ObservationKind, keycode: u16) -> KeyboardObservation {
+        KeyboardObservation {
+            kind,
+            keycode,
+            flags: 0,
+            autorepeat: false,
+            replay_marker: false,
+        }
+    }
+
+    #[test]
+    fn threshold_command_reaches_gate_before_runtime_drain() {
+        let (sender, receiver) = mpsc::channel();
+        let control = HotkeyControl::new(Preferences::default());
+        let publisher = MenuCommandPublisher::new(sender, control.clone());
+        let start = Instant::now();
+
+        assert!(publisher.send(MenuCommand::SetThreshold(HoldThreshold::MS_750)));
+        assert_eq!(
+            control.observe_for_test(observation(ObservationKind::KeyDown, 63), start),
+            Some(HotkeySignal::Pressed)
+        );
+        assert_eq!(
+            control.observe_for_test(
+                observation(ObservationKind::KeyUp, 63),
+                start + Duration::from_millis(500),
+            ),
+            Some(HotkeySignal::Released { short: true })
+        );
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(MenuCommand::SetThreshold(HoldThreshold::MS_750))
+        );
+    }
+
+    #[test]
+    fn reset_trigger_command_reaches_gate_before_runtime_drain() {
+        let (sender, receiver) = mpsc::channel();
+        let control = HotkeyControl::new(Preferences {
+            trigger: TriggerKey::KeyCode(54),
+            threshold: HoldThreshold::MS_500,
+        });
+        let publisher = MenuCommandPublisher::new(sender, control.clone());
+
+        assert!(publisher.send(MenuCommand::ResetTrigger));
+        assert_eq!(
+            control.observe_for_test(observation(ObservationKind::KeyDown, 63), Instant::now(),),
+            Some(HotkeySignal::Pressed)
+        );
+        assert_eq!(receiver.try_recv(), Ok(MenuCommand::ResetTrigger));
+    }
+
+    #[test]
+    fn assignment_command_arms_gate_before_runtime_drain() {
+        let (sender, receiver) = mpsc::channel();
+        let control = HotkeyControl::new(Preferences::default());
+        let publisher = MenuCommandPublisher::new(sender, control.clone());
+
+        assert!(publisher.send(MenuCommand::BeginTriggerAssignment));
+        assert!(matches!(
+            control.observe_for_test(observation(ObservationKind::KeyDown, 49), Instant::now(),),
+            Some(HotkeySignal::AssignmentSelected {
+                trigger: TriggerKey::KeyCode(49),
+                ..
+            })
+        ));
+        assert_eq!(receiver.try_recv(), Ok(MenuCommand::BeginTriggerAssignment));
     }
 
     #[test]

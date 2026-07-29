@@ -20,7 +20,7 @@ use std::{
     sync::{
         atomic::{AtomicPtr, Ordering},
         mpsc::Sender,
-        Mutex,
+        Arc, Mutex,
     },
     time::Instant,
 };
@@ -38,13 +38,23 @@ const KEYBOARD_EVENT_MASK: CGEventMask = (1 << CGEventType::KeyDown as CGEventMa
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HotkeySignal {
     Pressed,
-    Released { short: bool },
+    Released {
+        short: bool,
+    },
     Cancelled,
-    AssignmentSelected(TriggerKey),
-    AssignmentCancelled,
+    AssignmentSelected {
+        trigger: TriggerKey,
+        epoch: AssignmentEpoch,
+    },
+    AssignmentCancelled {
+        epoch: AssignmentEpoch,
+    },
     TapLost,
     TapRestored,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AssignmentEpoch(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObservationKind {
@@ -74,6 +84,93 @@ struct InputGate {
     preferences: Preferences,
     mode: GateMode,
     modifier_state: ModifierState,
+    next_assignment_epoch: u64,
+}
+
+#[derive(Clone)]
+pub struct HotkeyControl {
+    gate: Arc<Mutex<InputGate>>,
+}
+
+impl HotkeyControl {
+    pub fn new(preferences: Preferences) -> Self {
+        Self {
+            gate: Arc::new(Mutex::new(InputGate::new(preferences))),
+        }
+    }
+
+    pub fn set_preferences(&self, preferences: Preferences) {
+        self.with_gate(|gate| gate.set_preferences(preferences));
+    }
+
+    pub fn set_trigger(&self, trigger: TriggerKey) {
+        self.with_gate(|gate| {
+            let mut preferences = gate.preferences;
+            preferences.trigger = trigger;
+            gate.set_preferences(preferences);
+        });
+    }
+
+    pub fn set_threshold(&self, threshold: HoldThreshold) {
+        self.with_gate(|gate| {
+            let mut preferences = gate.preferences;
+            preferences.threshold = threshold;
+            gate.set_preferences(preferences);
+        });
+    }
+
+    pub fn begin_assignment(&self) -> Option<AssignmentEpoch> {
+        self.with_gate(InputGate::begin_assignment)
+    }
+
+    pub fn current_assignment_epoch(&self) -> Option<AssignmentEpoch> {
+        self.with_gate(|gate| gate.current_assignment_epoch())
+    }
+
+    pub fn cancel_assignment(&self, epoch: AssignmentEpoch) -> bool {
+        self.with_gate(|gate| gate.cancel_assignment(epoch))
+    }
+
+    pub fn cancel_current_assignment(&self) -> bool {
+        self.with_gate(|gate| {
+            gate.current_assignment_epoch()
+                .is_some_and(|epoch| gate.cancel_assignment(epoch))
+        })
+    }
+
+    pub fn reset_for_listener_removal(&self) -> bool {
+        self.with_gate(InputGate::reset_for_listener_removal)
+    }
+
+    fn handle(&self, observation: KeyboardObservation, now: Instant) -> GateDecision {
+        self.with_gate(|gate| gate.handle(observation, now))
+    }
+
+    fn with_gate<T>(&self, operation: impl FnOnce(&mut InputGate) -> T) -> T {
+        let mut gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        operation(&mut gate)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_for_test(
+        &self,
+        observation: KeyboardObservation,
+        now: Instant,
+    ) -> Option<HotkeySignal> {
+        self.handle(observation, now).signal
+    }
+
+    #[cfg(test)]
+    pub(crate) fn suppresses_for_test(
+        &self,
+        observation: KeyboardObservation,
+        now: Instant,
+    ) -> bool {
+        self.handle(observation, now).disposition == EventDisposition::Suppress
+    }
 }
 
 struct ModifierState {
@@ -106,8 +203,14 @@ enum GateMode {
     Combination {
         physical_keycode: u16,
     },
-    Assigning,
+    Assigning {
+        epoch: AssignmentEpoch,
+    },
     AssignmentConsumed {
+        physical_keycode: u16,
+        epoch: AssignmentEpoch,
+    },
+    AssignmentReleaseGuard {
         physical_keycode: u16,
     },
 }
@@ -215,6 +318,7 @@ impl InputGate {
             preferences,
             mode: GateMode::Idle,
             modifier_state: ModifierState::default(),
+            next_assignment_epoch: 0,
         }
     }
 
@@ -227,8 +331,55 @@ impl InputGate {
         self.preferences
     }
 
-    fn begin_assignment(&mut self) {
-        self.mode = GateMode::Assigning;
+    fn begin_assignment(&mut self) -> Option<AssignmentEpoch> {
+        if !matches!(self.mode, GateMode::Idle) {
+            return None;
+        }
+        self.next_assignment_epoch = self.next_assignment_epoch.wrapping_add(1);
+        let epoch = AssignmentEpoch(self.next_assignment_epoch);
+        self.mode = GateMode::Assigning { epoch };
+        Some(epoch)
+    }
+
+    fn current_assignment_epoch(&self) -> Option<AssignmentEpoch> {
+        match self.mode {
+            GateMode::Assigning { epoch } | GateMode::AssignmentConsumed { epoch, .. } => {
+                Some(epoch)
+            }
+            GateMode::Idle
+            | GateMode::Pending { .. }
+            | GateMode::Combination { .. }
+            | GateMode::AssignmentReleaseGuard { .. } => None,
+        }
+    }
+
+    fn cancel_assignment(&mut self, epoch: AssignmentEpoch) -> bool {
+        match self.mode {
+            GateMode::Assigning { epoch: active } if active == epoch => {
+                self.mode = GateMode::Idle;
+                true
+            }
+            GateMode::AssignmentConsumed {
+                physical_keycode,
+                epoch: active,
+            } if active == epoch => {
+                self.mode = GateMode::AssignmentReleaseGuard { physical_keycode };
+                true
+            }
+            GateMode::Idle
+            | GateMode::Pending { .. }
+            | GateMode::Combination { .. }
+            | GateMode::Assigning { .. }
+            | GateMode::AssignmentConsumed { .. }
+            | GateMode::AssignmentReleaseGuard { .. } => false,
+        }
+    }
+
+    fn reset_for_listener_removal(&mut self) -> bool {
+        let had_pending_press = matches!(self.mode, GateMode::Pending { .. });
+        self.mode = GateMode::Idle;
+        self.modifier_state.clear();
+        had_pending_press
     }
 
     fn handle(&mut self, observation: KeyboardObservation, now: Instant) -> GateDecision {
@@ -271,8 +422,11 @@ impl InputGate {
                 }
                 GateDecision::pass()
             }
-            GateMode::Assigning => self.handle_assigning(observation, edge),
-            GateMode::AssignmentConsumed { physical_keycode } => {
+            GateMode::Assigning { epoch } => self.handle_assigning(observation, edge, epoch),
+            GateMode::AssignmentConsumed {
+                physical_keycode, ..
+            }
+            | GateMode::AssignmentReleaseGuard { physical_keycode } => {
                 if observation.is_physical_release(physical_keycode, edge) {
                     self.mode = GateMode::Idle;
                     GateDecision::suppress(None)
@@ -359,6 +513,7 @@ impl InputGate {
         &mut self,
         observation: KeyboardObservation,
         edge: ObservationEdge,
+        epoch: AssignmentEpoch,
     ) -> GateDecision {
         if edge != ObservationEdge::Press {
             return GateDecision::pass();
@@ -367,8 +522,9 @@ impl InputGate {
         if observation.keycode == 53 {
             self.mode = GateMode::AssignmentConsumed {
                 physical_keycode: observation.keycode,
+                epoch,
             };
-            return GateDecision::suppress(Some(HotkeySignal::AssignmentCancelled));
+            return GateDecision::suppress(Some(HotkeySignal::AssignmentCancelled { epoch }));
         }
 
         let selected = if observation.is_fn_or_globe() {
@@ -380,15 +536,19 @@ impl InputGate {
             self.mode = GateMode::Idle;
             return GateDecision {
                 disposition: EventDisposition::Pass,
-                signal: Some(HotkeySignal::AssignmentCancelled),
+                signal: Some(HotkeySignal::AssignmentCancelled { epoch }),
                 replay: Vec::new(),
             };
         };
 
         self.mode = GateMode::AssignmentConsumed {
             physical_keycode: observation.keycode,
+            epoch,
         };
-        GateDecision::suppress(Some(HotkeySignal::AssignmentSelected(selected)))
+        GateDecision::suppress(Some(HotkeySignal::AssignmentSelected {
+            trigger: selected,
+            epoch,
+        }))
     }
 }
 
@@ -523,20 +683,14 @@ impl fmt::Display for HotkeyInstallError {
 impl Error for HotkeyInstallError {}
 
 struct CallbackState {
-    gate: Mutex<InputGate>,
+    control: HotkeyControl,
     sender: Sender<HotkeySignal>,
     tap: AtomicPtr<c_void>,
 }
 
 impl CallbackState {
     fn emit_observation(&self, observation: KeyboardObservation) -> GateDecision {
-        let decision = {
-            let mut gate = self
-                .gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            gate.handle(observation, Instant::now())
-        };
+        let decision = self.control.handle(observation, Instant::now());
 
         if let Some(signal) = decision.signal {
             let _ = self.sender.send(signal);
@@ -576,9 +730,12 @@ pub struct HotkeyListener {
 }
 
 impl HotkeyListener {
-    pub fn install(sender: Sender<HotkeySignal>) -> Result<Self, HotkeyInstallError> {
+    pub fn install(
+        sender: Sender<HotkeySignal>,
+        control: HotkeyControl,
+    ) -> Result<Self, HotkeyInstallError> {
         let callback_state = Box::new(CallbackState {
-            gate: Mutex::new(InputGate::new(Preferences::default())),
+            control,
             sender,
             tap: AtomicPtr::new(null_mut()),
         });
@@ -635,19 +792,11 @@ impl HotkeyListener {
     }
 
     pub fn set_preferences(&self, preferences: Preferences) {
-        self._callback_state
-            .gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .set_preferences(preferences);
+        self._callback_state.control.set_preferences(preferences);
     }
 
-    pub fn begin_assignment(&self) {
-        self._callback_state
-            .gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .begin_assignment();
+    pub fn begin_assignment(&self) -> Option<AssignmentEpoch> {
+        self._callback_state.control.begin_assignment()
     }
 }
 
@@ -757,10 +906,10 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
     use std::sync::{
         atomic::AtomicPtr,
         mpsc::{self, TryRecvError},
-        Mutex,
     };
     use std::time::{Duration, Instant};
 
@@ -844,7 +993,7 @@ mod tests {
     fn tap_loss_releases_a_held_key_before_reporting_the_loss() {
         let (sender, receiver) = mpsc::channel();
         let state = CallbackState {
-            gate: Mutex::new(InputGate::new(Preferences::default())),
+            control: HotkeyControl::new(Preferences::default()),
             sender,
             tap: AtomicPtr::new(null_mut()),
         };
@@ -875,6 +1024,56 @@ mod tests {
         let long = gate.handle(key_up(63), start + Duration::from_millis(500));
         assert_eq!(long.signal, Some(HotkeySignal::Released { short: false }));
         assert!(long.replay.is_empty());
+    }
+
+    #[test]
+    fn queued_press_rejects_assignment_and_release_completes_capture() {
+        let start = Instant::now();
+        let mut gate = InputGate::new(Preferences::default());
+        let pressed = gate.handle(key_down(63), start).signal.unwrap();
+
+        assert!(gate.begin_assignment().is_none());
+        let released = gate
+            .handle(key_up(63), start + Duration::from_millis(100))
+            .signal
+            .unwrap();
+
+        let mut controller = AppController::new();
+        controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
+        controller.handle(AppEvent::ModelLoaded(Ok(())));
+        assert_eq!(
+            controller.handle(AppEvent::TriggerPressed),
+            vec![Effect::StartCapture]
+        );
+        assert_eq!(pressed, HotkeySignal::Pressed);
+        assert_eq!(released, HotkeySignal::Released { short: true });
+        assert_eq!(
+            controller.handle(AppEvent::TriggerReleased { short: true }),
+            vec![Effect::AbortCapture]
+        );
+        assert_eq!(controller.status(), &AppStatus::Ready);
+    }
+
+    #[test]
+    fn assignment_request_preserves_combination_and_consumed_release_modes() {
+        let now = Instant::now();
+        let mut combination = InputGate::new(Preferences::default());
+        combination.handle(key_down(63), now);
+        combination.handle(key_down(8), now);
+        assert!(combination.begin_assignment().is_none());
+        assert_eq!(
+            combination.handle(key_up(63), now).disposition,
+            EventDisposition::Pass
+        );
+
+        let mut consumed = InputGate::new(Preferences::default());
+        assert!(consumed.begin_assignment().is_some());
+        consumed.handle(key_down(49), now);
+        assert!(consumed.begin_assignment().is_none());
+        assert_eq!(
+            consumed.handle(key_up(49), now).disposition,
+            EventDisposition::Suppress
+        );
     }
 
     #[test]
@@ -935,17 +1134,26 @@ mod tests {
     fn assignment_selects_supported_key_and_escape_cancels() {
         let now = Instant::now();
         let mut gate = InputGate::new(Preferences::default());
-        gate.begin_assignment();
+        let selected_epoch = gate.begin_assignment().unwrap();
         assert_eq!(
             gate.handle(flags_changed(54, COMMAND | DEVICE_RIGHT_COMMAND), now)
                 .signal,
-            Some(HotkeySignal::AssignmentSelected(TriggerKey::KeyCode(54)))
+            Some(HotkeySignal::AssignmentSelected {
+                trigger: TriggerKey::KeyCode(54),
+                epoch: selected_epoch,
+            })
+        );
+        assert_eq!(
+            gate.handle(flags_changed(54, 0), now).disposition,
+            EventDisposition::Suppress
         );
 
-        gate.begin_assignment();
+        let cancelled_epoch = gate.begin_assignment().unwrap();
         assert_eq!(
             gate.handle(key_down(53), now).signal,
-            Some(HotkeySignal::AssignmentCancelled)
+            Some(HotkeySignal::AssignmentCancelled {
+                epoch: cancelled_epoch,
+            })
         );
     }
 
@@ -953,10 +1161,13 @@ mod tests {
     fn excluded_assignment_passes_through_and_keeps_binding() {
         let now = Instant::now();
         let mut gate = InputGate::new(Preferences::default());
-        gate.begin_assignment();
+        let epoch = gate.begin_assignment().unwrap();
         let decision = gate.handle(key_down(57), now);
         assert_eq!(decision.disposition, EventDisposition::Pass);
-        assert_eq!(decision.signal, Some(HotkeySignal::AssignmentCancelled));
+        assert_eq!(
+            decision.signal,
+            Some(HotkeySignal::AssignmentCancelled { epoch })
+        );
         assert_eq!(gate.preferences().trigger, TriggerKey::FnGlobe);
     }
 
@@ -964,7 +1175,7 @@ mod tests {
     fn consumed_assignment_suppresses_matching_release_only() {
         let now = Instant::now();
         let mut gate = InputGate::new(Preferences::default());
-        gate.begin_assignment();
+        gate.begin_assignment().unwrap();
         gate.handle(key_down(49), now);
 
         assert_eq!(
@@ -985,14 +1196,17 @@ mod tests {
     fn modifier_release_is_not_accepted_as_assignment() {
         let now = Instant::now();
         let mut gate = InputGate::new(Preferences::default());
-        gate.begin_assignment();
+        let epoch = gate.begin_assignment().unwrap();
 
         let release = gate.handle(flags_changed(54, 0), now);
         assert_eq!(release.disposition, EventDisposition::Pass);
         assert_eq!(release.signal, None);
         assert_eq!(
             gate.handle(key_down(49), now).signal,
-            Some(HotkeySignal::AssignmentSelected(TriggerKey::KeyCode(49)))
+            Some(HotkeySignal::AssignmentSelected {
+                trigger: TriggerKey::KeyCode(49),
+                epoch,
+            })
         );
     }
 
@@ -1002,11 +1216,14 @@ mod tests {
 
         let now = Instant::now();
         let mut gate = InputGate::new(Preferences::default());
-        gate.begin_assignment();
+        let epoch = gate.begin_assignment().unwrap();
 
         let decision = gate.handle(flags_changed(57, ALPHA_SHIFT), now);
         assert_eq!(decision.disposition, EventDisposition::Pass);
-        assert_eq!(decision.signal, Some(HotkeySignal::AssignmentCancelled));
+        assert_eq!(
+            decision.signal,
+            Some(HotkeySignal::AssignmentCancelled { epoch })
+        );
     }
 
     #[test]
@@ -1078,7 +1295,7 @@ mod tests {
             flags_changed(54, COMMAND | DEVICE_LEFT_COMMAND | DEVICE_RIGHT_COMMAND),
             now,
         );
-        gate.begin_assignment();
+        let epoch = gate.begin_assignment().unwrap();
 
         let released_right_command =
             gate.handle(flags_changed(54, COMMAND | DEVICE_LEFT_COMMAND), now);
@@ -1086,7 +1303,10 @@ mod tests {
         assert_eq!(released_right_command.signal, None);
         assert_eq!(
             gate.handle(key_down(49), now).signal,
-            Some(HotkeySignal::AssignmentSelected(TriggerKey::KeyCode(49)))
+            Some(HotkeySignal::AssignmentSelected {
+                trigger: TriggerKey::KeyCode(49),
+                epoch,
+            })
         );
     }
 
@@ -1154,7 +1374,7 @@ mod tests {
     fn cold_assignment_ignores_right_command_release_with_left_held() {
         let now = Instant::now();
         let mut gate = InputGate::new(Preferences::default());
-        gate.begin_assignment();
+        let epoch = gate.begin_assignment().unwrap();
 
         let released_right_command =
             gate.handle(flags_changed(54, COMMAND | DEVICE_LEFT_COMMAND), now);
@@ -1162,7 +1382,10 @@ mod tests {
         assert_eq!(released_right_command.signal, None);
         assert_eq!(
             gate.handle(key_down(49), now).signal,
-            Some(HotkeySignal::AssignmentSelected(TriggerKey::KeyCode(49)))
+            Some(HotkeySignal::AssignmentSelected {
+                trigger: TriggerKey::KeyCode(49),
+                epoch,
+            })
         );
     }
 }
