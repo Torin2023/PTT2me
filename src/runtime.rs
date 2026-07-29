@@ -653,16 +653,18 @@ impl Runtime {
                     tracing::warn!(error_category = "open_permission_settings");
                 }
             }
-            Effect::StartCapture => match self.recorder.start() {
-                Ok(()) => {
-                    self.replace_capture_limit_timer(MAX_CAPTURE_MS);
-                    tracing::debug!(lifecycle = "capture_started");
+            Effect::StartCapture => {
+                match capture_start_result_event(self.recorder.start(), &self.hotkey_control) {
+                    Ok(()) => {
+                        self.replace_capture_limit_timer(MAX_CAPTURE_MS);
+                        tracing::debug!(lifecycle = "capture_started");
+                    }
+                    Err(event) => {
+                        tracing::warn!(error_category = "microphone_start");
+                        self.dispatch(event);
+                    }
                 }
-                Err(_) => {
-                    tracing::warn!(error_category = "microphone_start");
-                    self.dispatch(AppEvent::CaptureFailed);
-                }
-            },
+            }
             Effect::AbortCapture => {
                 self.cancel_finish_timer();
                 self.cancel_capture_limit_timer();
@@ -772,6 +774,16 @@ fn reset_hotkey_before_drop(control: &HotkeyControl, sender: &Sender<HotkeySigna
     }
 }
 
+fn capture_start_result_event(
+    result: Result<(), AudioError>,
+    control: &HotkeyControl,
+) -> Result<(), AppEvent> {
+    result.map_err(|_| {
+        control.guard_pending_release_after_capture_failure();
+        AppEvent::CaptureFailed
+    })
+}
+
 pub(crate) fn capture_result_event(result: Result<Option<Vec<f32>>, AudioError>) -> AppEvent {
     match result {
         Ok(samples) => AppEvent::AudioReady(samples),
@@ -853,10 +865,11 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        milliseconds_to_seconds, reset_hotkey_before_drop, status_name, AssignmentTracker,
-        DeferredTapState, MicrophonePermissionRuntime, RuntimePreferences, TapState,
-        EVENT_DRAIN_MS, PERMISSION_POLL_MS,
+        capture_start_result_event, milliseconds_to_seconds, reset_hotkey_before_drop, status_name,
+        AssignmentTracker, DeferredTapState, MicrophonePermissionRuntime, RuntimePreferences,
+        TapState, EVENT_DRAIN_MS, PERMISSION_POLL_MS,
     };
+    use crate::audio::AudioError;
     use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
     use crate::hotkey::{HotkeyControl, HotkeySignal, KeyboardObservation, ObservationKind};
     use crate::menu::MenuCommand;
@@ -931,6 +944,50 @@ mod tests {
             autorepeat: false,
             replay_marker: false,
         }
+    }
+
+    #[test]
+    fn recorder_start_failure_guards_pending_trigger_release_without_replay() {
+        let start = std::time::Instant::now();
+        let control = HotkeyControl::new(Preferences::default());
+        assert_eq!(
+            control.observe_for_test(key_down(63), start),
+            Some(HotkeySignal::Pressed)
+        );
+
+        let mut controller = AppController::new();
+        controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
+        controller.handle(AppEvent::ModelLoaded(Ok(())));
+        assert_eq!(
+            controller.handle(AppEvent::TriggerPressed),
+            vec![Effect::StartCapture]
+        );
+
+        let failure = capture_start_result_event(
+            Err(AudioError::StartStream("test failure".to_owned())),
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(failure, AppEvent::CaptureFailed);
+        controller.handle(failure);
+
+        assert_eq!(
+            control.observe_outcome_for_test(
+                KeyboardObservation {
+                    kind: ObservationKind::KeyUp,
+                    ..key_down(63)
+                },
+                start + std::time::Duration::from_millis(100),
+            ),
+            (true, None, 0)
+        );
+        assert!(matches!(
+            controller.status(),
+            AppStatus::Error {
+                recoverable: true,
+                ..
+            }
+        ));
     }
 
     #[test]

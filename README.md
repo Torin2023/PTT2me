@@ -28,7 +28,7 @@ The menu contains the trigger controls:
 
 ```text
 <status>
-PTT2me 1.0.0
+PTT2me 1.0.2
 ────────────
 Клавиша активации
   <selected key>
@@ -38,13 +38,14 @@ PTT2me 1.0.0
   250 мс
   500 мс
   750 мс
+────────────
 Выйти
 ```
 
 Choose `Клавиша активации` → `Назначить…`, then press the key to use for
 dictation. Press Escape to cancel assignment. `Сбросить на Fn / Globe` restores
-the default trigger. Escape, Caps Lock, and system volume/mute keys are not
-accepted as assigned triggers and leave the current trigger unchanged.
+the default trigger. Escape, Caps Lock, media keys, Power, and Touch ID are
+not accepted as assigned triggers and leave the current trigger unchanged.
 
 Choose one of the exact `Порог удержания` values: 250, 500, or 750 ms. A hold
 shorter than the selected value is replayed normally; a longer hold records

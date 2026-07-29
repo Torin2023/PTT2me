@@ -142,6 +142,10 @@ impl HotkeyControl {
         self.with_gate(InputGate::reset_for_listener_removal)
     }
 
+    pub(crate) fn guard_pending_release_after_capture_failure(&self) {
+        self.with_gate(InputGate::guard_pending_release_after_capture_failure);
+    }
+
     fn handle(&self, observation: KeyboardObservation, now: Instant) -> GateDecision {
         self.with_gate(|gate| gate.handle(observation, now))
     }
@@ -170,6 +174,20 @@ impl HotkeyControl {
         now: Instant,
     ) -> bool {
         self.handle(observation, now).disposition == EventDisposition::Suppress
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_outcome_for_test(
+        &self,
+        observation: KeyboardObservation,
+        now: Instant,
+    ) -> (bool, Option<HotkeySignal>, usize) {
+        let decision = self.handle(observation, now);
+        (
+            decision.disposition == EventDisposition::Suppress,
+            decision.signal,
+            decision.replay.len(),
+        )
     }
 }
 
@@ -211,6 +229,9 @@ enum GateMode {
         epoch: AssignmentEpoch,
     },
     AssignmentReleaseGuard {
+        physical_keycode: u16,
+    },
+    CaptureFailureReleaseGuard {
         physical_keycode: u16,
     },
 }
@@ -349,7 +370,8 @@ impl InputGate {
             GateMode::Idle
             | GateMode::Pending { .. }
             | GateMode::Combination { .. }
-            | GateMode::AssignmentReleaseGuard { .. } => None,
+            | GateMode::AssignmentReleaseGuard { .. }
+            | GateMode::CaptureFailureReleaseGuard { .. } => None,
         }
     }
 
@@ -371,7 +393,17 @@ impl InputGate {
             | GateMode::Combination { .. }
             | GateMode::Assigning { .. }
             | GateMode::AssignmentConsumed { .. }
-            | GateMode::AssignmentReleaseGuard { .. } => false,
+            | GateMode::AssignmentReleaseGuard { .. }
+            | GateMode::CaptureFailureReleaseGuard { .. } => false,
+        }
+    }
+
+    fn guard_pending_release_after_capture_failure(&mut self) {
+        if let GateMode::Pending {
+            physical_keycode, ..
+        } = self.mode
+        {
+            self.mode = GateMode::CaptureFailureReleaseGuard { physical_keycode };
         }
     }
 
@@ -426,7 +458,8 @@ impl InputGate {
             GateMode::AssignmentConsumed {
                 physical_keycode, ..
             }
-            | GateMode::AssignmentReleaseGuard { physical_keycode } => {
+            | GateMode::AssignmentReleaseGuard { physical_keycode }
+            | GateMode::CaptureFailureReleaseGuard { physical_keycode } => {
                 if observation.is_physical_release(physical_keycode, edge) {
                     self.mode = GateMode::Idle;
                     GateDecision::suppress(None)
@@ -1024,6 +1057,65 @@ mod tests {
         let long = gate.handle(key_up(63), start + Duration::from_millis(500));
         assert_eq!(long.signal, Some(HotkeySignal::Released { short: false }));
         assert!(long.replay.is_empty());
+    }
+
+    #[test]
+    fn replay_marked_observation_passes_without_changing_pending_gate() {
+        let start = Instant::now();
+        let mut gate = InputGate::new(Preferences::default());
+        assert_eq!(
+            gate.handle(key_down(63), start).signal,
+            Some(HotkeySignal::Pressed)
+        );
+
+        let marked_release = gate.handle(
+            KeyboardObservation {
+                replay_marker: true,
+                ..key_up(63)
+            },
+            start + Duration::from_millis(50),
+        );
+        assert_eq!(marked_release.disposition, EventDisposition::Pass);
+        assert_eq!(marked_release.signal, None);
+        assert!(marked_release.replay.is_empty());
+
+        let physical_release = gate.handle(key_up(63), start + Duration::from_millis(100));
+        assert_eq!(
+            physical_release.signal,
+            Some(HotkeySignal::Released { short: true })
+        );
+        assert_eq!(
+            physical_release.replay,
+            vec![replay_down(63), replay_up(63)]
+        );
+    }
+
+    #[test]
+    fn trigger_autorepeat_is_suppressed_without_affecting_pending_capture() {
+        let start = Instant::now();
+        let mut gate = InputGate::new(Preferences::default());
+        assert_eq!(
+            gate.handle(key_down(63), start).signal,
+            Some(HotkeySignal::Pressed)
+        );
+
+        let repeat = gate.handle(
+            KeyboardObservation {
+                autorepeat: true,
+                ..key_down(63)
+            },
+            start + Duration::from_millis(500),
+        );
+        assert_eq!(repeat.disposition, EventDisposition::Suppress);
+        assert_eq!(repeat.signal, None);
+        assert!(repeat.replay.is_empty());
+
+        let release = gate.handle(key_up(63), start + Duration::from_millis(600));
+        assert_eq!(
+            release.signal,
+            Some(HotkeySignal::Released { short: false })
+        );
+        assert!(release.replay.is_empty());
     }
 
     #[test]
