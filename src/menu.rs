@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
 use objc2::{
@@ -12,7 +14,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 
-use crate::hotkey::HotkeyControl;
+use crate::hotkey::{AssignmentEpoch, HotkeyControl};
 use crate::preferences::{HoldThreshold, Preferences, TriggerKey};
 use crate::state::{AppStatus, PermissionKind};
 
@@ -116,9 +118,30 @@ pub const MENU_DESCRIPTOR: [MenuEntry; 6] = [
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuCommand {
-    BeginTriggerAssignment,
+    BeginTriggerAssignment { epoch: AssignmentEpoch },
     ResetTrigger,
     SetThreshold(HoldThreshold),
+}
+
+#[derive(Clone)]
+pub struct MenuReadiness {
+    ready: Rc<Cell<bool>>,
+}
+
+impl MenuReadiness {
+    pub fn new(ready: bool) -> Self {
+        Self {
+            ready: Rc::new(Cell::new(ready)),
+        }
+    }
+
+    pub fn set_ready(&self, ready: bool) {
+        self.ready.set(ready);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.get()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,26 +171,49 @@ struct MenuTargetIvars {
 struct MenuCommandPublisher {
     sender: Sender<MenuCommand>,
     hotkey: HotkeyControl,
+    readiness: MenuReadiness,
 }
 
 impl MenuCommandPublisher {
-    fn new(sender: Sender<MenuCommand>, hotkey: HotkeyControl) -> Self {
-        Self { sender, hotkey }
+    fn new(sender: Sender<MenuCommand>, hotkey: HotkeyControl, readiness: MenuReadiness) -> Self {
+        Self {
+            sender,
+            hotkey,
+            readiness,
+        }
     }
 
     fn send(&self, command: MenuCommand) -> bool {
-        let accepted = match command {
-            MenuCommand::BeginTriggerAssignment => self.hotkey.begin_assignment().is_some(),
+        match command {
+            MenuCommand::BeginTriggerAssignment { .. } => false,
             MenuCommand::ResetTrigger => {
                 self.hotkey.set_trigger(TriggerKey::FnGlobe);
-                true
+                self.sender.send(command).is_ok()
             }
             MenuCommand::SetThreshold(threshold) => {
                 self.hotkey.set_threshold(threshold);
-                true
+                self.sender.send(command).is_ok()
             }
+        }
+    }
+
+    fn begin_assignment(&self) -> bool {
+        if !self.readiness.is_ready() {
+            return false;
+        }
+        let Some(epoch) = self.hotkey.begin_assignment() else {
+            return false;
         };
-        accepted && self.sender.send(command).is_ok()
+        if self
+            .sender
+            .send(MenuCommand::BeginTriggerAssignment { epoch })
+            .is_ok()
+        {
+            true
+        } else {
+            self.hotkey.cancel_assignment(epoch);
+            false
+        }
     }
 }
 
@@ -200,9 +246,7 @@ declare_class!(
 
         #[method(assignTrigger:)]
         fn assign_trigger(&self, _sender: &AnyObject) {
-            self.ivars()
-                .publisher
-                .send(MenuCommand::BeginTriggerAssignment);
+            self.ivars().publisher.begin_assignment();
         }
 
         #[method(resetTrigger:)]
@@ -231,9 +275,10 @@ impl MenuTarget {
         mtm: MainThreadMarker,
         sender: Sender<MenuCommand>,
         hotkey: HotkeyControl,
+        readiness: MenuReadiness,
     ) -> Retained<Self> {
         let this = mtm.alloc().set_ivars(MenuTargetIvars {
-            publisher: MenuCommandPublisher::new(sender, hotkey),
+            publisher: MenuCommandPublisher::new(sender, hotkey, readiness),
         });
         unsafe { msg_send_id![super(this), init] }
     }
@@ -264,9 +309,10 @@ impl MenuBar {
         preferences: Preferences,
         sender: Sender<MenuCommand>,
         hotkey: HotkeyControl,
+        readiness: MenuReadiness,
     ) -> Self {
         let mtm = main_thread_marker();
-        let target = MenuTarget::new(mtm, sender, hotkey);
+        let target = MenuTarget::new(mtm, sender, hotkey, readiness);
         let menu = unsafe { NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("PTT2me")) };
         unsafe { menu.setAutoenablesItems(false) };
 
@@ -693,7 +739,8 @@ mod tests {
     fn threshold_command_reaches_gate_before_runtime_drain() {
         let (sender, receiver) = mpsc::channel();
         let control = HotkeyControl::new(Preferences::default());
-        let publisher = MenuCommandPublisher::new(sender, control.clone());
+        let publisher =
+            MenuCommandPublisher::new(sender, control.clone(), MenuReadiness::new(true));
         let start = Instant::now();
 
         assert!(publisher.send(MenuCommand::SetThreshold(HoldThreshold::MS_750)));
@@ -721,7 +768,8 @@ mod tests {
             trigger: TriggerKey::KeyCode(54),
             threshold: HoldThreshold::MS_500,
         });
-        let publisher = MenuCommandPublisher::new(sender, control.clone());
+        let publisher =
+            MenuCommandPublisher::new(sender, control.clone(), MenuReadiness::new(true));
 
         assert!(publisher.send(MenuCommand::ResetTrigger));
         assert_eq!(
@@ -735,17 +783,43 @@ mod tests {
     fn assignment_command_arms_gate_before_runtime_drain() {
         let (sender, receiver) = mpsc::channel();
         let control = HotkeyControl::new(Preferences::default());
-        let publisher = MenuCommandPublisher::new(sender, control.clone());
+        let publisher =
+            MenuCommandPublisher::new(sender, control.clone(), MenuReadiness::new(true));
 
-        assert!(publisher.send(MenuCommand::BeginTriggerAssignment));
-        assert!(matches!(
-            control.observe_for_test(observation(ObservationKind::KeyDown, 49), Instant::now(),),
+        assert!(publisher.begin_assignment());
+        let selected_epoch = match control
+            .observe_for_test(observation(ObservationKind::KeyDown, 49), Instant::now())
+        {
             Some(HotkeySignal::AssignmentSelected {
                 trigger: TriggerKey::KeyCode(49),
-                ..
+                epoch,
+            }) => epoch,
+            other => panic!("expected selected assignment, got {other:?}"),
+        };
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(MenuCommand::BeginTriggerAssignment {
+                epoch: selected_epoch,
             })
-        ));
-        assert_eq!(receiver.try_recv(), Ok(MenuCommand::BeginTriggerAssignment));
+        );
+    }
+
+    #[test]
+    fn non_ready_assignment_command_does_not_consume_the_next_key() {
+        let (sender, receiver) = mpsc::channel();
+        let control = HotkeyControl::new(Preferences::default());
+        let readiness = MenuReadiness::new(false);
+        let publisher = MenuCommandPublisher::new(sender, control.clone(), readiness);
+
+        assert!(!publisher.begin_assignment());
+        assert_eq!(
+            control.observe_for_test(observation(ObservationKind::KeyDown, 49), Instant::now(),),
+            None
+        );
+        assert_eq!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
     }
 
     #[test]

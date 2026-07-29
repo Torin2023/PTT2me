@@ -17,7 +17,7 @@ use crate::audio::{AudioError, AudioRecorder};
 use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS};
 use crate::hotkey::{AssignmentEpoch, HotkeyControl, HotkeyListener, HotkeySignal};
 use crate::inserter;
-use crate::menu::{MenuBar, MenuCommand};
+use crate::menu::{MenuBar, MenuCommand, MenuReadiness};
 use crate::model::{resources_dir_from_executable, ModelPaths};
 use crate::permissions::{
     self, MicrophoneAuthorization, MicrophonePermissionBoundary, MicrophonePermissionFlow,
@@ -61,7 +61,7 @@ impl<R: RawPreferenceStore> RuntimePreferences<R> {
         match command {
             MenuCommand::ResetTrigger => self.current.trigger = TriggerKey::FnGlobe,
             MenuCommand::SetThreshold(threshold) => self.current.threshold = threshold,
-            MenuCommand::BeginTriggerAssignment => return Err(()),
+            MenuCommand::BeginTriggerAssignment { .. } => return Err(()),
         }
         Ok(())
     }
@@ -320,6 +320,7 @@ pub struct Runtime {
     menu_commands: Receiver<MenuCommand>,
     hotkey_control: HotkeyControl,
     assignment: AssignmentTracker,
+    menu_readiness: MenuReadiness,
     recorder: AudioRecorder,
     hotkey: Option<HotkeyListener>,
     hotkey_sender: Sender<HotkeySignal>,
@@ -353,14 +354,21 @@ impl Runtime {
         let preference_repository = PreferenceRepository::new(SystemPreferenceStore::new());
         let preferences = preference_repository.load();
         let hotkey_control = HotkeyControl::new(preferences);
+        let menu_readiness = MenuReadiness::new(false);
 
         let mut runtime = Box::pin(Self {
             controller: AppController::new(),
-            menu: MenuBar::new(preferences, menu_sender, hotkey_control.clone()),
+            menu: MenuBar::new(
+                preferences,
+                menu_sender,
+                hotkey_control.clone(),
+                menu_readiness.clone(),
+            ),
             preferences: RuntimePreferences::new(preferences, preference_repository),
             menu_commands,
             hotkey_control,
             assignment: AssignmentTracker::default(),
+            menu_readiness,
             recorder: AudioRecorder::new(),
             hotkey: None,
             hotkey_sender,
@@ -530,14 +538,12 @@ impl Runtime {
     }
 
     fn handle_menu_command(&mut self, command: MenuCommand) {
-        if command == MenuCommand::BeginTriggerAssignment {
+        if let MenuCommand::BeginTriggerAssignment { epoch } = command {
             if self.controller.status() == &AppStatus::Ready {
-                if let Some(epoch) = self.hotkey_control.current_assignment_epoch() {
-                    self.assignment.begin(epoch);
-                    self.menu.render_assignment();
-                }
+                self.assignment.begin(epoch);
+                self.menu.render_assignment();
             } else {
-                self.hotkey_control.cancel_current_assignment();
+                self.hotkey_control.cancel_assignment(epoch);
             }
             return;
         }
@@ -602,6 +608,8 @@ impl Runtime {
 
     fn dispatch(&mut self, event: AppEvent) {
         let effects = self.controller.handle(event);
+        self.menu_readiness
+            .set_ready(self.controller.status() == &AppStatus::Ready);
         self.assignment
             .cancel_unless_ready(self.controller.status(), &self.hotkey_control);
         self.menu.render(self.controller.status());
@@ -1029,6 +1037,54 @@ mod tests {
         assert_eq!(receiver.recv().unwrap(), HotkeySignal::Pressed);
         assert_eq!(receiver.recv().unwrap(), HotkeySignal::Cancelled);
         assert!(control.begin_assignment().is_some());
+    }
+
+    #[test]
+    fn quick_assignment_release_before_drain_persists_selected_trigger() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let control = HotkeyControl::new(Preferences::default());
+        let epoch = control.begin_assignment().unwrap();
+        sender
+            .send(MenuCommand::BeginTriggerAssignment { epoch })
+            .unwrap();
+        let selected = control
+            .observe_for_test(key_down(49), std::time::Instant::now())
+            .unwrap();
+        assert!(control.suppresses_for_test(
+            KeyboardObservation {
+                kind: ObservationKind::KeyUp,
+                ..key_down(49)
+            },
+            std::time::Instant::now(),
+        ));
+
+        let mut assignment = AssignmentTracker::default();
+        let MenuCommand::BeginTriggerAssignment {
+            epoch: command_epoch,
+        } = receiver.recv().unwrap()
+        else {
+            panic!("assignment command must retain its gate epoch");
+        };
+        assignment.begin(command_epoch);
+        let HotkeySignal::AssignmentSelected {
+            trigger,
+            epoch: selected_epoch,
+        } = selected
+        else {
+            panic!("assignment key must produce a selected signal");
+        };
+        let trigger = assignment
+            .accept_selection(trigger, selected_epoch, &AppStatus::Ready)
+            .unwrap();
+        let mut model = RuntimePreferences::new(
+            Preferences::default(),
+            PreferenceRepository::new(MemoryRawStore::default()),
+        );
+        model.select_trigger(trigger);
+        model.persist().unwrap();
+
+        assert_eq!(command_epoch, epoch);
+        assert_eq!(model.saved().trigger, TriggerKey::KeyCode(49));
     }
 
     fn recognizing_controller() -> AppController {
