@@ -24,6 +24,10 @@ use crate::inserter::{
 use crate::menu::MenuAction;
 use crate::menu::{MenuBar, MenuCommand, MenuReadiness};
 use crate::model::{resources_dir_from_executable, ModelPaths};
+use crate::output_preferences::{
+    OutputPreferenceController, OutputPreferenceError, OutputPreferenceRepository,
+    RawOutputPreferenceStore, SystemOutputPreferenceStore,
+};
 use crate::permissions::{
     self, MicrophoneAuthorization, MicrophonePermissionBoundary, MicrophonePermissionFlow,
     SystemPermissionProbe,
@@ -71,7 +75,9 @@ impl<R: RawPreferenceStore> RuntimePreferences<R> {
         match command {
             MenuCommand::ResetTrigger => self.current.trigger = TriggerKey::FnGlobe,
             MenuCommand::SetThreshold(threshold) => self.current.threshold = threshold,
-            MenuCommand::BeginTriggerAssignment { .. } => return Err(()),
+            MenuCommand::BeginTriggerAssignment { .. } | MenuCommand::SetAppendSpace(_) => {
+                return Err(())
+            }
         }
         Ok(())
     }
@@ -87,6 +93,16 @@ impl<R: RawPreferenceStore> RuntimePreferences<R> {
     #[cfg(test)]
     fn saved(&self) -> Preferences {
         self.repository.load()
+    }
+}
+
+fn apply_output_menu_command<R: RawOutputPreferenceStore>(
+    command: MenuCommand,
+    preferences: &mut OutputPreferenceController<R>,
+) -> Result<(), OutputPreferenceError> {
+    match command {
+        MenuCommand::SetAppendSpace(value) => preferences.set_append_space(value),
+        _ => Ok(()),
     }
 }
 
@@ -417,6 +433,7 @@ pub struct Runtime {
     controller: AppController,
     menu: MenuBar,
     preferences: RuntimePreferences<SystemPreferenceStore>,
+    output_preferences: OutputPreferenceController<SystemOutputPreferenceStore>,
     menu_commands: Receiver<MenuCommand>,
     hotkey_control: HotkeyControl,
     assignment: AssignmentTracker,
@@ -455,6 +472,10 @@ impl Runtime {
         let asr_worker = spawn_asr_worker(asr_command_receiver, asr_event_sender);
         let preference_repository = PreferenceRepository::new(SystemPreferenceStore::new());
         let preferences = preference_repository.load();
+        let output_preferences = OutputPreferenceController::load(OutputPreferenceRepository::new(
+            SystemOutputPreferenceStore::standard(),
+        ));
+        let append_space = output_preferences.current().append_space;
         let hotkey_control = HotkeyControl::new(preferences);
         let menu_readiness = MenuReadiness::new(false);
 
@@ -462,11 +483,13 @@ impl Runtime {
             controller: AppController::new(),
             menu: MenuBar::new(
                 preferences,
+                append_space,
                 menu_sender,
                 hotkey_control.clone(),
                 menu_readiness.clone(),
             ),
             preferences: RuntimePreferences::new(preferences, preference_repository),
+            output_preferences,
             menu_commands,
             hotkey_control,
             assignment: AssignmentTracker::default(),
@@ -678,6 +701,20 @@ impl Runtime {
             return;
         }
 
+        if let MenuCommand::SetAppendSpace(value) = command {
+            if apply_output_menu_command(
+                MenuCommand::SetAppendSpace(value),
+                &mut self.output_preferences,
+            )
+            .is_err()
+            {
+                tracing::warn!(error_category = "output_preference_persistence");
+            }
+            self.menu
+                .render_append_space(self.output_preferences.current().append_space);
+            return;
+        }
+
         if self.preferences.apply_in_memory(command).is_ok() {
             self.publish_preferences();
         }
@@ -825,24 +862,26 @@ impl Runtime {
                     )));
                 }
             }
-            Effect::InsertText(text) => match text_inserter::begin(&text) {
-                Ok(InsertOutcome::Complete(method)) => {
-                    let method = match method {
-                        InsertMethod::Accessibility => "accessibility",
-                        InsertMethod::UnicodeEvents => "unicode_events",
-                    };
-                    tracing::debug!(method, lifecycle = "text_inserted");
-                    self.dispatch(AppEvent::PasteFinished(Ok(())));
+            Effect::InsertText(text) => {
+                match text_inserter::begin(&text, self.output_preferences.current().append_space) {
+                    Ok(InsertOutcome::Complete(method)) => {
+                        let method = match method {
+                            InsertMethod::Accessibility => "accessibility",
+                            InsertMethod::UnicodeEvents => "unicode_events",
+                        };
+                        tracing::debug!(method, lifecycle = "text_inserted");
+                        self.dispatch(AppEvent::PasteFinished(Ok(())));
+                    }
+                    Ok(InsertOutcome::PendingClipboard(insertion)) => {
+                        let flow = PasteFlow::begin(insertion, self);
+                        self.pending_insertion = Some(flow);
+                    }
+                    Err(_) => {
+                        tracing::warn!(error_category = "text_insertion");
+                        self.dispatch(AppEvent::PasteFinished(Err("insert failed".to_owned())));
+                    }
                 }
-                Ok(InsertOutcome::PendingClipboard(insertion)) => {
-                    let flow = PasteFlow::begin(insertion, self);
-                    self.pending_insertion = Some(flow);
-                }
-                Err(_) => {
-                    tracing::warn!(error_category = "text_insertion");
-                    self.dispatch(AppEvent::PasteFinished(Err("insert failed".to_owned())));
-                }
-            },
+            }
             Effect::ScheduleErrorReset { delay_ms } => {
                 self.replace_error_timer(delay_ms);
             }
@@ -1086,16 +1125,21 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        capture_start_result_event, milliseconds_to_seconds, reset_hotkey_before_drop, status_name,
-        wait_for_smoke_child, AssignmentTracker, DeferredTapState, MicrophonePermissionRuntime,
-        PasteFlow, PasteFlowBoundary, PasteInsertion, RuntimePreferences, TapState, TimerKind,
-        EVENT_DRAIN_MS, PERMISSION_POLL_MS,
+        apply_output_menu_command, capture_start_result_event, milliseconds_to_seconds,
+        reset_hotkey_before_drop, status_name, wait_for_smoke_child, AssignmentTracker,
+        DeferredTapState, MicrophonePermissionRuntime, PasteFlow, PasteFlowBoundary,
+        PasteInsertion, RuntimePreferences, TapState, TimerKind, EVENT_DRAIN_MS,
+        PERMISSION_POLL_MS,
     };
     use crate::audio::AudioError;
     use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
     use crate::hotkey::{HotkeyControl, HotkeySignal, KeyboardObservation, ObservationKind};
     use crate::inserter::InsertError;
     use crate::menu::MenuCommand;
+    use crate::output_preferences::{
+        OutputPreferenceController, OutputPreferenceError, OutputPreferenceRepository,
+        RawOutputPreferenceStore,
+    };
     use crate::permissions::{MicrophoneAuthorization, MicrophonePermissionBoundary};
     use crate::preferences::{
         HoldThreshold, PreferenceError, PreferenceRepository, Preferences, RawPreferenceStore,
@@ -1145,6 +1189,27 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MemoryOutputStore {
+        value: Option<bool>,
+        fail_writes: bool,
+    }
+
+    impl RawOutputPreferenceStore for MemoryOutputStore {
+        fn append_space(&self) -> Option<bool> {
+            self.value
+        }
+
+        fn set_append_space(&mut self, value: bool) -> Result<(), OutputPreferenceError> {
+            if self.fail_writes {
+                Err(OutputPreferenceError::WriteFailed)
+            } else {
+                self.value = Some(value);
+                Ok(())
+            }
+        }
+    }
+
     #[test]
     fn threshold_command_updates_menu_store_and_future_gate_preferences() {
         let mut model = RuntimePreferences::new(
@@ -1157,6 +1222,21 @@ mod tests {
         );
         assert_eq!(model.current().threshold, HoldThreshold::MS_750);
         assert_eq!(model.saved().threshold, HoldThreshold::MS_750);
+    }
+
+    #[test]
+    fn trailing_space_command_keeps_live_state_when_persistence_fails() {
+        let mut preferences =
+            OutputPreferenceController::load(OutputPreferenceRepository::new(MemoryOutputStore {
+                value: Some(false),
+                fail_writes: true,
+            }));
+
+        assert_eq!(
+            apply_output_menu_command(MenuCommand::SetAppendSpace(true), &mut preferences),
+            Err(OutputPreferenceError::WriteFailed)
+        );
+        assert!(preferences.current().append_space);
     }
 
     fn key_down(keycode: u16) -> KeyboardObservation {
