@@ -1,36 +1,61 @@
-# PTT2me Automatic Updates Design
+# PTT2me Automatic Update Discovery Design
 
 ## Status
 
-Approved in conversation on 2026-07-31. This design covers update discovery,
-download verification, user-guided installation, and permission migration for
-unsigned builds. It does not add automatic application replacement, an Apple
-Developer ID signature, notarization, telemetry, or a background agent.
+Revised after the 2026-07-31 implementation-plan audit. The original design
+was approved in conversation; this revision incorporates the audit findings
+and is pending written-spec review before production-code implementation.
+
+This feature provides signed update discovery, a verified download, and a
+user-guided manual installation. It does not replace the application bundle,
+remove quarantine metadata, disable Gatekeeper, add Apple Developer ID
+signing/notarization, send telemetry, or run a background agent.
 
 ## Product contract
 
-- Git is the only source of truth for published versions.
-- The signed `updates/channels/stable.json` committed to Git has priority over
-  local bundle metadata, local `dist/` files, and previously built artifacts.
-- GitHub Pages is a read-only delivery channel for committed update manifests.
-- Every GitHub Release stores two immutable artifacts: a self-contained Full
-  DMG for a fresh installation and a small Update DMG without the ASR model.
-- PTT2me checks automatically at most once per 24 hours, beginning 60 seconds
-  after launch. `Проверить обновления…` bypasses that interval.
-- A DMG is downloaded only after the user chooses the download menu action.
-  The updater selects the small Update DMG only when the required local model
-  exists and passes its committed manifest; otherwise it offers the Full DMG.
-- The app verifies the manifest signature, architecture, version, size, and
-  SHA-256 before opening a DMG.
-- Installation remains manual: PTT2me opens the verified DMG and quits; the
-  user replaces the app in `Applications`.
-- No code removes quarantine metadata, disables Gatekeeper, or automates an
-  `Open Anyway` confirmation.
-- On the first launch of every distinct unsigned build, PTT2me resets only its
-  Accessibility, Input Monitoring, and Microphone grants. The user grants all
-  three again in System Settings before dictation becomes ready.
+- Git is the sole source of truth for published versions.
+- The exact signed `updates/channels/stable.json` committed to Git has priority
+  over a local bundle, local `dist/` files, and previously built artifacts.
+- GitHub Pages is a read-only transport for committed update records. The
+  client URL is exactly
+  `https://torin2023.github.io/PTT2me/channels/stable.json`.
+- Every release publishes a self-contained Full DMG and a model-free Update
+  DMG. Both contain the same executable, frameworks, version, build, source
+  commit, and embedded public key.
+- A fresh installation always uses Full. Update is only selected by the
+  running application after the required external model has been verified.
+- No model is downloaded as an independent runtime asset. A Full DMG contains
+  the complete model needed for an offline first launch.
+- Update checks start no earlier than 60 seconds after launch and recur no more
+  than once per 24 hours while the application remains running. A manual check
+  bypasses the interval.
+- The manifest request is automatic. A DMG is downloaded only after an
+  explicit menu action by the user.
+- After verification, the application remains running in `ReadyToInstall`.
+  The user separately chooses `Открыть DMG и выйти…`; that action is enabled
+  only while dictation and pasteboard restoration are idle.
+- The user replaces `PTT2me.app` in `/Applications` through Finder, launches
+  the new version, and grants Accessibility, Input Monitoring, and Microphone
+  again.
+- The updater never removes quarantine, automates Finder replacement, or
+  bypasses the narrow macOS `Open Anyway` flow.
+- On the first usable launch of every new release build, PTT2me resets exactly
+  its Accessibility, ListenEvent, and Microphone decisions for bundle ID
+  `com.ptt2me.app`. A failed model bootstrap does not consume this reset.
 
-## Trust model and repository layout
+The resulting user intervention for an ordinary update is:
+
+1. Choose `Скачать обновление <version>…`.
+2. After the verified download completes, choose `Открыть DMG и выйти…`.
+3. Replace the application in Finder and launch it.
+4. If Gatekeeper blocks the unsigned build, use `Open Anyway` for this app.
+5. Grant the same three permissions again in System Settings.
+
+## Trust model
+
+The initial Full DMG is an unsigned bootstrap trust decision by the user. The
+embedded Ed25519 public key authenticates subsequent update records, but it
+does not turn the app into an Apple-identified or notarized application.
 
 The repository contains:
 
@@ -38,19 +63,24 @@ The repository contains:
 updates/
   public-key.txt
   channels/stable.json
-  releases/1.0.6.json
+  releases/<version>.json
 models/manifests/
   gigaam-v3-rnnt-v1.json
 scripts/
   sign-update-manifest.sh
+  validate-update-manifest.sh
 .github/workflows/pages.yml
 ```
 
-The private Ed25519 key never enters Git, GitHub Pages, a GitHub Release, or a
-normal CI environment. `public-key.txt` is embedded into the application at
-compile time and is also published for auditability.
+The private Ed25519 key never enters Git, GitHub Pages, GitHub Releases, or a
+normal CI environment. Before the first production record is signed, the
+release runbook must name its owner, require two encrypted offline backups,
+and document recovery and bridge-release rotation. A bridge release signed by
+the old key can ship a new embedded key before later records use it. Loss of
+all copies of the current key requires a manual reinstall and cannot be hidden
+by the updater.
 
-To avoid ambiguous JSON canonicalization, the signed envelope is:
+To avoid ambiguous JSON canonicalization, the envelope remains:
 
 ```json
 {
@@ -88,30 +118,58 @@ The decoded payload contains exactly:
 }
 ```
 
-The client verifies the envelope before parsing or trusting payload fields.
-It accepts only schema 1, channel `stable`, architecture `arm64`, HTTPS, the
-exact GitHub release host/path shape, valid semantic versions, nonzero size,
-and well-formed hashes and commits.
+The client limits the envelope body to 64 KiB, verifies the signature over the
+decoded payload bytes before trusting fields, and rejects unknown fields. It
+accepts only schema 1, channel `stable`, architecture `arm64`, stable semantic
+versions, a nonzero build, exact expected HTTPS GitHub Release URL shapes,
+nonzero artifact sizes no greater than 1 GiB, well-formed hashes/commits, and a
+real UTC timestamp.
 
-`updates/releases/<version>.json` is immutable. `stable.json` is a byte-for-byte
-copy of the selected signed release envelope. CI rejects a stable entry without
-a matching release record and rejects disagreement with `Cargo.toml`, the tag,
-the source commit, or the published asset digest.
+## Canonical release and installed-build precedence
 
-## Version precedence
+The signed stable record defines the canonical GitHub release. The installed
+bundle contributes `CFBundleShortVersionString`, `CFBundleVersion`, and
+`PTT2meSourceCommit`.
 
-The remote signed stable manifest defines the published stable version. The
-installed bundle defines only which build is currently running.
+Comparison is deterministic:
 
-- Remote version/build greater than local: update available.
-- Remote version/build equal to local: current.
-- Local greater than remote: `неопубликованная сборка`; do not downgrade.
-- An automatic downgrade is never performed. A future recovery design requires
-  an explicit signed recovery field and is outside this scope.
+1. Compare semantic version.
+2. For equal versions, compare numeric build.
+3. For equal version/build, compare source commit.
 
-## Model storage and provisioning
+- Remote version/build greater: `Available`.
+- Equal version/build and equal source commit: `Current`.
+- Equal version/build but different source commit: `DivergedLocal`; the
+  canonical GitHub artifact is offered because Git has explicit priority.
+- Local version/build greater: `UnpublishedLocal`; do not downgrade.
+- A malformed or untrusted record never influences local state.
 
-The fixed model is versioned independently from the application and stored at:
+`minimum_macos` is compared numerically with the running system before a
+download action is exposed. An incompatible release produces
+`Incompatible { required_macos }`; automatic checks stay quiet and a manual
+check shows the reason. No DMG action is offered.
+
+Model repair is evaluated after release precedence:
+
+- For `Available` or `DivergedLocal`, a verified exact model selects Update;
+  a missing, wrong, or invalid model selects Full.
+- For `Current`, a valid model needs no action. If neither a valid external
+  model nor a bundled model exists, the same signed Full artifact becomes
+  `RepairRequired` even though version/build are equal.
+- For `UnpublishedLocal`, the stable Full artifact is not offered because it
+  would be a downgrade. The UI reports that the local build needs its matching
+  Full package.
+
+## Model manifest and external store
+
+The model manifest is committed at
+`models/manifests/gigaam-v3-rnnt-v1.json` and embedded into both application
+variants with `include_bytes!`. Its exact-byte SHA-256 must equal
+`required_model.manifest_sha256`. A manifest file is immutable once its model
+ID has shipped; changed bytes require a new model ID and a new manifest file.
+
+The external model directory contains exactly four data files and no trusted
+metadata copied from the user-writable directory:
 
 ```text
 ~/Library/Application Support/PTT2me/models/gigaam-v3-rnnt-v1/
@@ -119,14 +177,9 @@ The fixed model is versioned independently from the application and stored at:
   decoder.onnx
   joiner.onnx
   tokens.txt
-  model-manifest.json
 ```
 
-The committed model manifest is the Git source of truth for the model ID,
-exact file names, sizes, and SHA-256 digests. Runtime code rejects extra file
-names, missing files, symlinks, wrong sizes, and digest mismatches.
-
-Its schema is fixed and contains no download URL:
+The fixed manifest schema is:
 
 ```json
 {
@@ -141,79 +194,138 @@ Its schema is fixed and contains no download URL:
 }
 ```
 
-These sizes and digests were measured from the frozen v1 build assets on the
-controlled build Mac. Directories are created with user-only access and regular
-model files are not executable.
+Runtime verification rejects duplicate or extra entries, extra filesystem
+names, missing files, symlinks, non-regular files, executable bits, wrong
+sizes, and digest mismatches. Verification and provisioning run on a worker,
+not the AppKit thread.
 
-The first updater-enabled release is a bootstrap Full DMG. On first launch its
-app copies the bundled model into a sibling `.incoming` directory, verifies the
-committed manifest, fsyncs the files, and atomically renames the directory to
-the model ID. A partial or invalid directory is never used. Once the external
-model is valid, later Update DMGs replace only the application bundle and leave
-the model store untouched.
+### Bootstrap and repair transaction
 
-A fresh installation of any later release still uses the Full DMG, which
-contains the required model and works without a runtime model download. If an
-installed app finds neither a valid external model nor a bundled bootstrap
-model, it remains blocked and offers the signed Full DMG. Model changes use a
-new immutable model ID and require a Full DMG; the old model remains until the
-new model has been provisioned successfully.
+The first updater-enabled release is installed from a Full DMG. Startup first
+acquires the existing single-instance lock and then runs model preparation:
 
-Deleting `PTT2me.app` does not delete the external model. Documentation must
-name the Application Support directory in a separate full-uninstall procedure.
+1. Verify the existing external directory against the embedded manifest.
+2. If it is valid, use it without copying the bundled model.
+3. If it is absent or invalid and the bundle has no matching model, enter
+   `ModelRepairRequired` without resetting TCC.
+4. If the bundle has the model, require free space equal to the manifest's
+   total data size plus 64 MiB.
+5. Create user-only `<model-id>.incoming`, copy only the four expected regular
+   files, fsync each file, and verify the completed staging directory.
+6. If the final target is an invalid non-empty directory, rename it to
+   `<model-id>.invalid-<uuid>` and fsync the parent.
+7. Rename `.incoming` to the final model ID, fsync the parent, and verify the
+   final directory again.
+8. Only after final verification may the invalid backup be removed. A valid
+   model, including a valid older model ID, is never deleted automatically.
 
-## Application components
+On restart, a valid `.incoming` with no final target is promoted; an invalid
+`.incoming` is removed only after its path and contents have been validated as
+belonging to this exact model transaction. A crash after the invalid-target
+rename therefore remains recoverable.
 
-### `update_manifest.rs`
+The menu shows `Подготовка модели…` during work and a targeted storage/model
+error with retry on failure. ASR loading begins only after verified model paths
+have been resolved.
 
-Owns envelope decoding, Ed25519 verification, payload validation, semantic
-version/build comparison, model requirement validation, artifact selection,
-and download digest verification. It has no network, filesystem, UI, or AppKit
-dependencies.
+## Updater state machine and scheduling
 
-### `model_store.rs`
+The pure reducer states are:
 
-Owns committed model-manifest parsing, local verification, atomic provisioning
-from a Full app bundle, and resolution of the verified external model paths.
-It never downloads a model and never deletes a previously valid model during
-provisioning.
+```text
+Idle
+Checking(reason)
+Current
+Available(release, selected_artifact)
+DivergedLocal(release, selected_artifact)
+RepairRequired(release, full_artifact)
+Incompatible(release, required_macos)
+UnpublishedLocal
+RecheckingModel(release)
+Downloading(release, artifact)
+ReadyToInstall(release, artifact, path)
+Failed(reason, retry_action)
+```
 
-### `updater.rs`
+The reducer owns no HTTP, filesystem, AppKit, clock, platform, or process
+implementation. Commands carry operation IDs; late results from an older
+operation are ignored. At most one check, model recheck, or download is active.
 
-Owns the updater state machine and boundary traits for HTTP, storage, clock,
-current platform, and opening a file. Network and hashing run off the AppKit
-main thread. It receives the result of model-store verification and selects
-`application_update` or `fresh_install` accordingly. A verified DMG is stored below
-`~/Library/Caches/com.ptt2me.app/updates/`; partial files are never opened.
+On launch, the runtime first verifies a cached signed envelope, if present, so
+a known update does not disappear after a restart. The cached bytes are never
+trusted without the normal signature and field validation.
 
-States are `Idle`, `Checking`, `Current`, `Available`, `Downloading`,
-`ReadyToInstall`, `UnpublishedLocal`, and `Failed`. Automatic-check failures
-are logged without interrupting dictation. A manual failure is visible in the
-updater menu row and remains retryable.
+Automatic scheduling uses one-shot timers that are rescheduled after every
+attempt:
 
-### Menu and runtime integration
+- With no previous attempt, schedule for launch + 60 seconds.
+- With a previous attempt less than 24 hours old, schedule its 24-hour due
+  time, but never earlier than launch + 60 seconds.
+- Persist `last_network_check_attempt` immediately before either an automatic
+  or manual request. Manual checks bypass the due test but move the next
+  automatic attempt 24 hours forward, avoiding a duplicate request.
+- A future timestamp caused by wall-clock rollback is treated as an attempt at
+  the current time and schedules the next check 24 hours later.
 
-The menu always contains `Проверить обновления…`. When an update is available,
-it contains `Скачать обновление <version>…` for a valid local model or
-`Скачать полную версию <version>…` when model provisioning is required. During work the informational row
-shows checking/downloading progress. Selecting download is the user's explicit
-confirmation. After verification PTT2me opens the DMG through `NSWorkspace`
-and terminates, leaving bundle replacement to Finder.
+Automatic failures are logged and do not interrupt dictation. Manual failures
+remain visible and retryable.
 
-The runtime schedules a one-shot 60-second startup timer and evaluates the
-24-hour persisted last-check timestamp before making a request. A manual check
-ignores the timestamp. No LaunchAgent or work is performed while PTT2me is not
-running.
+## Download, cache, and quarantine
 
-### `permission_migration.rs`
+The manifest worker uses HTTPS and bounded reads off the main thread:
 
-A build identity is the tuple of `CFBundleShortVersionString`,
-`CFBundleVersion`, and `PTT2meSourceCommit`. `build-app.sh` writes all three to
-`Info.plist`. Development binaries outside a `.app` do not run migration.
+- manifest response: at most 64 KiB;
+- connect timeout: 10 seconds;
+- read inactivity timeout: 30 seconds;
+- overall request timeout: 15 minutes;
+- redirects: at most five and never from HTTPS to HTTP;
+- non-success HTTP status: failure;
+- artifact stream: stop at signed size + 1 and reject both short and long
+  bodies; compare `Content-Length` when present;
+- global signed artifact size ceiling: 1 GiB.
 
-Before the event tap, microphone stream, or insertion runtime can become ready,
-the app compares the identity with `PermissionsResetForBuild` in
-`NSUserDefaults`. On a new identity it runs, without a shell:
+Full and Update cache names include version, build, and artifact kind. A
+download is written to a sibling `.part`, flushed and fsynced, verified by
+size/SHA-256, atomically renamed, and re-opened for verification before use.
+A verified cached file may be reused only after the same checks. Stale `.part`
+files and verified DMGs from superseded releases are removed; the currently
+offered verified DMG is retained until superseded or full uninstall.
+
+Because a custom writer does not receive browser quarantine automatically, the
+bundle enables file quarantine and the production boundary verifies that the
+completed DMG has `com.apple.quarantine` before `ReadyToInstall`. Missing
+quarantine is a hard failure, never a reason to open the file. A release gate
+must exercise download → mount → Finder copy → expected Gatekeeper/Open Anyway
+behavior on a clean macOS user.
+
+The menu action `Открыть DMG и выйти…` is enabled only when the application is
+`Ready`, no capture/recognition is active, and no pasteboard insertion or
+restore is pending. `NSWorkspace` open failure leaves the app and verified DMG
+available for retry. Only a successful open requests orderly termination.
+
+Immediately before download confirmation, the worker verifies the required
+model again. If an Update selection became invalid, the UI changes to Full and
+requires the user to choose the Full download action; it never silently
+downloads the larger artifact under an earlier choice.
+
+## Permission migration
+
+A release build identity is the exact tuple of:
+
+```text
+CFBundleShortVersionString
+CFBundleVersion
+PTT2meSourceCommit
+```
+
+`build-release-artifacts.sh` fixes these values once and both variants use the
+same executable and identity. Dirty release builds are rejected. Development
+binaries outside a `.app` bypass migration.
+
+After model preparation succeeds and before event-tap, microphone, or insertion
+runtime setup, the app compares this identity with `PermissionsResetForBuild`.
+For a new identity it executes without a shell, with a 10-second timeout per
+command:
 
 ```text
 /usr/bin/tccutil reset Accessibility com.ptt2me.app
@@ -221,50 +333,121 @@ the app compares the identity with `PermissionsResetForBuild` in
 /usr/bin/tccutil reset Microphone com.ptt2me.app
 ```
 
-The reset marker is stored only after all commands succeed. A separate
+The reset marker is stored only after all three commands succeed. A separate
 `PermissionsSetupCompletedForBuild` marker is stored after system probes report
-all three grants. Closing the app during setup does not repeat a successful
-reset; the existing permission flow resumes at the first missing grant.
+all three grants. Closing during interactive setup does not repeat a successful
+reset; the next launch resumes at the first missing permission.
 
-If reset fails, dictation remains blocked, the menu reports a permission-reset
-error, and the user can retry. The app never treats old grants as valid for the
-new build.
+Reset failure blocks dictation and exposes retry plus narrow manual Terminal
+fallback instructions. The release gate must prove the real build-to-build
+flow on supported macOS versions; mocked process-boundary tests do not satisfy
+that gate.
 
-## Release flow
+## Deterministic packaging
 
-1. Commit release source and create tag `vX.Y.Z`.
-2. Build Full and Update app variants from that exact tag on the controlled
-   Apple Silicon Mac. Only the Full variant contains the frozen model.
-3. Verify the Full bundle against the committed model manifest and verify the
-   Update bundle contains no model files.
-4. Build both DMGs, run bundle/manual/architecture/checksum checks, and publish
-   both immutable DMGs plus checksums to GitHub Release.
-5. Generate the payload with the tag commit, required model-manifest digest,
-   and both GitHub asset digests.
-6. Sign payload bytes using the offline Ed25519 key.
-7. Commit the immutable release envelope and update `stable.json` through PR.
-8. CI validates the relationship and deploys the committed `updates/` directory
-   to GitHub Pages.
+The release coordinator receives explicit version, numeric build, and clean
+source commit. It compiles the executable once, then creates two app bundles:
 
-The next release is the bootstrap release: v1.0.5 cannot check for updates, so
-users install the first updater-enabled version manually. All later compatible
-versions use the embedded public key and the external verified model store.
+- Full: executable, frameworks, licenses, embedded public/model manifests, and
+  the four model data files.
+- Update: the byte-identical executable/frameworks/licenses/manifests and no
+  `Resources/models` directory.
 
-## Verification
+Both `Info.plist` files contain the same version, build, source commit, bundle
+identifier, minimum system version, and file-quarantine policy. A diagnostic
+`PTT2meDistributionVariant` differs, but it is not part of release precedence
+or the version-level permission-reset marker.
 
-- Pure unit tests cover malformed envelopes, invalid signatures, field
-  validation, version precedence, downgrade refusal, and digest mismatch.
-- Updater state tests use deterministic in-memory boundaries for automatic and
-  manual checks, Full-versus-Update selection, download confirmation, network
-  failure, and verified opening.
-- Model-store tests cover manifest validation, symlink rejection, atomic
-  provisioning, interrupted copies, reuse, and a changed model ID.
-- Permission migration tests cover first launch, same-build relaunch, partial
-  reset failure, setup continuation, and development-binary bypass.
-- Menu/runtime tests cover action visibility, timer policy, failure display,
-  and blocking until permissions are re-granted.
-- Script tests generate a temporary key and artifact, sign a manifest, and
-  verify it through the same Rust verifier.
-- Release validation covers GitHub Pages payload bytes, both GitHub asset
-  SHA-256 values, model-manifest SHA-256, source commit, bundle contents, and
-  the full existing PTT2me check suite.
+Validation is explicitly variant-aware:
+
+- `check-bundle.sh --variant full` verifies exact model contents and performs a
+  bundled-model smoke test.
+- `check-bundle.sh --variant update` rejects bundled model data and never reads
+  production Application Support.
+- The release gate compares executable and framework hashes between variants.
+- `build-dmg.sh` packages a supplied app/variant/output and never rebuilds it.
+
+## GitHub release and Pages flow
+
+Feature implementation and production release are separate commits. The
+release-only flow is:
+
+1. Ensure GitHub Pages custom-workflow publishing and GitHub immutable releases
+   are enabled. Immutability must be enabled before this release.
+2. Bump `Cargo.toml` and `Cargo.lock` once, commit, and create tag `vX.Y.Z`.
+3. Create a clean detached worktree at the exact tag and reject local changes.
+4. Choose one build value, build both variants from the same compiled output,
+   and complete bundle/manual/architecture/model/quarantine checks.
+5. Create a draft GitHub Release and upload both DMGs and checksums.
+6. Publish the release only after all assets are present; verify the release
+   and each asset are immutable.
+7. Generate and sign the payload using the offline key.
+8. Through a separate PR, add immutable `updates/releases/X.Y.Z.json` and make
+   `updates/channels/stable.json` its byte-for-byte copy.
+9. CI verifies each release record against its historical source with
+   `git show <source_commit>:Cargo.toml`, verifies tag → source commit, rejects
+   modification of previously committed release records/model manifests, and
+   verifies the real immutable asset digests.
+10. Publish `updates/` as the GitHub Pages artifact root. After deployment,
+    canary the exact public stable URL, require HTTP 200, and compare public
+    bytes with Git before updating README/site or announcing the release.
+
+If canary fails, the previous Pages deployment remains authoritative. A bad
+stable pointer may be restored to a previous signed record, but already
+installed newer clients are never downgraded; they require a signed hotfix.
+
+The first updater-enabled version is a manually installed bootstrap Full DMG,
+because v1.0.5 cannot discover it. Subsequent compatible releases exercise the
+Update path.
+
+## Documentation contract
+
+README, release notes, and the product site must state:
+
+- the feature automatically checks for updates; it does not automatically
+  install them;
+- exact 60-second/24-hour behavior and the manual bypass;
+- manifest requests go to GitHub Pages without a product telemetry identifier;
+- GitHub Release download happens only after the user's action;
+- speech, audio, and recognition remain local;
+- Full is the only fresh-install/manual website download; Update is for the
+  in-app updater;
+- Finder replacement, narrow Gatekeeper recovery, automatic TCC reset, and
+  manual re-grant steps;
+- model, update cache, timestamps, and permission markers stored by the app;
+- full uninstall paths for the app, Application Support, cache, preferences,
+  and remaining System Settings grants.
+
+The site release version, Full URL, Full size, checksum, and release URL must be
+validated against the committed signed release record. The primary CTA must
+never point to `application_update`.
+
+## Verification gates
+
+Automated coverage includes:
+
+- signed dual-artifact payloads, strict fields, source-commit divergence,
+  numeric macOS comparison, repair precedence, and downgrade refusal;
+- deterministic scheduler behavior across relaunch, long-running processes,
+  manual checks, future clocks, and cached signed envelopes;
+- model-manifest immutability, exact filesystem contents, symlink rejection,
+  free-space failure, valid reuse, invalid-target swap, and crash recovery;
+- re-verification between update discovery, user download action, and open;
+- manifest/artifact size caps, short/long/chunked bodies, stalled reads,
+  redirects, non-success responses, cache collisions, and `.part` cleanup;
+- active recording/recognition/pasteboard states never terminate on download;
+- deterministic Full/Update bundle identities and variant-specific checks;
+- permission reset first launch, same-build relaunch, partial failure, marker
+  persistence, and model-failure-before-reset ordering.
+
+Manual release coverage includes:
+
+```text
+v1.0.5 → updater-enabled Full bootstrap → model provision → TCC reset/re-grant
+current release + corrupt model → same-version Full repair
+valid model + next release → model-free Update path
+fresh user choosing Full from site → offline first recognition
+minimum macOS mismatch → no download action
+downloaded DMG → quarantine → Finder copy → Open Anyway → launch
+offline/timeout/interrupted/ENOSPC cases → retry without data loss
+```
