@@ -16,3 +16,4 @@ pub mod runtime;
 pub mod single_instance;
 pub mod state;
 pub(crate) mod text_inserter;
+pub mod update_manifest;
