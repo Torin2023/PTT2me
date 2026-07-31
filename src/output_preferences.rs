@@ -8,9 +8,14 @@ pub struct OutputPreferences {
     pub append_space: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputPreferenceError {
+    WriteFailed,
+}
+
 pub trait RawOutputPreferenceStore {
     fn append_space(&self) -> Option<bool>;
-    fn set_append_space(&mut self, value: bool) -> Result<(), ()>;
+    fn set_append_space(&mut self, value: bool) -> Result<(), OutputPreferenceError>;
 }
 
 pub struct OutputPreferenceRepository<R> {
@@ -28,7 +33,7 @@ impl<R: RawOutputPreferenceStore> OutputPreferenceRepository<R> {
         }
     }
 
-    pub fn save(&mut self, value: OutputPreferences) -> Result<(), ()> {
+    pub fn save(&mut self, value: OutputPreferences) -> Result<(), OutputPreferenceError> {
         self.raw.set_append_space(value.append_space)
     }
 }
@@ -51,7 +56,7 @@ impl<R: RawOutputPreferenceStore> OutputPreferenceController<R> {
         self.current
     }
 
-    pub fn set_append_space(&mut self, value: bool) -> Result<(), ()> {
+    pub fn set_append_space(&mut self, value: bool) -> Result<(), OutputPreferenceError> {
         self.current.append_space = value;
         self.repository.save(self.current)
     }
@@ -78,11 +83,14 @@ impl RawOutputPreferenceStore for SystemOutputPreferenceStore {
         }
     }
 
-    fn set_append_space(&mut self, value: bool) -> Result<(), ()> {
+    fn set_append_space(&mut self, value: bool) -> Result<(), OutputPreferenceError> {
         let key = NSString::from_str(APPEND_SPACE_KEY);
         unsafe {
             self.defaults.setBool_forKey(value, &key);
-            self.defaults.synchronize().then_some(()).ok_or(())
+            self.defaults
+                .synchronize()
+                .then_some(())
+                .ok_or(OutputPreferenceError::WriteFailed)
         }
     }
 }
@@ -102,9 +110,9 @@ mod tests {
             self.value
         }
 
-        fn set_append_space(&mut self, value: bool) -> Result<(), ()> {
+        fn set_append_space(&mut self, value: bool) -> Result<(), OutputPreferenceError> {
             if self.fail_writes {
-                Err(())
+                Err(OutputPreferenceError::WriteFailed)
             } else {
                 self.value = Some(value);
                 Ok(())
@@ -136,7 +144,10 @@ mod tests {
         };
         let mut controller = OutputPreferenceController::load(OutputPreferenceRepository::new(raw));
 
-        assert_eq!(controller.set_append_space(true), Err(()));
+        assert_eq!(
+            controller.set_append_space(true),
+            Err(OutputPreferenceError::WriteFailed)
+        );
         assert!(controller.current().append_space);
     }
 

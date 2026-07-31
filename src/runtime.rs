@@ -21,8 +21,8 @@ use crate::inserter;
 use crate::menu::{MenuBar, MenuCommand};
 use crate::model::{resources_dir_from_executable, ModelPaths};
 use crate::output_preferences::{
-    OutputPreferenceController, OutputPreferenceRepository, OutputPreferences,
-    RawOutputPreferenceStore, SystemOutputPreferenceStore,
+    OutputPreferenceController, OutputPreferenceError, OutputPreferenceRepository,
+    OutputPreferences, RawOutputPreferenceStore, SystemOutputPreferenceStore,
 };
 use crate::permissions::{
     self, MicrophoneAuthorization, MicrophonePermissionBoundary, MicrophonePermissionFlow,
@@ -630,7 +630,7 @@ impl Runtime {
 fn apply_menu_command<R: RawOutputPreferenceStore>(
     command: MenuCommand,
     preferences: &mut OutputPreferenceController<R>,
-) -> Result<OutputPreferences, ()> {
+) -> Result<OutputPreferences, OutputPreferenceError> {
     let result = match command {
         MenuCommand::SetAppendSpace(value) => preferences.set_append_space(value),
     };
@@ -724,7 +724,8 @@ mod tests {
     use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
     use crate::menu::MenuCommand;
     use crate::output_preferences::{
-        OutputPreferenceController, OutputPreferenceRepository, RawOutputPreferenceStore,
+        OutputPreferenceController, OutputPreferenceError, OutputPreferenceRepository,
+        RawOutputPreferenceStore,
     };
     use crate::permissions::{MicrophoneAuthorization, MicrophonePermissionBoundary};
     use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
@@ -762,8 +763,8 @@ mod tests {
             Some(false)
         }
 
-        fn set_append_space(&mut self, _value: bool) -> Result<(), ()> {
-            Err(())
+        fn set_append_space(&mut self, _value: bool) -> Result<(), OutputPreferenceError> {
+            Err(OutputPreferenceError::WriteFailed)
         }
     }
 
@@ -774,7 +775,7 @@ mod tests {
 
         assert_eq!(
             apply_menu_command(MenuCommand::SetAppendSpace(true), &mut preferences),
-            Err(())
+            Err(OutputPreferenceError::WriteFailed)
         );
         assert!(preferences.current().append_space);
     }
