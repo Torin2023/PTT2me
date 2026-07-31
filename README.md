@@ -36,7 +36,7 @@ The menu contains the trigger controls:
 
 ```text
 <status>
-PTT2me 1.0.4
+PTT2me 1.0.5
 Открыть настройки…   (only while a required permission is missing)
 Клавиша активации
   <selected key>
@@ -119,7 +119,7 @@ To rebuild the app and create a local Apple Silicon DMG, run:
 scripts/build-dmg.sh
 ```
 
-The command creates `dist/PTT2me-1.0.4-macos-arm64.dmg` and its
+The command creates `dist/PTT2me-1.0.5-macos-arm64.dmg` and its
 `.sha256` checksum. The image contains `PTT2me.app` and an `Applications`
 link for drag-and-drop installation. It uses ad-hoc signing and is not
 notarized for public distribution.
