@@ -1,100 +1,101 @@
-# Optional Trailing Space Design
+# Опциональный пробел после реплики
 
-## Goal
+## Цель
 
-Let the user optionally append one space after each inserted dictation result so
-successive dictated sentences remain separated. Preserve punctuation produced
-by the ASR model.
+Дать пользователю возможность добавлять один пробел после каждого вставленного
+результата диктовки, чтобы последовательные продиктованные предложения не
+сливались. Пунктуация, созданная ASR-моделью, должна сохраняться.
 
-## User Experience
+## Пользовательское поведение
 
-The menu gains one checkable item titled `Пробел`.
+В меню появляется один пункт с чекбоксом `Пробел`.
 
-- The item is unchecked by default on a new installation.
-- Selecting it toggles whether one trailing space is appended to future
-  insertions.
-- The selected state persists across application restarts.
+- В новой установке чекбокс по умолчанию выключен.
+- Выбор пункта переключает добавление одного пробела в конце последующих
+  вставок.
+- Выбранное состояние сохраняется между перезапусками приложения.
 
-With the option disabled, recognized text is inserted using the existing
-behavior. With the option enabled, exactly one ASCII space is appended after
-the existing outer-whitespace normalization:
+При выключенной настройке распознанный текст вставляется в соответствии с
+текущим поведением. При включённой настройке после существующей нормализации
+внешних пробелов добавляется ровно один пробел ASCII:
 
 ```text
-Привет.  -> Привет. 
-Привет!  -> Привет! 
-Привет?  -> Привет? 
+"Привет." -> "Привет. "
+"Привет!" -> "Привет! "
+"Привет?" -> "Привет? "
 ```
 
-The application does not add, remove, or replace punctuation. The local
-GigaAM RNNT call has no text prompt or punctuation instruction, so no ASR
-configuration change is required.
+Приложение не добавляет, не удаляет и не заменяет знаки пунктуации. Вызов
+локальной GigaAM RNNT не содержит текстового запроса или инструкции о
+пунктуации, поэтому конфигурацию ASR менять не требуется.
 
-## Design
+## Проектирование
 
-### Preference Model and Persistence
+### Модель настройки и хранение
 
-A small output preference model owns the `append_space` boolean and its
-default value of `false`.
+Небольшая модель настройки вывода хранит логическое значение `append_space`.
+Его значение по умолчанию — `false`.
 
-The preference is stored in the standard macOS user-defaults store. A missing
-or unreadable value falls back to `false`. A write failure does not block
-dictation: the in-memory value remains active for the current run and the
-failure is logged.
+Настройка сохраняется в стандартном хранилище пользовательских настроек macOS.
+Если значение отсутствует или не может быть прочитано, используется `false`.
+Ошибка записи не блокирует диктовку: выбранное значение продолжает действовать
+в памяти до завершения текущего запуска, а ошибка записывается в журнал.
 
-### Menu
+### Меню
 
-`MenuBar` adds `Пробел` after the informational version row and before the
-existing separator. It is a normal checkable menu command. Its checkmark is
-updated immediately when selected.
+`MenuBar` добавляет пункт `Пробел` после информационной строки версии и перед
+существующим разделителем. Это обычная команда меню с отображаемой галочкой.
+Галочка обновляется сразу после выбора.
 
-The menu target reports the new boolean value to the runtime through a command
-channel. It does not own persistence or text insertion.
+Обработчик меню передаёт новое логическое значение в среду выполнения через
+канал команд. Он не отвечает за хранение настройки или вставку текста.
 
-### Insertion Flow
+### Поток вставки
 
-The runtime keeps the current output preference. When it handles an
-`InsertText` effect, it passes the recognized text and current `append_space`
-value to the insertion boundary.
+Среда выполнения хранит текущее значение настройки вывода. При обработке
+эффекта `InsertText` она передаёт распознанный текст и текущее значение
+`append_space` на границу вставки.
 
-The insertion boundary first retains the established behavior of trimming
-outer whitespace and rejecting an empty result. It then appends exactly one
-ASCII space when the option is enabled. This ordering is required because the
-current insertion normalization would otherwise remove the requested trailing
-space.
+Граница вставки сначала сохраняет установленное поведение: удаляет внешние
+пробельные символы и отклоняет пустой результат. Затем, если настройка
+включена, добавляет ровно один пробел ASCII. Порядок важен: существующая
+нормализация на границе вставки иначе удалила бы требуемый конечный пробел.
 
-The resulting string is written temporarily to the pasteboard and pasted with
-the existing Command-V path. Complete pasteboard snapshot, ownership checking,
-and restoration behavior remain unchanged.
+Полученная строка временно записывается в буфер обмена и вставляется по
+существующему пути Command-V. Полный снимок буфера обмена, проверка владения и
+восстановление остаются без изменений.
 
-Changing the checkbox affects the next insertion that reaches the insertion
-boundary, including recognition already in progress.
+Изменение чекбокса влияет на следующую вставку, дошедшую до границы вставки, в
+том числе на уже распознаваемую реплику.
 
-## Error Handling
+## Обработка ошибок
 
-- Missing or invalid persisted state uses the unchecked default.
-- A persistence write failure is logged and keeps the selected in-memory state.
-- Existing empty-text, pasteboard, keyboard-event, and restoration errors keep
-  their current behavior.
+- Отсутствующее или недоступное сохранённое значение заменяется выключенным
+  состоянием по умолчанию.
+- При ошибке сохранения выбранное состояние продолжает действовать в памяти, а
+  ошибка записывается в журнал.
+- Существующая обработка пустого текста, ошибок буфера обмена, клавиатурных
+  событий и восстановления не меняется.
 
-## Testing
+## Проверка
 
-Automated tests cover:
+Автоматические тесты покрывают:
 
-- the unchecked default;
-- loading and saving enabled and disabled values;
-- fallback when the stored value is unavailable;
-- the menu descriptor and checkbox projection;
-- the menu command carrying the new selected value;
-- disabled formatting preserving normalized model output;
-- enabled formatting appending exactly one space after `.`, `!`, `?`, and
-  unpunctuated text;
-- whitespace-only recognition still being rejected;
-- the temporary pasteboard text containing the requested trailing space;
-- the existing full pasteboard restoration behavior remaining intact.
+- выключенное состояние по умолчанию;
+- загрузку и сохранение включённого и выключенного состояний;
+- возврат к значению по умолчанию, если сохранённое значение недоступно;
+- описание меню и отображение галочки;
+- передачу нового выбранного значения командой меню;
+- сохранение нормализованного результата модели при выключенной настройке;
+- добавление ровно одного пробела после `.`, `!`, `?` и текста без пунктуации
+  при включённой настройке;
+- отклонение результата, состоящего только из пробельных символов;
+- наличие требуемого конечного пробела во временном тексте буфера обмена;
+- сохранение существующего полного восстановления буфера обмена.
 
-The final verification runs formatting, the full Rust test suite, Clippy, and
-bundle validation.
+Итоговая проверка включает форматирование, полный набор тестов Rust, Clippy и
+проверку комплекта приложения.
 
-Manual macOS verification confirms that the checkbox toggles immediately,
-persists after relaunch, and separates two successive dictations in a
-frontmost application.
+Ручная проверка в macOS подтверждает, что чекбокс переключается сразу,
+сохраняется после перезапуска и разделяет две последовательные диктовки в
+активном приложении.
