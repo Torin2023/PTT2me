@@ -38,7 +38,7 @@ export default function Home() {
         <div className="hero-glow" aria-hidden="true" />
         <div className="hero-copy">
           <p className="eyebrow">
-            <span aria-hidden="true" />
+            <span className="eyebrow-line" aria-hidden="true" />
             Локальная диктовка для macOS
             <span className="preview-badge">Preview 1.0.5</span>
           </p>

@@ -39,6 +39,7 @@ test("renders the current PTT2me v1.0.5 product contract", async () => {
   assert.match(html, /Без облака/);
   assert.match(html, /Микрофон/);
   assert.match(html, /Preview 1\.0\.5/);
+  assert.match(html, /class="preview-badge">Preview 1\.0\.5<\/span>/);
   assert.match(
     html,
     /https:\/\/github\.com\/Torin2023\/PTT2me\/releases\/download\/v1\.0\.5\/PTT2me-1\.0\.5-macos-arm64\.dmg/,

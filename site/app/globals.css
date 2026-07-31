@@ -181,7 +181,8 @@ main {
   text-transform: uppercase;
 }
 
-.eyebrow > span {
+.eyebrow-line {
+  flex: 0 0 auto;
   width: 16px;
   height: 1px;
   background: var(--accent);
@@ -189,6 +190,7 @@ main {
 
 .preview-badge {
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
   width: auto;
   height: auto;
@@ -201,6 +203,7 @@ main {
   color: var(--accent);
   font-size: 9px;
   letter-spacing: 0.08em;
+  white-space: nowrap;
 }
 
 .hero h1 {
