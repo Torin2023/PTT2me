@@ -18,8 +18,12 @@ use crate::audio::{AudioError, AudioRecorder};
 use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS};
 use crate::hotkey::{HotkeyListener, HotkeySignal};
 use crate::inserter;
-use crate::menu::MenuBar;
+use crate::menu::{MenuBar, MenuCommand};
 use crate::model::{resources_dir_from_executable, ModelPaths};
+use crate::output_preferences::{
+    OutputPreferenceController, OutputPreferenceRepository, OutputPreferences,
+    RawOutputPreferenceStore, SystemOutputPreferenceStore,
+};
 use crate::permissions::{
     self, MicrophoneAuthorization, MicrophonePermissionBoundary, MicrophonePermissionFlow,
     SystemPermissionProbe,
@@ -216,6 +220,8 @@ extern "C" fn timer_fired(_timer: CFRunLoopTimerRef, raw_context: *mut c_void) {
 pub struct Runtime {
     controller: AppController,
     menu: MenuBar,
+    menu_events: Receiver<MenuCommand>,
+    output_preferences: OutputPreferenceController<SystemOutputPreferenceStore>,
     recorder: AudioRecorder,
     hotkey: Option<HotkeyListener>,
     hotkey_sender: Sender<HotkeySignal>,
@@ -243,13 +249,20 @@ impl Runtime {
     /// alive until `NSApplication::run` returns.
     pub fn start(_mtm: MainThreadMarker) -> Pin<Box<Self>> {
         let (hotkey_sender, hotkey_events) = mpsc::channel();
+        let (menu_sender, menu_events) = mpsc::channel();
         let (asr_commands, asr_command_receiver) = mpsc::channel();
         let (asr_event_sender, asr_events) = mpsc::channel();
         let asr_worker = spawn_asr_worker(asr_command_receiver, asr_event_sender);
+        let output_preferences = OutputPreferenceController::load(OutputPreferenceRepository::new(
+            SystemOutputPreferenceStore::standard(),
+        ));
+        let append_space = output_preferences.current().append_space;
 
         let mut runtime = Box::pin(Self {
             controller: AppController::new(),
-            menu: MenuBar::new(),
+            menu: MenuBar::new(append_space, menu_sender),
+            menu_events,
+            output_preferences,
             recorder: AudioRecorder::new(),
             hotkey: None,
             hotkey_sender,
@@ -336,6 +349,15 @@ impl Runtime {
     }
 
     fn drain_events(&mut self) {
+        let menu_commands: Vec<_> = self.menu_events.try_iter().collect();
+        for command in menu_commands {
+            if apply_menu_command(command, &mut self.output_preferences).is_err() {
+                tracing::warn!(error_category = "output_preference_write");
+            }
+            self.menu
+                .render_append_space(self.output_preferences.current().append_space);
+        }
+
         self.drain_microphone_permission_completions();
 
         let hotkey_events: Vec<_> = self.hotkey_events.try_iter().collect();
@@ -532,7 +554,8 @@ impl Runtime {
             }
             Effect::InsertText(text) => {
                 let result =
-                    inserter::insert_text(&text, false).map_err(|_| "insert failed".to_owned());
+                    inserter::insert_text(&text, self.output_preferences.current().append_space)
+                        .map_err(|_| "insert failed".to_owned());
                 if result.is_err() {
                     tracing::warn!(error_category = "text_insertion");
                 }
@@ -602,6 +625,16 @@ impl Runtime {
     fn cancel_capture_limit_timer(&mut self) {
         cancel_timer(&self.run_loop, &mut self.capture_limit_timer);
     }
+}
+
+fn apply_menu_command<R: RawOutputPreferenceStore>(
+    command: MenuCommand,
+    preferences: &mut OutputPreferenceController<R>,
+) -> Result<OutputPreferences, ()> {
+    let result = match command {
+        MenuCommand::SetAppendSpace(value) => preferences.set_append_space(value),
+    };
+    result.map(|()| preferences.current())
 }
 
 pub(crate) fn capture_result_event(result: Result<Option<Vec<f32>>, AudioError>) -> AppEvent {
@@ -685,10 +718,14 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        milliseconds_to_seconds, status_name, DeferredTapState, MicrophonePermissionRuntime,
-        TapState, EVENT_DRAIN_MS, PERMISSION_POLL_MS,
+        apply_menu_command, milliseconds_to_seconds, status_name, DeferredTapState,
+        MicrophonePermissionRuntime, TapState, EVENT_DRAIN_MS, PERMISSION_POLL_MS,
     };
     use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
+    use crate::menu::MenuCommand;
+    use crate::output_preferences::{
+        OutputPreferenceController, OutputPreferenceRepository, RawOutputPreferenceStore,
+    };
     use crate::permissions::{MicrophoneAuthorization, MicrophonePermissionBoundary};
     use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
 
@@ -716,6 +753,30 @@ mod tests {
         controller.handle(AppEvent::FnReleased { held_ms: 900 });
         assert_eq!(controller.status(), &AppStatus::Recognizing);
         controller
+    }
+
+    struct FailingRawStore;
+
+    impl RawOutputPreferenceStore for FailingRawStore {
+        fn append_space(&self) -> Option<bool> {
+            Some(false)
+        }
+
+        fn set_append_space(&mut self, _value: bool) -> Result<(), ()> {
+            Err(())
+        }
+    }
+
+    #[test]
+    fn menu_command_updates_current_preference_even_when_persistence_fails() {
+        let repository = OutputPreferenceRepository::new(FailingRawStore);
+        let mut preferences = OutputPreferenceController::load(repository);
+
+        assert_eq!(
+            apply_menu_command(MenuCommand::SetAppendSpace(true), &mut preferences),
+            Err(())
+        );
+        assert!(preferences.current().append_space);
     }
 
     #[test]

@@ -1,12 +1,15 @@
+use std::cell::Cell;
 use std::ptr::NonNull;
+use std::sync::mpsc::Sender;
 
 use objc2::{
     declare_class, msg_send, msg_send_id, mutability, rc::Retained, runtime::AnyClass,
     runtime::AnyObject, sel, ClassType, DeclaredClass,
 };
 use objc2_app_kit::{
-    NSApplication, NSColor, NSImage, NSImageSymbolConfiguration, NSMenu, NSMenuItem, NSStatusBar,
-    NSStatusBarButton, NSStatusItem, NSVariableStatusItemLength,
+    NSApplication, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSImage,
+    NSImageSymbolConfiguration, NSMenu, NSMenuItem, NSStatusBar, NSStatusBarButton, NSStatusItem,
+    NSVariableStatusItemLength,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 
@@ -95,19 +98,45 @@ const fn permission_title(permission: PermissionKind) -> &'static str {
 pub enum MenuEntry {
     Status,
     Version,
+    TrailingSpace,
     Separator,
     Quit,
 }
 
-pub const MENU_DESCRIPTOR: [MenuEntry; 4] = [
+impl MenuEntry {
+    const fn title(self) -> Option<&'static str> {
+        match self {
+            Self::TrailingSpace => Some("Пробел в конце"),
+            _ => None,
+        }
+    }
+}
+
+pub const MENU_DESCRIPTOR: [MenuEntry; 5] = [
     MenuEntry::Status,
     MenuEntry::Version,
+    MenuEntry::TrailingSpace,
     MenuEntry::Separator,
     MenuEntry::Quit,
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuCommand {
+    SetAppendSpace(bool),
+}
+
+fn toggled_append_space(current: bool) -> (bool, MenuCommand) {
+    let next = !current;
+    (next, MenuCommand::SetAppendSpace(next))
+}
+
 fn symbol_style(projection: &MenuProjection) -> SymbolStyle {
     projection.style
+}
+
+struct MenuTargetIvars {
+    commands: Sender<MenuCommand>,
+    append_space: Cell<bool>,
 }
 
 declare_class!(
@@ -123,7 +152,7 @@ declare_class!(
     }
 
     impl DeclaredClass for MenuTarget {
-        type Ivars = ();
+        type Ivars = MenuTargetIvars;
     }
 
     unsafe impl NSObjectProtocol for MenuTarget {}
@@ -131,6 +160,13 @@ declare_class!(
     // SAFETY: `quit:` has the Cocoa action signature `(id) -> void` and is
     // invoked by AppKit on the main thread.
     unsafe impl MenuTarget {
+        #[method(toggleTrailingSpace:)]
+        fn toggle_trailing_space(&self, _sender: &AnyObject) {
+            let (next, command) = toggled_append_space(self.ivars().append_space.get());
+            self.ivars().append_space.set(next);
+            let _ = self.ivars().commands.send(command);
+        }
+
         #[method(quit:)]
         fn quit(&self, sender: &AnyObject) {
             let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
@@ -140,19 +176,27 @@ declare_class!(
 );
 
 impl MenuTarget {
-    fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = mtm.alloc().set_ivars(());
+    fn new(
+        mtm: MainThreadMarker,
+        append_space: bool,
+        commands: Sender<MenuCommand>,
+    ) -> Retained<Self> {
+        let this = mtm.alloc().set_ivars(MenuTargetIvars {
+            commands,
+            append_space: Cell::new(append_space),
+        });
         unsafe { msg_send_id![super(this), init] }
     }
 }
 
-/// Owns the permanent four-row status menu and projects application state onto
+/// Owns the permanent five-row status menu and projects application state onto
 /// the existing status row and status-bar button.
 pub struct MenuBar {
     _status_bar: Retained<NSStatusBar>,
     _status_item: Retained<NSStatusItem>,
     _menu: Retained<NSMenu>,
     status_row: Retained<NSMenuItem>,
+    trailing_space_row: Retained<NSMenuItem>,
     button: Retained<NSStatusBarButton>,
     _target: Retained<MenuTarget>,
     pulse_active: bool,
@@ -165,13 +209,14 @@ impl MenuBar {
     ///
     /// Panics when called outside the AppKit main thread or if AppKit does not
     /// provide a button for its newly-created status item.
-    pub fn new() -> Self {
+    pub fn new(append_space: bool, commands: Sender<MenuCommand>) -> Self {
         let mtm = main_thread_marker();
-        let target = MenuTarget::new(mtm);
+        let target = MenuTarget::new(mtm, append_space, commands);
         let menu = unsafe { NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("PTT2me")) };
         unsafe { menu.setAutoenablesItems(false) };
 
         let mut status_row = None;
+        let mut trailing_space_row = None;
         for entry in MENU_DESCRIPTOR {
             match entry {
                 MenuEntry::Status => {
@@ -184,6 +229,21 @@ impl MenuBar {
                     let item = menu_item(mtm, concat!("PTT2me ", env!("CARGO_PKG_VERSION")), None);
                     unsafe { item.setEnabled(false) };
                     menu.addItem(&item);
+                }
+                MenuEntry::TrailingSpace => {
+                    let item = menu_item(
+                        mtm,
+                        entry
+                            .title()
+                            .expect("trailing-space entry must have a title"),
+                        Some(sel!(toggleTrailingSpace:)),
+                    );
+                    unsafe {
+                        item.setTarget(Some(&target));
+                        item.setEnabled(true);
+                    }
+                    menu.addItem(&item);
+                    trailing_space_row = Some(item);
                 }
                 MenuEntry::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
                 MenuEntry::Quit => {
@@ -214,10 +274,13 @@ impl MenuBar {
             _status_item: status_item,
             _menu: menu,
             status_row: status_row.expect("menu descriptor must contain the status row"),
+            trailing_space_row: trailing_space_row
+                .expect("menu descriptor must contain the trailing-space row"),
             button,
             _target: target,
             pulse_active: false,
         };
+        menu_bar.render_append_space(append_space);
         menu_bar.render(&AppStatus::Starting);
         menu_bar
     }
@@ -244,11 +307,21 @@ impl MenuBar {
             self.pulse_active = projection.pulse;
         }
     }
+
+    pub fn render_append_space(&self, append_space: bool) {
+        let state = if append_space {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        };
+        unsafe { self.trailing_space_row.setState(state) };
+    }
 }
 
 impl Default for MenuBar {
     fn default() -> Self {
-        Self::new()
+        let (commands, _events) = std::sync::mpsc::channel();
+        Self::new(false, commands)
     }
 }
 
@@ -466,15 +539,29 @@ mod tests {
     }
 
     #[test]
-    fn menu_descriptor_contains_only_the_four_approved_entries() {
+    fn menu_descriptor_contains_trailing_space_before_separator() {
         assert_eq!(
             MENU_DESCRIPTOR,
             [
                 MenuEntry::Status,
                 MenuEntry::Version,
+                MenuEntry::TrailingSpace,
                 MenuEntry::Separator,
                 MenuEntry::Quit,
             ]
+        );
+        assert_eq!(MenuEntry::TrailingSpace.title(), Some("Пробел в конце"));
+    }
+
+    #[test]
+    fn toggling_trailing_space_emits_the_new_selected_value() {
+        assert_eq!(
+            toggled_append_space(false),
+            (true, MenuCommand::SetAppendSpace(true))
+        );
+        assert_eq!(
+            toggled_append_space(true),
+            (false, MenuCommand::SetAppendSpace(false))
         );
     }
 
