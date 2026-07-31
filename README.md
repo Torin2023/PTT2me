@@ -14,17 +14,22 @@ PTT2me loads its fixed model at startup. When the status becomes `Готово`,
 hold Fn/Globe for at least 250 ms while speaking and release it. The app keeps
 recording for another 180 ms, recognizes the captured phrase, and pastes a
 non-empty result with Cmd+V. A capture ends automatically after 25 seconds.
+The `Пробел в конце` menu checkbox optionally appends one space after each
+inserted phrase so consecutive dictations remain separated. It is disabled by
+default and its selected state persists across application restarts.
 
 The menu contains exactly:
 
 ```text
 <status>
-PTT2me 1.0.0
+PTT2me <version>
+Пробел в конце
 ────────────
 Выйти
 ```
 
-The status and version rows are informational; `Выйти` is the only command.
+The status and version rows are informational. `Пробел в конце` is a
+checkable preference, and `Выйти` terminates the app.
 
 ## Build
 
@@ -83,10 +88,10 @@ and guides their interactive setup.
 ## Privacy
 
 Audio and recognized text are processed locally. PTT2me does not save audio,
-transcripts, history, settings, or application data. Recognized text is used
-temporarily for insertion and is not retained by PTT2me; the previous macOS
-pasteboard contents are restored unless newer contents were copied during
-insertion.
+transcripts, history, or application data. It stores only the boolean
+`Пробел в конце` preference. Recognized text is used temporarily for insertion
+and is not retained by PTT2me; the previous macOS pasteboard contents are
+restored unless newer contents were copied during insertion.
 
 ## Troubleshooting
 
