@@ -9,6 +9,7 @@ pub mod inserter;
 pub mod logging;
 pub mod menu;
 pub mod model;
+pub mod output_preferences;
 pub mod permissions;
 pub mod runtime;
 pub mod single_instance;
