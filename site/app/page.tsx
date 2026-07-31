@@ -1,7 +1,7 @@
 const DOWNLOAD_URL =
-  "https://github.com/Torin2023/PTT2me/releases/download/v1.0.4/PTT2me-1.0.4-macos-arm64.dmg";
+  "https://github.com/Torin2023/PTT2me/releases/download/v1.0.5/PTT2me-1.0.5-macos-arm64.dmg";
 const REPOSITORY_URL = "https://github.com/Torin2023/PTT2me";
-const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.0.4`;
+const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.0.5`;
 
 const steps = [
   ["01", "Удерживайте", "Нажмите и удерживайте выбранную клавишу."],
@@ -40,7 +40,7 @@ export default function Home() {
           <p className="eyebrow">
             <span aria-hidden="true" />
             Локальная диктовка для macOS
-            <span className="preview-badge">Preview 1.0.4</span>
+            <span className="preview-badge">Preview 1.0.5</span>
           </p>
           <h1>
             Говорите —
@@ -54,7 +54,7 @@ export default function Home() {
           </p>
           <div className="hero-actions">
             <a className="button" href={DOWNLOAD_URL}>
-              Скачать PTT2me 1.0.4
+              Скачать PTT2me 1.0.5
               <span aria-hidden="true">↘</span>
             </a>
             <a className="text-link" href={REPOSITORY_URL}>
@@ -150,7 +150,8 @@ export default function Home() {
           Запись начинается сразу при нажатии. Если нажатие оказалось коротким,
           запись отбрасывается, а клавиша передаётся macOS как обычно. После
           отпускания PTT2me оставляет 180 мс, чтобы не обрезать окончание фразы.
-          Максимальная запись — 25 секунд.
+          Максимальная запись — 25 секунд. Настройка «Пробел в конце» позволяет
+          разделять последовательные фразы, не изменяя пунктуацию модели.
         </p>
       </section>
 
@@ -220,7 +221,7 @@ export default function Home() {
 
       <section className="section install" id="install">
         <div className="install-copy">
-          <p className="eyebrow">PTT2me Preview 1.0.4</p>
+          <p className="eyebrow">PTT2me Preview 1.0.5</p>
           <h2>Готовы говорить?</h2>
           <p>Для Mac с Apple Silicon и macOS 13 Ventura или новее.</p>
           <a className="button" href={DOWNLOAD_URL}>
@@ -260,11 +261,11 @@ export default function Home() {
         <p>
           SHA-256{" "}
           <code>
-            64b54978627ba1f2f1c466222fd2a984b2fcd8623afb66d1714e12da13be83bf
+            d89a1767edfb2c010ba98ffc59f6c35f8e346958c492b3ed33b4596f303a7c8c
           </code>
         </p>
         <div>
-          <a href={RELEASE_URL}>Preview-релиз 1.0.4</a>
+          <a href={RELEASE_URL}>Preview-релиз 1.0.5</a>
           <a href={REPOSITORY_URL}>GitHub</a>
         </div>
       </footer>
