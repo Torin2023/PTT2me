@@ -24,6 +24,9 @@ use crate::inserter::{
 use crate::menu::MenuAction;
 use crate::menu::{MenuBar, MenuCommand, MenuReadiness};
 use crate::model::{resources_dir_from_executable, ModelPaths};
+use crate::output_preferences::{
+    OutputPreferenceController, OutputPreferenceRepository, SystemOutputPreferenceStore,
+};
 use crate::permissions::{
     self, MicrophoneAuthorization, MicrophonePermissionBoundary, MicrophonePermissionFlow,
     SystemPermissionProbe,
@@ -71,7 +74,9 @@ impl<R: RawPreferenceStore> RuntimePreferences<R> {
         match command {
             MenuCommand::ResetTrigger => self.current.trigger = TriggerKey::FnGlobe,
             MenuCommand::SetThreshold(threshold) => self.current.threshold = threshold,
-            MenuCommand::BeginTriggerAssignment { .. } => return Err(()),
+            MenuCommand::BeginTriggerAssignment { .. } | MenuCommand::SetAppendSpace(_) => {
+                return Err(())
+            }
         }
         Ok(())
     }
@@ -417,6 +422,7 @@ pub struct Runtime {
     controller: AppController,
     menu: MenuBar,
     preferences: RuntimePreferences<SystemPreferenceStore>,
+    output_preferences: OutputPreferenceController<SystemOutputPreferenceStore>,
     menu_commands: Receiver<MenuCommand>,
     hotkey_control: HotkeyControl,
     assignment: AssignmentTracker,
@@ -455,6 +461,10 @@ impl Runtime {
         let asr_worker = spawn_asr_worker(asr_command_receiver, asr_event_sender);
         let preference_repository = PreferenceRepository::new(SystemPreferenceStore::new());
         let preferences = preference_repository.load();
+        let output_preferences = OutputPreferenceController::load(OutputPreferenceRepository::new(
+            SystemOutputPreferenceStore::standard(),
+        ));
+        let append_space = output_preferences.current().append_space;
         let hotkey_control = HotkeyControl::new(preferences);
         let menu_readiness = MenuReadiness::new(false);
 
@@ -462,11 +472,13 @@ impl Runtime {
             controller: AppController::new(),
             menu: MenuBar::new(
                 preferences,
+                append_space,
                 menu_sender,
                 hotkey_control.clone(),
                 menu_readiness.clone(),
             ),
             preferences: RuntimePreferences::new(preferences, preference_repository),
+            output_preferences,
             menu_commands,
             hotkey_control,
             assignment: AssignmentTracker::default(),
@@ -678,6 +690,15 @@ impl Runtime {
             return;
         }
 
+        if let MenuCommand::SetAppendSpace(value) = command {
+            if self.output_preferences.set_append_space(value).is_err() {
+                tracing::warn!(error_category = "output_preference_persistence");
+            }
+            self.menu
+                .render_append_space(self.output_preferences.current().append_space);
+            return;
+        }
+
         if self.preferences.apply_in_memory(command).is_ok() {
             self.publish_preferences();
         }
@@ -825,24 +846,26 @@ impl Runtime {
                     )));
                 }
             }
-            Effect::InsertText(text) => match text_inserter::begin(&text) {
-                Ok(InsertOutcome::Complete(method)) => {
-                    let method = match method {
-                        InsertMethod::Accessibility => "accessibility",
-                        InsertMethod::UnicodeEvents => "unicode_events",
-                    };
-                    tracing::debug!(method, lifecycle = "text_inserted");
-                    self.dispatch(AppEvent::PasteFinished(Ok(())));
+            Effect::InsertText(text) => {
+                match text_inserter::begin(&text, self.output_preferences.current().append_space) {
+                    Ok(InsertOutcome::Complete(method)) => {
+                        let method = match method {
+                            InsertMethod::Accessibility => "accessibility",
+                            InsertMethod::UnicodeEvents => "unicode_events",
+                        };
+                        tracing::debug!(method, lifecycle = "text_inserted");
+                        self.dispatch(AppEvent::PasteFinished(Ok(())));
+                    }
+                    Ok(InsertOutcome::PendingClipboard(insertion)) => {
+                        let flow = PasteFlow::begin(insertion, self);
+                        self.pending_insertion = Some(flow);
+                    }
+                    Err(_) => {
+                        tracing::warn!(error_category = "text_insertion");
+                        self.dispatch(AppEvent::PasteFinished(Err("insert failed".to_owned())));
+                    }
                 }
-                Ok(InsertOutcome::PendingClipboard(insertion)) => {
-                    let flow = PasteFlow::begin(insertion, self);
-                    self.pending_insertion = Some(flow);
-                }
-                Err(_) => {
-                    tracing::warn!(error_category = "text_insertion");
-                    self.dispatch(AppEvent::PasteFinished(Err("insert failed".to_owned())));
-                }
-            },
+            }
             Effect::ScheduleErrorReset { delay_ms } => {
                 self.replace_error_timer(delay_ms);
             }

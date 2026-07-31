@@ -85,10 +85,17 @@ impl fmt::Display for InsertError {
 
 impl Error for InsertError {}
 
-/// Removes outer whitespace without modifying recognised text itself.
-pub fn normalize_text(text: &str) -> Option<String> {
+/// Removes outer whitespace and optionally appends one separator space without
+/// otherwise modifying recognised text.
+pub fn normalize_text(text: &str, append_space: bool) -> Option<String> {
     let trimmed = text.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    (!trimmed.is_empty()).then(|| {
+        if append_space {
+            format!("{trimmed} ")
+        } else {
+            trimmed.to_owned()
+        }
+    })
 }
 
 struct SystemPasteboard {
@@ -224,9 +231,11 @@ impl PendingInsertion {
 
 impl<P: PasteboardAccess, C: PasteCommand> InsertionTransaction<P, C> {
     fn begin_with(text: &str, mut pasteboard: P, command: C) -> Result<Self, InsertError> {
-        let text = normalize_text(text).ok_or(InsertError::EmptyText)?;
+        if text.is_empty() {
+            return Err(InsertError::EmptyText);
+        }
         let snapshot = pasteboard.snapshot()?;
-        let temporary = match pasteboard.write_temporary_text(&text) {
+        let temporary = match pasteboard.write_temporary_text(text) {
             Ok(temporary) => temporary,
             Err(failure) => {
                 if pasteboard.restore(&snapshot, failure.change_count).is_err() {
@@ -719,19 +728,34 @@ mod tests {
 
     #[test]
     fn trims_outer_whitespace_only() {
-        assert_eq!(normalize_text("  Привет. \n"), Some("Привет.".into()));
+        assert_eq!(
+            normalize_text("  Привет. \n", false),
+            Some("Привет.".into())
+        );
     }
 
     #[test]
     fn rejects_whitespace_only_text() {
-        assert_eq!(normalize_text(" \n\t "), None);
+        assert_eq!(normalize_text(" \n\t ", true), None);
     }
 
     #[test]
     fn preserves_text_without_rewriting() {
         assert_eq!(
-            normalize_text("Текст без точки"),
+            normalize_text("Текст без точки", false),
             Some("Текст без точки".into())
+        );
+    }
+
+    #[test]
+    fn appends_one_space_without_rewriting_model_punctuation() {
+        assert_eq!(
+            normalize_text("  Привет. \n", true),
+            Some("Привет. ".into())
+        );
+        assert_eq!(
+            normalize_text("Текст без точки", true),
+            Some("Текст без точки ".into())
         );
     }
 }

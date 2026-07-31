@@ -46,6 +46,7 @@ PTT2me 1.0.4
   250 мс
   500 мс
   750 мс
+Пробел в конце
 ────────────
 Выйти
 ```
@@ -62,6 +63,11 @@ not accepted as assigned triggers and leave the current trigger unchanged.
 Choose one of the exact `Порог удержания` values: 250, 500, or 750 ms. A hold
 shorter than the selected value is replayed normally; a longer hold records
 and is consumed so it does not type or invoke its usual system action.
+
+`Пробел в конце` is disabled by default. When enabled, PTT2me appends one
+ASCII space to each non-empty recognized phrase after trimming outer
+whitespace. The option persists across application restarts. Recognition
+punctuation is never added, removed, or rewritten by PTT2me.
 
 `Выйти` terminates the app.
 
@@ -163,8 +169,9 @@ and guides their interactive setup.
 ## Privacy
 
 Audio and recognized text are processed locally. PTT2me stores only the
-selected trigger and hold threshold in macOS user defaults. It does not retain
-audio, transcripts, recognized text, history, or other application data.
+selected trigger, hold threshold, and `Пробел в конце` boolean preference in
+macOS user defaults. It does not retain audio, transcripts, recognized text,
+history, or other application data.
 Recognized text is used temporarily for insertion. Direct Accessibility
 and Unicode insertion do not modify the pasteboard. The compatibility fallback
 restores every previous pasteboard item and representation unless newer

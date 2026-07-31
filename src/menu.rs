@@ -128,16 +128,18 @@ pub enum MenuEntry {
     PermissionSettings,
     Trigger,
     Threshold,
+    TrailingSpace,
     Separator,
     Quit,
 }
 
-pub const MENU_DESCRIPTOR: [MenuEntry; 7] = [
+pub const MENU_DESCRIPTOR: [MenuEntry; 8] = [
     MenuEntry::Status,
     MenuEntry::Version,
     MenuEntry::PermissionSettings,
     MenuEntry::Trigger,
     MenuEntry::Threshold,
+    MenuEntry::TrailingSpace,
     MenuEntry::Separator,
     MenuEntry::Quit,
 ];
@@ -147,6 +149,12 @@ pub enum MenuCommand {
     BeginTriggerAssignment { epoch: AssignmentEpoch },
     ResetTrigger,
     SetThreshold(HoldThreshold),
+    SetAppendSpace(bool),
+}
+
+fn toggled_append_space(selected: bool) -> (bool, MenuCommand) {
+    let selected = !selected;
+    (selected, MenuCommand::SetAppendSpace(selected))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +206,7 @@ struct MenuTargetIvars {
     publisher: MenuCommandPublisher,
     action_sender: Sender<MenuAction>,
     permission: Cell<Option<PermissionKind>>,
+    append_space: Cell<bool>,
 }
 
 #[derive(Clone)]
@@ -227,6 +236,7 @@ impl MenuCommandPublisher {
                 self.hotkey.set_threshold(threshold);
                 self.sender.send(command).is_ok()
             }
+            MenuCommand::SetAppendSpace(_) => self.sender.send(command).is_ok(),
         }
     }
 
@@ -310,6 +320,14 @@ declare_class!(
                 .publisher
                 .send(MenuCommand::SetThreshold(threshold));
         }
+
+        #[method(toggleTrailingSpace:)]
+        fn toggle_trailing_space(&self, _sender: &AnyObject) {
+            let (selected, command) =
+                toggled_append_space(self.ivars().append_space.get());
+            self.ivars().append_space.set(selected);
+            self.ivars().publisher.send(command);
+        }
     }
 );
 
@@ -320,11 +338,13 @@ impl MenuTarget {
         hotkey: HotkeyControl,
         readiness: MenuReadiness,
         action_sender: Sender<MenuAction>,
+        append_space: bool,
     ) -> Retained<Self> {
         let this = mtm.alloc().set_ivars(MenuTargetIvars {
             publisher: MenuCommandPublisher::new(sender, hotkey, readiness),
             action_sender,
             permission: Cell::new(None),
+            append_space: Cell::new(append_space),
         });
         unsafe { msg_send_id![super(this), init] }
     }
@@ -340,6 +360,7 @@ pub struct MenuBar {
     permission_row: Retained<NSMenuItem>,
     current_trigger_row: Retained<NSMenuItem>,
     threshold_rows: [Retained<NSMenuItem>; 3],
+    trailing_space_row: Retained<NSMenuItem>,
     button: Retained<NSStatusBarButton>,
     _target: Retained<MenuTarget>,
     action_receiver: Receiver<MenuAction>,
@@ -355,13 +376,14 @@ impl MenuBar {
     /// provide a button for its newly-created status item.
     pub fn new(
         preferences: Preferences,
+        append_space: bool,
         sender: Sender<MenuCommand>,
         hotkey: HotkeyControl,
         readiness: MenuReadiness,
     ) -> Self {
         let mtm = main_thread_marker();
         let (action_sender, action_receiver) = mpsc::channel();
-        let target = MenuTarget::new(mtm, sender, hotkey, readiness, action_sender);
+        let target = MenuTarget::new(mtm, sender, hotkey, readiness, action_sender, append_space);
         let menu = unsafe { NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("PTT2me")) };
         unsafe { menu.setAutoenablesItems(false) };
 
@@ -369,6 +391,7 @@ impl MenuBar {
         let mut permission_row = None;
         let mut current_trigger_row = None;
         let mut threshold_rows = Vec::with_capacity(HoldThreshold::OPTIONS.len());
+        let mut trailing_space_row = None;
         for entry in MENU_DESCRIPTOR {
             match entry {
                 MenuEntry::Status => {
@@ -450,6 +473,15 @@ impl MenuBar {
                     parent.setSubmenu(Some(&submenu));
                     menu.addItem(&parent);
                 }
+                MenuEntry::TrailingSpace => {
+                    let item = menu_item(mtm, "Пробел в конце", Some(sel!(toggleTrailingSpace:)));
+                    unsafe {
+                        item.setTarget(Some(&target));
+                        item.setEnabled(true);
+                    }
+                    menu.addItem(&item);
+                    trailing_space_row = Some(item);
+                }
                 MenuEntry::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
                 MenuEntry::Quit => {
                     let item = menu_item(mtm, "Выйти", Some(sel!(quit:)));
@@ -486,6 +518,8 @@ impl MenuBar {
             threshold_rows: threshold_rows
                 .try_into()
                 .unwrap_or_else(|_| panic!("menu descriptor must contain three threshold rows")),
+            trailing_space_row: trailing_space_row
+                .expect("menu descriptor must contain the trailing-space row"),
             button,
             _target: target,
             action_receiver,
@@ -493,6 +527,7 @@ impl MenuBar {
         };
         menu_bar.render(&AppStatus::Starting);
         menu_bar.render_preferences(preferences);
+        menu_bar.render_append_space(append_space);
         menu_bar
     }
 
@@ -552,6 +587,17 @@ impl MenuBar {
                     NSControlStateValueOff
                 });
             }
+        }
+    }
+
+    pub fn render_append_space(&self, append_space: bool) {
+        self._target.ivars().append_space.set(append_space);
+        unsafe {
+            self.trailing_space_row.setState(if append_space {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
         }
     }
 
@@ -788,9 +834,22 @@ mod tests {
                 MenuEntry::PermissionSettings,
                 MenuEntry::Trigger,
                 MenuEntry::Threshold,
+                MenuEntry::TrailingSpace,
                 MenuEntry::Separator,
                 MenuEntry::Quit,
             ]
+        );
+    }
+
+    #[test]
+    fn trailing_space_toggle_emits_the_new_selected_value() {
+        assert_eq!(
+            toggled_append_space(false),
+            (true, MenuCommand::SetAppendSpace(true))
+        );
+        assert_eq!(
+            toggled_append_space(true),
+            (false, MenuCommand::SetAppendSpace(false))
         );
     }
 

@@ -6,7 +6,7 @@ use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::event::{CGEvent, CGEventTapLocation};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
-use crate::inserter::{InsertError, PendingInsertion};
+use crate::inserter::{normalize_text, InsertError, PendingInsertion};
 
 type AXUIElementRef = *const c_void;
 type AXError = i32;
@@ -47,6 +47,7 @@ pub(crate) trait ClipboardInsertion {
 
 pub(crate) fn begin_with<A, U, C>(
     text: &str,
+    append_space: bool,
     accessibility: &mut A,
     unicode: &mut U,
     clipboard: &mut C,
@@ -56,13 +57,14 @@ where
     U: UnicodeInsertion,
     C: ClipboardInsertion,
 {
-    match accessibility.insert_selected_text(text) {
+    let text = normalize_text(text, append_space).ok_or(InsertError::EmptyText)?;
+    match accessibility.insert_selected_text(&text) {
         Ok(true) => Ok(InsertOutcome::Complete(InsertMethod::Accessibility)),
         Err(error) => Err(error),
-        Ok(false) => match unicode.insert_unicode(text)? {
+        Ok(false) => match unicode.insert_unicode(&text)? {
             true => Ok(InsertOutcome::Complete(InsertMethod::UnicodeEvents)),
             false => clipboard
-                .begin_clipboard(text)
+                .begin_clipboard(&text)
                 .map(InsertOutcome::PendingClipboard),
         },
     }
@@ -204,9 +206,13 @@ impl ClipboardInsertion for SystemClipboard {
     }
 }
 
-pub(crate) fn begin(text: &str) -> Result<InsertOutcome<PendingInsertion>, InsertError> {
+pub(crate) fn begin(
+    text: &str,
+    append_space: bool,
+) -> Result<InsertOutcome<PendingInsertion>, InsertError> {
     begin_with(
         text,
+        append_space,
         &mut SystemAccessibility,
         &mut SystemUnicode,
         &mut SystemClipboard,
@@ -246,109 +252,129 @@ mod tests {
 
     struct RecordingAx {
         calls: Rc<RefCell<Vec<&'static str>>>,
+        texts: Rc<RefCell<Vec<String>>>,
         result: Result<bool, InsertError>,
     }
 
     impl AccessibilityInsertion for RecordingAx {
-        fn insert_selected_text(&mut self, _text: &str) -> Result<bool, InsertError> {
+        fn insert_selected_text(&mut self, text: &str) -> Result<bool, InsertError> {
             self.calls.borrow_mut().push("ax");
+            self.texts.borrow_mut().push(text.to_owned());
             self.result
         }
     }
 
     struct RecordingUnicode {
         calls: Rc<RefCell<Vec<&'static str>>>,
+        texts: Rc<RefCell<Vec<String>>>,
         result: Result<bool, InsertError>,
     }
 
     impl UnicodeInsertion for RecordingUnicode {
-        fn insert_unicode(&mut self, _text: &str) -> Result<bool, InsertError> {
+        fn insert_unicode(&mut self, text: &str) -> Result<bool, InsertError> {
             self.calls.borrow_mut().push("unicode");
+            self.texts.borrow_mut().push(text.to_owned());
             self.result
         }
     }
 
     struct RecordingClipboard {
         calls: Rc<RefCell<Vec<&'static str>>>,
+        texts: Rc<RefCell<Vec<String>>>,
     }
 
     impl ClipboardInsertion for RecordingClipboard {
         type Pending = &'static str;
 
-        fn begin_clipboard(&mut self, _text: &str) -> Result<Self::Pending, InsertError> {
+        fn begin_clipboard(&mut self, text: &str) -> Result<Self::Pending, InsertError> {
             self.calls.borrow_mut().push("clipboard");
+            self.texts.borrow_mut().push(text.to_owned());
             Ok("pending")
         }
     }
 
-    fn boundaries(
-        ax_result: Result<bool, InsertError>,
-        unicode_result: Result<bool, InsertError>,
-    ) -> (
+    type Boundaries = (
         RecordingAx,
         RecordingUnicode,
         RecordingClipboard,
         Rc<RefCell<Vec<&'static str>>>,
-    ) {
+        Rc<RefCell<Vec<String>>>,
+    );
+
+    fn boundaries(
+        ax_result: Result<bool, InsertError>,
+        unicode_result: Result<bool, InsertError>,
+    ) -> Boundaries {
         let calls = Rc::new(RefCell::new(Vec::new()));
+        let texts = Rc::new(RefCell::new(Vec::new()));
         (
             RecordingAx {
                 calls: Rc::clone(&calls),
+                texts: Rc::clone(&texts),
                 result: ax_result,
             },
             RecordingUnicode {
                 calls: Rc::clone(&calls),
+                texts: Rc::clone(&texts),
                 result: unicode_result,
             },
             RecordingClipboard {
                 calls: Rc::clone(&calls),
+                texts: Rc::clone(&texts),
             },
             calls,
+            texts,
         )
     }
 
     #[test]
     fn accessibility_success_bypasses_unicode_and_clipboard() {
-        let (mut ax, mut unicode, mut clipboard, calls) = boundaries(Ok(true), Ok(true));
+        let (mut ax, mut unicode, mut clipboard, calls, texts) = boundaries(Ok(true), Ok(true));
 
-        let outcome = begin_with("текст", &mut ax, &mut unicode, &mut clipboard);
+        let outcome = begin_with(" Привет. ", true, &mut ax, &mut unicode, &mut clipboard);
 
         assert_eq!(
             outcome,
             Ok(InsertOutcome::Complete(InsertMethod::Accessibility))
         );
         assert_eq!(calls.borrow().as_slice(), ["ax"]);
+        assert_eq!(texts.borrow().as_slice(), ["Привет. "]);
     }
 
     #[test]
     fn unsupported_accessibility_falls_through_to_unicode() {
-        let (mut ax, mut unicode, mut clipboard, calls) = boundaries(Ok(false), Ok(true));
+        let (mut ax, mut unicode, mut clipboard, calls, texts) = boundaries(Ok(false), Ok(true));
 
-        let outcome = begin_with("текст", &mut ax, &mut unicode, &mut clipboard);
+        let outcome = begin_with(" Привет. ", true, &mut ax, &mut unicode, &mut clipboard);
 
         assert_eq!(
             outcome,
             Ok(InsertOutcome::Complete(InsertMethod::UnicodeEvents))
         );
         assert_eq!(calls.borrow().as_slice(), ["ax", "unicode"]);
+        assert_eq!(texts.borrow().as_slice(), ["Привет. ", "Привет. "]);
     }
 
     #[test]
     fn unsupported_unicode_falls_through_to_clipboard() {
-        let (mut ax, mut unicode, mut clipboard, calls) = boundaries(Ok(false), Ok(false));
+        let (mut ax, mut unicode, mut clipboard, calls, texts) = boundaries(Ok(false), Ok(false));
 
-        let outcome = begin_with("текст", &mut ax, &mut unicode, &mut clipboard);
+        let outcome = begin_with(" Привет. ", true, &mut ax, &mut unicode, &mut clipboard);
 
         assert_eq!(outcome, Ok(InsertOutcome::PendingClipboard("pending")));
         assert_eq!(calls.borrow().as_slice(), ["ax", "unicode", "clipboard"]);
+        assert_eq!(
+            texts.borrow().as_slice(),
+            ["Привет. ", "Привет. ", "Привет. "]
+        );
     }
 
     #[test]
     fn secure_field_error_is_terminal() {
-        let (mut ax, mut unicode, mut clipboard, calls) =
+        let (mut ax, mut unicode, mut clipboard, calls, _texts) =
             boundaries(Err(InsertError::SecureField), Ok(true));
 
-        let outcome = begin_with("текст", &mut ax, &mut unicode, &mut clipboard);
+        let outcome = begin_with("текст", false, &mut ax, &mut unicode, &mut clipboard);
 
         assert_eq!(outcome, Err(InsertError::SecureField));
         assert_eq!(calls.borrow().as_slice(), ["ax"]);
