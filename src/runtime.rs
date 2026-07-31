@@ -531,7 +531,8 @@ impl Runtime {
                 }
             }
             Effect::InsertText(text) => {
-                let result = inserter::insert_text(&text).map_err(|_| "insert failed".to_owned());
+                let result =
+                    inserter::insert_text(&text, false).map_err(|_| "insert failed".to_owned());
                 if result.is_err() {
                     tracing::warn!(error_category = "text_insertion");
                 }

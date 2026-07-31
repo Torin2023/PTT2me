@@ -84,9 +84,17 @@ impl fmt::Display for InsertError {
 impl Error for InsertError {}
 
 /// Removes outer whitespace without modifying recognised text itself.
-pub fn normalize_text(text: &str) -> Option<String> {
+pub fn normalize_text(text: &str, append_space: bool) -> Option<String> {
     let trimmed = text.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut normalized = trimmed.to_owned();
+    if append_space {
+        normalized.push(' ');
+    }
+    Some(normalized)
 }
 
 struct SystemPasteboard {
@@ -212,11 +220,12 @@ fn reconstruct_items(
 
 fn insert_with(
     text: &str,
+    append_space: bool,
     pasteboard: &mut impl PasteboardAccess,
     command: &mut impl PasteCommand,
     sleeper: &mut impl Sleeper,
 ) -> Result<(), InsertError> {
-    let text = normalize_text(text).ok_or(InsertError::EmptyText)?;
+    let text = normalize_text(text, append_space).ok_or(InsertError::EmptyText)?;
     let snapshot = pasteboard.snapshot()?;
     let temporary = match pasteboard.write_temporary_text(&text) {
         Ok(temporary) => temporary,
@@ -248,10 +257,11 @@ fn insert_with(
 
 /// Temporarily writes `text`, sends Command-V to the frontmost application,
 /// then restores the previous pasteboard contents when they are still current.
-pub fn insert_text(text: &str) -> Result<(), InsertError> {
+pub fn insert_text(text: &str, append_space: bool) -> Result<(), InsertError> {
     let pasteboard = unsafe { NSPasteboard::generalPasteboard() };
     insert_with(
         text,
+        append_space,
         &mut SystemPasteboard::new(pasteboard),
         &mut SystemPasteCommand,
         &mut ThreadSleeper,
@@ -287,6 +297,7 @@ mod tests {
         replace_before_ownership_check: Option<PasteboardSnapshot>,
         replace_during_restore: Option<PasteboardSnapshot>,
         temporary_write_calls: usize,
+        temporary_texts: Vec<String>,
         restore_calls: usize,
     }
 
@@ -301,6 +312,7 @@ mod tests {
                 replace_before_ownership_check: None,
                 replace_during_restore: None,
                 temporary_write_calls: 0,
+                temporary_texts: Vec::new(),
                 restore_calls: 0,
             }
         }
@@ -317,6 +329,7 @@ mod tests {
             text: &str,
         ) -> Result<TemporaryWrite, TemporaryWriteFailure> {
             self.temporary_write_calls += 1;
+            self.temporary_texts.push(text.to_owned());
             self.change_count += 1;
             self.current = snapshot(&[&[("public.utf8-plain-text", text.as_bytes())]]);
             let result = TemporaryWrite {
@@ -473,7 +486,13 @@ mod tests {
         let mut sleeper = FakeSleeper::default();
 
         assert_eq!(
-            insert_with("recognized", &mut pasteboard, &mut command, &mut sleeper),
+            insert_with(
+                "recognized",
+                false,
+                &mut pasteboard,
+                &mut command,
+                &mut sleeper,
+            ),
             Ok(())
         );
         assert_eq!(pasteboard.current, original);
@@ -493,6 +512,7 @@ mod tests {
         assert_eq!(
             insert_with(
                 "recognized",
+                false,
                 &mut pasteboard,
                 &mut FakePasteCommand::succeed(),
                 &mut FakeSleeper::default(),
@@ -513,6 +533,7 @@ mod tests {
         assert_eq!(
             insert_with(
                 "recognized",
+                false,
                 &mut pasteboard,
                 &mut FakePasteCommand::succeed(),
                 &mut FakeSleeper::default(),
@@ -530,6 +551,7 @@ mod tests {
         assert_eq!(
             insert_with(
                 "recognized",
+                false,
                 &mut pasteboard,
                 &mut FakePasteCommand::succeed(),
                 &mut FakeSleeper::default(),
@@ -547,6 +569,7 @@ mod tests {
         assert_eq!(
             insert_with(
                 "recognized",
+                false,
                 &mut pasteboard,
                 &mut FakePasteCommand::fail(InsertError::KeyboardEvent),
                 &mut FakeSleeper::default(),
@@ -565,6 +588,7 @@ mod tests {
         assert_eq!(
             insert_with(
                 "recognized",
+                false,
                 &mut pasteboard,
                 &mut FakePasteCommand::succeed(),
                 &mut FakeSleeper::default(),
@@ -582,6 +606,7 @@ mod tests {
         assert_eq!(
             insert_with(
                 "recognized",
+                false,
                 &mut pasteboard,
                 &mut FakePasteCommand::succeed(),
                 &mut FakeSleeper::default(),
@@ -592,20 +617,66 @@ mod tests {
     }
 
     #[test]
+    fn temporary_text_keeps_requested_trailing_space() {
+        let mut pasteboard = FakePasteboard::with_snapshot(PasteboardSnapshot::default());
+
+        assert_eq!(
+            insert_with(
+                "Привет.",
+                true,
+                &mut pasteboard,
+                &mut FakePasteCommand::succeed(),
+                &mut FakeSleeper::default(),
+            ),
+            Ok(())
+        );
+
+        assert_eq!(pasteboard.temporary_texts, vec!["Привет. ".to_owned()]);
+    }
+
+    #[test]
     fn trims_outer_whitespace_only() {
-        assert_eq!(normalize_text("  Привет. \n"), Some("Привет.".into()));
+        assert_eq!(
+            normalize_text("  Привет. \n", false),
+            Some("Привет.".into())
+        );
     }
 
     #[test]
     fn rejects_whitespace_only_text() {
-        assert_eq!(normalize_text(" \n\t "), None);
+        assert_eq!(normalize_text(" \n\t ", false), None);
     }
 
     #[test]
     fn preserves_text_without_rewriting() {
         assert_eq!(
-            normalize_text("Текст без точки"),
+            normalize_text("Текст без точки", false),
             Some("Текст без точки".into())
         );
+    }
+
+    #[test]
+    fn disabled_trailing_space_preserves_normalized_model_output() {
+        assert_eq!(
+            normalize_text("  Привет! \n", false),
+            Some("Привет!".into())
+        );
+    }
+
+    #[test]
+    fn enabled_trailing_space_follows_model_punctuation() {
+        for (input, expected) in [
+            ("Привет.", "Привет. "),
+            ("Привет!", "Привет! "),
+            ("Привет?", "Привет? "),
+            ("Привет", "Привет "),
+        ] {
+            assert_eq!(normalize_text(input, true), Some(expected.into()));
+        }
+    }
+
+    #[test]
+    fn trailing_space_option_does_not_make_empty_recognition_insertable() {
+        assert_eq!(normalize_text(" \n\t ", true), None);
     }
 }
