@@ -770,5 +770,7 @@ mod tests {
             normalize_text("Текст без точки", true),
             Some("Текст без точки ".into())
         );
+        assert_eq!(normalize_text("Готово!", true), Some("Готово! ".into()));
+        assert_eq!(normalize_text("Готово?", true), Some("Готово? ".into()));
     }
 }

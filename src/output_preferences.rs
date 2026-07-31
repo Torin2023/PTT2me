@@ -159,6 +159,14 @@ mod tests {
             Ok(())
         );
         assert!(repository.load().append_space);
+
+        assert_eq!(
+            repository.save(OutputPreferences {
+                append_space: false,
+            }),
+            Ok(())
+        );
+        assert!(!repository.load().append_space);
     }
 
     #[test]

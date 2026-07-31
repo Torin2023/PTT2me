@@ -25,7 +25,8 @@ use crate::menu::MenuAction;
 use crate::menu::{MenuBar, MenuCommand, MenuReadiness};
 use crate::model::{resources_dir_from_executable, ModelPaths};
 use crate::output_preferences::{
-    OutputPreferenceController, OutputPreferenceRepository, SystemOutputPreferenceStore,
+    OutputPreferenceController, OutputPreferenceError, OutputPreferenceRepository,
+    RawOutputPreferenceStore, SystemOutputPreferenceStore,
 };
 use crate::permissions::{
     self, MicrophoneAuthorization, MicrophonePermissionBoundary, MicrophonePermissionFlow,
@@ -92,6 +93,16 @@ impl<R: RawPreferenceStore> RuntimePreferences<R> {
     #[cfg(test)]
     fn saved(&self) -> Preferences {
         self.repository.load()
+    }
+}
+
+fn apply_output_menu_command<R: RawOutputPreferenceStore>(
+    command: MenuCommand,
+    preferences: &mut OutputPreferenceController<R>,
+) -> Result<(), OutputPreferenceError> {
+    match command {
+        MenuCommand::SetAppendSpace(value) => preferences.set_append_space(value),
+        _ => Ok(()),
     }
 }
 
@@ -691,7 +702,12 @@ impl Runtime {
         }
 
         if let MenuCommand::SetAppendSpace(value) = command {
-            if self.output_preferences.set_append_space(value).is_err() {
+            if apply_output_menu_command(
+                MenuCommand::SetAppendSpace(value),
+                &mut self.output_preferences,
+            )
+            .is_err()
+            {
                 tracing::warn!(error_category = "output_preference_persistence");
             }
             self.menu
@@ -1109,16 +1125,21 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        capture_start_result_event, milliseconds_to_seconds, reset_hotkey_before_drop, status_name,
-        wait_for_smoke_child, AssignmentTracker, DeferredTapState, MicrophonePermissionRuntime,
-        PasteFlow, PasteFlowBoundary, PasteInsertion, RuntimePreferences, TapState, TimerKind,
-        EVENT_DRAIN_MS, PERMISSION_POLL_MS,
+        apply_output_menu_command, capture_start_result_event, milliseconds_to_seconds,
+        reset_hotkey_before_drop, status_name, wait_for_smoke_child, AssignmentTracker,
+        DeferredTapState, MicrophonePermissionRuntime, PasteFlow, PasteFlowBoundary,
+        PasteInsertion, RuntimePreferences, TapState, TimerKind, EVENT_DRAIN_MS,
+        PERMISSION_POLL_MS,
     };
     use crate::audio::AudioError;
     use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
     use crate::hotkey::{HotkeyControl, HotkeySignal, KeyboardObservation, ObservationKind};
     use crate::inserter::InsertError;
     use crate::menu::MenuCommand;
+    use crate::output_preferences::{
+        OutputPreferenceController, OutputPreferenceError, OutputPreferenceRepository,
+        RawOutputPreferenceStore,
+    };
     use crate::permissions::{MicrophoneAuthorization, MicrophonePermissionBoundary};
     use crate::preferences::{
         HoldThreshold, PreferenceError, PreferenceRepository, Preferences, RawPreferenceStore,
@@ -1168,6 +1189,27 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MemoryOutputStore {
+        value: Option<bool>,
+        fail_writes: bool,
+    }
+
+    impl RawOutputPreferenceStore for MemoryOutputStore {
+        fn append_space(&self) -> Option<bool> {
+            self.value
+        }
+
+        fn set_append_space(&mut self, value: bool) -> Result<(), OutputPreferenceError> {
+            if self.fail_writes {
+                Err(OutputPreferenceError::WriteFailed)
+            } else {
+                self.value = Some(value);
+                Ok(())
+            }
+        }
+    }
+
     #[test]
     fn threshold_command_updates_menu_store_and_future_gate_preferences() {
         let mut model = RuntimePreferences::new(
@@ -1180,6 +1222,21 @@ mod tests {
         );
         assert_eq!(model.current().threshold, HoldThreshold::MS_750);
         assert_eq!(model.saved().threshold, HoldThreshold::MS_750);
+    }
+
+    #[test]
+    fn trailing_space_command_keeps_live_state_when_persistence_fails() {
+        let mut preferences =
+            OutputPreferenceController::load(OutputPreferenceRepository::new(MemoryOutputStore {
+                value: Some(false),
+                fail_writes: true,
+            }));
+
+        assert_eq!(
+            apply_output_menu_command(MenuCommand::SetAppendSpace(true), &mut preferences),
+            Err(OutputPreferenceError::WriteFailed)
+        );
+        assert!(preferences.current().append_space);
     }
 
     fn key_down(keycode: u16) -> KeyboardObservation {
