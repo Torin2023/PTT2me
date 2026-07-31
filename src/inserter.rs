@@ -727,6 +727,19 @@ mod tests {
     }
 
     #[test]
+    fn empty_prepared_text_aborts_before_snapshot() {
+        let pasteboard = FakePasteboard::with_snapshot(PasteboardSnapshot::default());
+        let temporary_write_counter = Rc::clone(&pasteboard.temporary_write_counter);
+
+        assert_eq!(
+            InsertionTransaction::begin_with("", pasteboard, FakePasteCommand::succeed())
+                .map(|_| ()),
+            Err(InsertError::EmptyText)
+        );
+        assert_eq!(temporary_write_counter.get(), 0);
+    }
+
+    #[test]
     fn trims_outer_whitespace_only() {
         assert_eq!(
             normalize_text("  Привет. \n", false),

@@ -854,6 +854,19 @@ mod tests {
     }
 
     #[test]
+    fn trailing_space_command_reports_a_closed_runtime_channel() {
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let publisher = MenuCommandPublisher::new(
+            sender,
+            HotkeyControl::new(Preferences::default()),
+            MenuReadiness::new(true),
+        );
+
+        assert!(!publisher.send(MenuCommand::SetAppendSpace(true)));
+    }
+
+    #[test]
     fn permission_action_tracks_the_current_missing_permission() {
         assert_eq!(
             PermissionActionProjection::from_status(&AppStatus::Ready),

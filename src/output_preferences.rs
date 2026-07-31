@@ -160,4 +160,15 @@ mod tests {
         );
         assert!(repository.load().append_space);
     }
+
+    #[test]
+    fn successful_controller_update_changes_memory_and_saved_value() {
+        let mut controller = OutputPreferenceController::load(OutputPreferenceRepository::new(
+            MemoryRawStore::default(),
+        ));
+
+        assert_eq!(controller.set_append_space(true), Ok(()));
+        assert!(controller.current().append_space);
+        assert!(controller.repository.load().append_space);
+    }
 }

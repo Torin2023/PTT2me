@@ -342,6 +342,20 @@ mod tests {
     }
 
     #[test]
+    fn disabled_preference_preserves_punctuation_without_trailing_space() {
+        let (mut ax, mut unicode, mut clipboard, calls, texts) = boundaries(Ok(true), Ok(true));
+
+        let outcome = begin_with(" Привет. ", false, &mut ax, &mut unicode, &mut clipboard);
+
+        assert_eq!(
+            outcome,
+            Ok(InsertOutcome::Complete(InsertMethod::Accessibility))
+        );
+        assert_eq!(calls.borrow().as_slice(), ["ax"]);
+        assert_eq!(texts.borrow().as_slice(), ["Привет."]);
+    }
+
+    #[test]
     fn unsupported_accessibility_falls_through_to_unicode() {
         let (mut ax, mut unicode, mut clipboard, calls, texts) = boundaries(Ok(false), Ok(true));
 
@@ -378,6 +392,29 @@ mod tests {
 
         assert_eq!(outcome, Err(InsertError::SecureField));
         assert_eq!(calls.borrow().as_slice(), ["ax"]);
+    }
+
+    #[test]
+    fn whitespace_only_text_is_rejected_before_any_adapter() {
+        let (mut ax, mut unicode, mut clipboard, calls, texts) = boundaries(Ok(true), Ok(true));
+
+        let outcome = begin_with(" \n\t ", true, &mut ax, &mut unicode, &mut clipboard);
+
+        assert_eq!(outcome, Err(InsertError::EmptyText));
+        assert!(calls.borrow().is_empty());
+        assert!(texts.borrow().is_empty());
+    }
+
+    #[test]
+    fn unicode_error_is_terminal_before_clipboard_fallback() {
+        let (mut ax, mut unicode, mut clipboard, calls, texts) =
+            boundaries(Ok(false), Err(InsertError::UnicodeEvent));
+
+        let outcome = begin_with("текст", true, &mut ax, &mut unicode, &mut clipboard);
+
+        assert_eq!(outcome, Err(InsertError::UnicodeEvent));
+        assert_eq!(calls.borrow().as_slice(), ["ax", "unicode"]);
+        assert_eq!(texts.borrow().as_slice(), ["текст ", "текст "]);
     }
 
     #[test]
