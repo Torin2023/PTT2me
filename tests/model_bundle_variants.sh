@@ -152,6 +152,17 @@ grep -Fq 'Add :PTT2meSourceCommit string $SOURCE_COMMIT' \
     --variant full \
     --model-manifest "$MANIFEST" \
     --model-source "$MODEL_DIRECTORY"
+printf '\n' >"$MODEL_DIRECTORY/.gitkeep"
+"$CHECK_MODEL_VARIANT" \
+    --variant full \
+    --model-manifest "$MANIFEST" \
+    --model-source "$MODEL_DIRECTORY"
+expect_failure_containing "exactly four entries" \
+    "$CHECK_MODEL_VARIANT" \
+    --variant full \
+    --model-manifest "$MANIFEST" \
+    --resources "$FULL_RESOURCES"
+rm "$MODEL_DIRECTORY/.gitkeep"
 "$CHECK_MODEL_VARIANT" \
     --variant update \
     --model-manifest "$MANIFEST" \

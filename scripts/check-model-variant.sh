@@ -86,6 +86,9 @@ fi
     fail "full variant model directory is not a real directory: $MODEL_DIRECTORY"
 
 ENTRY_COUNT="$(find "$MODEL_DIRECTORY" -mindepth 1 -maxdepth 1 -exec printf x \; | wc -c | tr -d ' ')"
+if [[ -n "$MODEL_SOURCE" && -f "$MODEL_DIRECTORY/.gitkeep" && ! -L "$MODEL_DIRECTORY/.gitkeep" ]]; then
+    ENTRY_COUNT="$((ENTRY_COUNT - 1))"
+fi
 [[ "$ENTRY_COUNT" == "4" ]] ||
     fail "full model directory must contain exactly four entries"
 
