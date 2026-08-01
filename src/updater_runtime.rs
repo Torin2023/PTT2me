@@ -5,9 +5,14 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
+use objc2_foundation::NSProcessInfo;
+
 use crate::model_store::{
-    embedded_model_manifest, model_directory, verify_model_directory, MODEL_ID,
-    PRODUCTION_MODEL_MANIFEST_SHA256,
+    application_support_root_from_home, embedded_model_manifest, model_directory,
+    verify_model_directory, MODEL_ID, PRODUCTION_MODEL_MANIFEST_SHA256,
+};
+use crate::permission_migration::{
+    load_main_bundle_identity, BuildIdentityError, BuildIdentityLoad,
 };
 use crate::preferences::{
     RawUpdateScheduleStore, SystemUpdateScheduleStore, UpdateScheduleRepository,
@@ -23,6 +28,94 @@ use crate::updater::{
     SystemClock, UpdateClock, UpdateFailure, UpdateFetch, Updater, UpdaterCommand, UpdaterEvent,
     UpdaterState, VerifiedDownload,
 };
+
+pub(crate) const PRODUCTION_MANIFEST_URL: &str =
+    "https://torin2023.github.io/PTT2me/channels/stable.json";
+const PRODUCTION_PUBLIC_KEY: &[u8] = include_bytes!("../updates/public-key.txt");
+
+#[derive(Debug)]
+pub(crate) enum ProductionUpdaterConfigError {
+    Identity(BuildIdentityError),
+    InvalidInstalledBuild,
+    InvalidPublicKey,
+    HomeUnavailable,
+    InvalidHome,
+    InvalidOperatingSystem,
+}
+
+impl std::fmt::Display for ProductionUpdaterConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Identity(error) => write!(formatter, "invalid application identity: {error:?}"),
+            Self::InvalidInstalledBuild => formatter.write_str("invalid installed build identity"),
+            Self::InvalidPublicKey => formatter.write_str("invalid embedded updater public key"),
+            Self::HomeUnavailable => formatter.write_str("HOME is unavailable"),
+            Self::InvalidHome => formatter.write_str("HOME must be an absolute path"),
+            Self::InvalidOperatingSystem => formatter.write_str("invalid macOS version"),
+        }
+    }
+}
+
+pub(crate) fn load_production_updater_config(
+) -> Result<Option<UpdaterLaunchConfig>, ProductionUpdaterConfigError> {
+    let identity = load_main_bundle_identity().map_err(ProductionUpdaterConfigError::Identity)?;
+    build_production_updater_config(
+        identity,
+        || {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or(ProductionUpdaterConfigError::HomeUnavailable)
+        },
+        running_macos_version,
+    )
+}
+
+fn build_production_updater_config(
+    identity: BuildIdentityLoad,
+    home: impl FnOnce() -> Result<PathBuf, ProductionUpdaterConfigError>,
+    running_macos: impl FnOnce() -> Result<MacOsVersion, ProductionUpdaterConfigError>,
+) -> Result<Option<UpdaterLaunchConfig>, ProductionUpdaterConfigError> {
+    let BuildIdentityLoad::Release(identity) = identity else {
+        return Ok(None);
+    };
+
+    let build = identity
+        .build()
+        .parse::<u64>()
+        .map_err(|_| ProductionUpdaterConfigError::InvalidInstalledBuild)?;
+    let installed = InstalledBuild::parse(identity.version(), build, identity.source_commit())
+        .map_err(|_| ProductionUpdaterConfigError::InvalidInstalledBuild)?;
+    let public_key = crate::release_manifest::parse_public_key(PRODUCTION_PUBLIC_KEY)
+        .map_err(|_| ProductionUpdaterConfigError::InvalidPublicKey)?;
+    let home = home()?;
+    if !home.is_absolute() {
+        return Err(ProductionUpdaterConfigError::InvalidHome);
+    }
+    let running_macos = running_macos()?;
+    let application_support_root = application_support_root_from_home(&home)
+        .map_err(|_| ProductionUpdaterConfigError::InvalidHome)?;
+    let cache_root = home.join("Library/Caches/com.ptt2me.app");
+
+    Ok(Some(UpdaterLaunchConfig {
+        installed,
+        public_key,
+        running_macos,
+        manifest_url: PRODUCTION_MANIFEST_URL.to_owned(),
+        manifest_cache_path: cache_root.join("channels/stable.json"),
+        artifact_cache_root: cache_root.join("artifacts"),
+        application_support_root,
+    }))
+}
+
+fn running_macos_version() -> Result<MacOsVersion, ProductionUpdaterConfigError> {
+    let version = NSProcessInfo::processInfo().operatingSystemVersion();
+    let major = u64::try_from(version.majorVersion)
+        .map_err(|_| ProductionUpdaterConfigError::InvalidOperatingSystem)?;
+    let minor = u64::try_from(version.minorVersion)
+        .map_err(|_| ProductionUpdaterConfigError::InvalidOperatingSystem)?;
+    MacOsVersion::parse(&format!("{major}.{minor}"))
+        .map_err(|_| ProductionUpdaterConfigError::InvalidOperatingSystem)
+}
 
 pub(crate) fn required_model_availability(
     required: &RequiredModel,
@@ -669,6 +762,80 @@ mod tests {
     use crate::updater::{OperationId, UpdateClock, UpdaterState};
 
     use super::*;
+
+    #[test]
+    fn development_bypass_does_not_read_home_or_operating_system() {
+        let config = build_production_updater_config(
+            crate::permission_migration::BuildIdentityLoad::DevelopmentBypass,
+            || panic!("HOME must not be read for a development binary"),
+            || panic!("macOS version must not be read for a development binary"),
+        )
+        .unwrap();
+
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn release_identity_maps_to_exact_production_updater_config() {
+        let identity = crate::permission_migration::BuildIdentity::parse(
+            "1.0.5",
+            "202608011234",
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .unwrap();
+        let home = PathBuf::from("/Users/release-user");
+
+        let config = build_production_updater_config(
+            crate::permission_migration::BuildIdentityLoad::Release(identity),
+            || Ok(home.clone()),
+            || Ok(MacOsVersion::parse("14.6").unwrap()),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(config.installed.version.to_string(), "1.0.5");
+        assert_eq!(config.installed.build, 202608011234);
+        assert_eq!(
+            config.installed.source_commit,
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(config.running_macos.to_string(), "14.6");
+        assert_eq!(config.manifest_url, PRODUCTION_MANIFEST_URL);
+        assert_eq!(
+            config.manifest_cache_path,
+            home.join("Library/Caches/com.ptt2me.app/channels/stable.json")
+        );
+        assert_eq!(
+            config.artifact_cache_root,
+            home.join("Library/Caches/com.ptt2me.app/artifacts")
+        );
+        assert_eq!(
+            config.application_support_root,
+            home.join("Library/Application Support/PTT2me")
+        );
+        assert_eq!(
+            config.public_key,
+            crate::release_manifest::parse_public_key(include_bytes!("../updates/public-key.txt"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn release_config_rejects_relative_home() {
+        let identity = crate::permission_migration::BuildIdentity::parse(
+            "1.0.5",
+            "202608011234",
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .unwrap();
+
+        assert!(build_production_updater_config(
+            crate::permission_migration::BuildIdentityLoad::Release(identity),
+            || Ok(PathBuf::from("relative-home")),
+            || Ok(MacOsVersion::parse("14.6").unwrap()),
+        )
+        .is_err());
+    }
 
     #[test]
     fn model_manifest_hash_mismatch_selects_the_full_artifact() {

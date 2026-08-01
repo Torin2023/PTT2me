@@ -123,6 +123,14 @@ case "$PRIVATE_KEY" in
 esac
 
 cd -- "$REPO_ROOT"
+readonly COMMITTED_PUBLIC_KEY="updates/public-key.txt"
+git cat-file -e "HEAD:$COMMITTED_PUBLIC_KEY" 2>/dev/null ||
+    fail "$COMMITTED_PUBLIC_KEY must be tracked in git HEAD"
+git diff --quiet HEAD -- "$COMMITTED_PUBLIC_KEY" ||
+    fail "$COMMITTED_PUBLIC_KEY worktree bytes must equal git HEAD"
+cmp -s "$REPO_ROOT/$COMMITTED_PUBLIC_KEY" "$PUBLIC_KEY" ||
+    fail "public key must match $COMMITTED_PUBLIC_KEY"
+
 "$SCRIPT_DIR/check-production-model-manifest.sh" "$MODEL_MANIFEST"
 cmp -s "$REPO_ROOT/models/manifests/$MODEL_ID.json" "$MODEL_MANIFEST" ||
     fail "model manifest must match the committed exact bytes"

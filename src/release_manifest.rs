@@ -4,6 +4,7 @@ use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 
 use crate::model_store::MODEL_ID;
@@ -82,17 +83,24 @@ pub fn verify_release_files(
 
 fn read_public_key(path: &Path) -> Result<[u8; 32], ReleaseManifestError> {
     let bytes = read_bounded(path, KEY_FILE_LIMIT, "key file")?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| ReleaseManifestError::InvalidPublicKey)?;
-    let line = text.strip_suffix('\n').unwrap_or(text);
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    if line.is_empty() || line.bytes().any(|byte| byte.is_ascii_whitespace()) {
+    parse_public_key(&bytes)
+}
+
+pub(crate) fn parse_public_key(bytes: &[u8]) -> Result<[u8; 32], ReleaseManifestError> {
+    let line = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let text = std::str::from_utf8(line).map_err(|_| ReleaseManifestError::InvalidPublicKey)?;
+    if text.is_empty() || text.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return Err(ReleaseManifestError::InvalidPublicKey);
     }
-    STANDARD
-        .decode(line)
+    let key: [u8; 32] = STANDARD
+        .decode(text)
         .ok()
         .and_then(|decoded| decoded.try_into().ok())
-        .ok_or(ReleaseManifestError::InvalidPublicKey)
+        .ok_or(ReleaseManifestError::InvalidPublicKey)?;
+    if STANDARD.encode(key) != text || VerifyingKey::from_bytes(&key).is_err() {
+        return Err(ReleaseManifestError::InvalidPublicKey);
+    }
+    Ok(key)
 }
 
 fn read_bounded(
@@ -126,4 +134,37 @@ fn digest_file(path: &Path) -> Result<String, ReleaseManifestError> {
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use ed25519_dalek::SigningKey;
+
+    use super::*;
+
+    #[test]
+    fn public_key_parser_accepts_one_canonical_line() {
+        let expected = SigningKey::from_bytes(&[0x42; 32])
+            .verifying_key()
+            .to_bytes();
+        let encoded = format!("{}\n", STANDARD.encode(expected));
+
+        assert_eq!(parse_public_key(encoded.as_bytes()).unwrap(), expected);
+    }
+
+    #[test]
+    fn public_key_parser_rejects_noncanonical_and_invalid_ed25519_keys() {
+        let valid = SigningKey::from_bytes(&[0x42; 32])
+            .verifying_key()
+            .to_bytes();
+        let valid_line = STANDARD.encode(valid);
+
+        assert!(parse_public_key(format!("{valid_line}\r\n").as_bytes()).is_err());
+        assert!(parse_public_key(format!("{valid_line}\nextra").as_bytes()).is_err());
+        let invalid = (0_u8..=u8::MAX)
+            .map(|byte| [byte; 32])
+            .find(|candidate| VerifyingKey::from_bytes(candidate).is_err())
+            .expect("at least one raw 32-byte value is not an Ed25519 verifying key");
+        assert!(parse_public_key(format!("{}\n", STANDARD.encode(invalid)).as_bytes()).is_err());
+    }
 }

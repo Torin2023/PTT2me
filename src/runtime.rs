@@ -51,8 +51,8 @@ use crate::state::{
 use crate::text_inserter::{self, InsertMethod, InsertOutcome};
 use crate::updater::{RetryAction, SystemClock, UpdateClock, UpdaterState};
 use crate::updater_runtime::{
-    updater_open_allowed, OrderlyQuitGate, SystemUpdaterLane, UpdaterLaunchConfig,
-    UpdaterRuntimeEffect,
+    load_production_updater_config, updater_open_allowed, OrderlyQuitGate, SystemUpdaterLane,
+    UpdaterLaunchConfig, UpdaterRuntimeEffect,
 };
 
 const EVENT_DRAIN_MS: u64 = 50;
@@ -628,7 +628,17 @@ impl Runtime {
     /// Creates and starts the complete runtime. The returned box must remain
     /// alive until `NSApplication::run` returns.
     pub fn start(mtm: MainThreadMarker) -> Pin<Box<Self>> {
-        Self::start_with_updater_config(mtm, None)
+        let updater_config = match load_production_updater_config() {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::error!(
+                    error_category = "updater_production_config",
+                    error = %error
+                );
+                None
+            }
+        };
+        Self::start_with_updater_config(mtm, updater_config)
     }
 
     pub(crate) fn start_with_updater_config(

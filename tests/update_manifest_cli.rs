@@ -163,3 +163,59 @@ fn temporary_key_signing_and_cli_validation_cover_all_release_inputs() {
     assert!(release_error.contains("--public-key"));
     assert!(release_error.contains("--private-key"));
 }
+
+#[test]
+fn release_coordinator_rejects_a_different_public_key_before_building() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().unwrap();
+    let model_manifest = temp.path().join("model.json");
+    let model_source = temp.path().join("model");
+    let different_public_key = temp.path().join("different-public-key.txt");
+    let private_key = temp.path().join("private-key.txt");
+    let output_dir = temp.path().join("output");
+    fs::write(&model_manifest, MODEL_MANIFEST_BYTES).unwrap();
+    fs::create_dir(&model_source).unwrap();
+    fs::create_dir(&output_dir).unwrap();
+    let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+    fs::write(
+        &different_public_key,
+        format!(
+            "{}\n",
+            STANDARD.encode(signing_key.verifying_key().to_bytes())
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &private_key,
+        format!("{}\n", STANDARD.encode(signing_key.to_bytes())),
+    )
+    .unwrap();
+
+    let output = Command::new(repository.join("scripts/build-release-artifacts.sh"))
+        .arg("--version")
+        .arg("1.0.5")
+        .arg("--build")
+        .arg("202608011234")
+        .arg("--source-commit")
+        .arg("0123456789abcdef0123456789abcdef01234567")
+        .arg("--model-manifest")
+        .arg(&model_manifest)
+        .arg("--model-source")
+        .arg(&model_source)
+        .arg("--public-key")
+        .arg(&different_public_key)
+        .arg("--private-key")
+        .arg(&private_key)
+        .arg("--published-at")
+        .arg("2026-08-01T12:34:00Z")
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .output()
+        .expect("run release coordinator with a different public key");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("public key must match updates/public-key.txt"));
+    assert!(!stderr.contains("production model manifest is not exact"));
+    assert!(fs::read_dir(&output_dir).unwrap().next().is_none());
+}
