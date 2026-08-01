@@ -1,0 +1,72 @@
+name: Задача разработки
+description: Одна проверяемая задача для отдельной ветки и Pull Request
+title: "[Task] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Одна Issue должна приводить к одной ветке `codex/<описание>` и одному Pull Request.
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Цель
+      description: Какой проверяемый результат должен быть получен?
+      placeholder: После выполнения...
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Критерии приёмки
+      description: Перечислите наблюдаемые условия завершения задачи.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Границы задачи
+      description: Какие файлы или сценарии входят и не входят в задачу?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: verification_environment
+    attributes:
+      label: Требуемое окружение проверки
+      options:
+        - Только Linux cloud
+        - macOS GitHub Actions
+        - Apple Silicon Mac и ручная проверка
+        - Release gate с model assets
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Проверка
+      description: Какие автоматические и ручные проверки обязательны?
+    validations:
+      required: true
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Риски и дополнительные сведения
+      description: TCC, updater, model assets, совместимость, ссылки и скриншоты.
+
+  - type: checkboxes
+    id: readiness
+    attributes:
+      label: Готовность задачи
+      options:
+        - label: В задаче нет секретов и приватных ключей
+          required: true
+        - label: Задача достаточно узкая для одного Pull Request
+          required: true
