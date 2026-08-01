@@ -11,6 +11,7 @@ pub mod menu;
 pub mod model;
 pub mod model_store;
 pub mod output_preferences;
+pub mod permission_migration;
 pub mod permissions;
 pub mod preferences;
 pub mod runtime;

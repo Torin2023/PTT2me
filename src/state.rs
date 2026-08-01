@@ -43,6 +43,8 @@ pub enum AppStatus {
     PreparingModel,
     ModelRepairRequired,
     ModelPreparationFailed,
+    ResettingPermissions,
+    PermissionResetFailed,
     PermissionBlocked(PermissionKind),
     Ready,
     Recording,
@@ -63,6 +65,9 @@ pub enum ModelPreparationFailure {
 pub enum AppEvent {
     ModelPreparationStarted,
     ModelPreparationFailed(ModelPreparationFailure),
+    PermissionMigrationStarted,
+    PermissionMigrationCompleted,
+    PermissionMigrationFailed,
     ModelLoaded(Result<(), String>),
     PermissionsChanged(PermissionSnapshot),
     TriggerPressed,
@@ -125,6 +130,20 @@ impl AppController {
             AppEvent::ModelPreparationFailed(ModelPreparationFailure::Storage) => {
                 self.model_ready = false;
                 self.status = AppStatus::ModelPreparationFailed;
+                Vec::new()
+            }
+            AppEvent::PermissionMigrationStarted => {
+                self.model_ready = false;
+                self.status = AppStatus::ResettingPermissions;
+                Vec::new()
+            }
+            AppEvent::PermissionMigrationCompleted => {
+                self.status = AppStatus::PreparingModel;
+                Vec::new()
+            }
+            AppEvent::PermissionMigrationFailed => {
+                self.model_ready = false;
+                self.status = AppStatus::PermissionResetFailed;
                 Vec::new()
             }
             AppEvent::ModelLoaded(Ok(())) => {
@@ -211,6 +230,8 @@ impl AppController {
                     self.status,
                     AppStatus::ModelRepairRequired
                         | AppStatus::ModelPreparationFailed
+                        | AppStatus::ResettingPermissions
+                        | AppStatus::PermissionResetFailed
                         | AppStatus::Error {
                             recoverable: false,
                             ..
@@ -330,6 +351,27 @@ mod tests {
             ModelPreparationFailure::Storage,
         ));
         assert_eq!(controller.status(), &AppStatus::ModelPreparationFailed);
+    }
+
+    #[test]
+    fn permission_reset_failure_stays_blocked_until_targeted_retry() {
+        let mut controller = AppController::new();
+
+        controller.handle(AppEvent::PermissionMigrationStarted);
+        assert_eq!(controller.status(), &AppStatus::ResettingPermissions);
+        controller.handle(AppEvent::PermissionMigrationFailed);
+        assert_eq!(controller.status(), &AppStatus::PermissionResetFailed);
+
+        assert!(controller
+            .handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()))
+            .is_empty());
+        assert!(controller.handle(AppEvent::TriggerPressed).is_empty());
+        assert_eq!(controller.status(), &AppStatus::PermissionResetFailed);
+
+        controller.handle(AppEvent::PermissionMigrationStarted);
+        assert_eq!(controller.status(), &AppStatus::ResettingPermissions);
+        controller.handle(AppEvent::PermissionMigrationCompleted);
+        assert_eq!(controller.status(), &AppStatus::PreparingModel);
     }
 
     #[test]

@@ -102,6 +102,10 @@ VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
     exit 1
 }
 BUILD_VERSION="$(date -u +%Y%m%d%H%M)"
+SOURCE_COMMIT="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
+    fail "could not resolve exact git HEAD"
+[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+    fail "git HEAD must be exactly 40 lowercase hexadecimal characters"
 
 export MACOSX_DEPLOYMENT_TARGET=13.0
 cargo build --release --target "$TARGET"
@@ -179,6 +183,7 @@ plutil -create xml1 "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD_VERSION" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :PTT2meSourceCommit string $SOURCE_COMMIT" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :PTT2meDistributionVariant string $VARIANT" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 13.0" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PLIST"

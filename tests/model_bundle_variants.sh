@@ -47,6 +47,27 @@ expect_failure_containing() {
     }
 }
 
+FAKE_TOOLS="$TEMP_ROOT/fake-tools"
+mkdir "$FAKE_TOOLS"
+printf '%s\n' \
+    '#!/bin/bash' \
+    '[[ "$1" == "-m" ]] || exit 91' \
+    'printf "%s\\n" arm64' >"$FAKE_TOOLS/uname"
+printf '%s\n' \
+    '#!/bin/bash' \
+    '[[ "$*" == "rev-parse --verify HEAD^{commit}" ]] || exit 92' \
+    'printf "%s\\n" ABC' >"$FAKE_TOOLS/git"
+printf '%s\n' \
+    '#!/bin/bash' \
+    'echo "cargo must not run before source commit validation" >&2' \
+    'exit 93' >"$FAKE_TOOLS/cargo"
+printf '%s\n' '#!/bin/bash' 'exit 0' >"$FAKE_TOOLS/lipo"
+printf '%s\n' \
+    '#!/bin/bash' \
+    'echo "otool must not run before source commit validation" >&2' \
+    'exit 94' >"$FAKE_TOOLS/otool"
+chmod 755 "$FAKE_TOOLS"/*
+
 "$CHECK_PRODUCTION_MANIFEST" \
     "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
 WHITESPACE_MUTATION="$TEMP_ROOT/production-manifest-whitespace.json"
@@ -71,6 +92,50 @@ expect_failure_containing "production manifest SHA-256 mismatch" \
     --model-manifest "$WHITESPACE_MUTATION" \
     --app "$FAKE_APP" \
     --output "$TEMP_ROOT/fake.dmg"
+
+expect_failure_containing "git HEAD must be exactly 40 lowercase hexadecimal characters" \
+    env PATH="$FAKE_TOOLS:$PATH" \
+    "$REPO_ROOT/scripts/build-app.sh" \
+    --variant update \
+    --model-manifest "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
+
+INVALID_IDENTITY_APP="$TEMP_ROOT/invalid-identity.app"
+mkdir -p \
+    "$INVALID_IDENTITY_APP/Contents/MacOS" \
+    "$INVALID_IDENTITY_APP/Contents/Frameworks" \
+    "$INVALID_IDENTITY_APP/Contents/Resources"
+touch \
+    "$INVALID_IDENTITY_APP/Contents/MacOS/PTT2me" \
+    "$INVALID_IDENTITY_APP/Contents/Frameworks/libsherpa-onnx-c-api.dylib" \
+    "$INVALID_IDENTITY_APP/Contents/Frameworks/libonnxruntime.1.17.1.dylib"
+INVALID_IDENTITY_PLIST="$INVALID_IDENTITY_APP/Contents/Info.plist"
+plutil -create xml1 "$INVALID_IDENTITY_PLIST"
+/usr/libexec/PlistBuddy -c \
+    "Add :CFBundleIdentifier string com.ptt2me.app" "$INVALID_IDENTITY_PLIST"
+/usr/libexec/PlistBuddy -c \
+    "Add :CFBundleShortVersionString string 1.0.5" "$INVALID_IDENTITY_PLIST"
+/usr/libexec/PlistBuddy -c \
+    "Add :CFBundleVersion string 202608011200" "$INVALID_IDENTITY_PLIST"
+/usr/libexec/PlistBuddy -c \
+    "Add :PTT2meSourceCommit string ABC" "$INVALID_IDENTITY_PLIST"
+/usr/libexec/PlistBuddy -c \
+    "Add :PTT2meDistributionVariant string update" "$INVALID_IDENTITY_PLIST"
+/usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$INVALID_IDENTITY_PLIST"
+/usr/libexec/PlistBuddy -c \
+    "Add :LSMinimumSystemVersion string 13.0" "$INVALID_IDENTITY_PLIST"
+expect_failure_containing \
+    "Info.plist PTT2meSourceCommit must be 40 lowercase hexadecimal characters" \
+    env PATH="$FAKE_TOOLS:$PATH" \
+    "$REPO_ROOT/scripts/check-bundle.sh" \
+    --variant update \
+    --model-manifest "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json" \
+    "$INVALID_IDENTITY_APP"
+
+grep -Fq 'Add :PTT2meSourceCommit string $SOURCE_COMMIT' \
+    "$REPO_ROOT/scripts/build-app.sh" || {
+    echo "build-app.sh must write PTT2meSourceCommit before signing" >&2
+    exit 1
+}
 
 "$CHECK_MODEL_VARIANT" \
     --variant full \

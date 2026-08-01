@@ -225,6 +225,10 @@ PARSED_BUILD_VERSION=$(
 ) || fail "Info.plist CFBundleVersion is not a valid UTC calendar minute"
 [[ "$PARSED_BUILD_VERSION" == "$BUILD_VERSION" ]] ||
     fail "Info.plist CFBundleVersion is not a valid UTC calendar minute"
+SOURCE_COMMIT=$(/usr/libexec/PlistBuddy -c "Print :PTT2meSourceCommit" "$PLIST" 2>/dev/null) ||
+    fail "missing Info.plist key PTT2meSourceCommit"
+[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+    fail "Info.plist PTT2meSourceCommit must be 40 lowercase hexadecimal characters"
 
 require_dylib_id "$SHERPA_DYLIB" "@rpath/libsherpa-onnx-c-api.dylib"
 require_dylib_id "$ONNX_DYLIB" "@rpath/libonnxruntime.1.17.1.dylib"

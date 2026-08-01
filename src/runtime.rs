@@ -33,6 +33,10 @@ use crate::output_preferences::{
     OutputPreferenceController, OutputPreferenceError, OutputPreferenceRepository,
     RawOutputPreferenceStore, SystemOutputPreferenceStore,
 };
+use crate::permission_migration::{
+    persist_setup_completion_if_granted, run_system_permission_migration, BuildIdentity,
+    PermissionMigrationRunError, PermissionMigrationSuccess, SystemPermissionMigrationStore,
+};
 use crate::permissions::{
     self, MicrophoneAuthorization, MicrophonePermissionBoundary, MicrophonePermissionFlow,
     SystemPermissionProbe,
@@ -59,19 +63,19 @@ const SMOKE_TIMEOUT_EXIT_CODE: i32 = 124;
 
 #[derive(Debug)]
 enum ModelPreparationPlan {
-    LoadVerified(ModelPaths),
+    BeginPermissionMigration(ModelPaths),
     Failed(ModelPreparationFailure),
 }
 
 impl ModelPreparationPlan {
-    const fn starts_permission_setup(&self) -> bool {
-        matches!(self, Self::LoadVerified(_))
+    const fn starts_permission_migration(&self) -> bool {
+        matches!(self, Self::BeginPermissionMigration(_))
     }
 }
 
 fn model_preparation_plan(result: Result<VerifiedModel, ModelStoreError>) -> ModelPreparationPlan {
     match result {
-        Ok(verified) => ModelPreparationPlan::LoadVerified(verified.into_paths()),
+        Ok(verified) => ModelPreparationPlan::BeginPermissionMigration(verified.into_paths()),
         Err(ModelStoreError::RepairRequired) => {
             ModelPreparationPlan::Failed(ModelPreparationFailure::RepairRequired)
         }
@@ -129,6 +133,59 @@ impl ModelPreparationTask {
         self.worker
             .take()
             .expect("model preparation task must own its worker")
+            .join()
+    }
+}
+
+struct PermissionMigrationWorkerResult {
+    paths: ModelPaths,
+    migration: Result<PermissionMigrationSuccess, PermissionMigrationRunError>,
+}
+
+fn spawn_permission_migration_worker_with<F>(
+    paths: ModelPaths,
+    migrate: F,
+) -> (Receiver<PermissionMigrationWorkerResult>, JoinHandle<()>)
+where
+    F: FnOnce() -> Result<PermissionMigrationSuccess, PermissionMigrationRunError> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let migration = migrate();
+        let _ = sender.send(PermissionMigrationWorkerResult { paths, migration });
+    });
+    (receiver, worker)
+}
+
+fn spawn_permission_migration_worker(
+    paths: ModelPaths,
+) -> (Receiver<PermissionMigrationWorkerResult>, JoinHandle<()>) {
+    spawn_permission_migration_worker_with(paths, run_system_permission_migration)
+}
+
+/// Owns one permission migration attempt. Dropping an unfinished task
+/// deliberately detaches its worker so AppKit teardown never waits for TCC.
+struct PermissionMigrationTask {
+    events: Receiver<PermissionMigrationWorkerResult>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl PermissionMigrationTask {
+    fn new(events: Receiver<PermissionMigrationWorkerResult>, worker: JoinHandle<()>) -> Self {
+        Self {
+            events,
+            worker: Some(worker),
+        }
+    }
+
+    fn try_recv(&self) -> Result<PermissionMigrationWorkerResult, TryRecvError> {
+        self.events.try_recv()
+    }
+
+    fn join_completed(mut self) -> thread::Result<()> {
+        self.worker
+            .take()
+            .expect("permission migration task must own its worker")
             .join()
     }
 }
@@ -546,6 +603,9 @@ pub struct Runtime {
     asr_worker: Option<JoinHandle<()>>,
     asr_connected: bool,
     model_preparation: Option<ModelPreparationTask>,
+    permission_migration: Option<PermissionMigrationTask>,
+    prepared_model_paths: Option<ModelPaths>,
+    permission_build_identity: Option<BuildIdentity>,
     updater: Option<SystemUpdaterLane>,
     orderly_quit: OrderlyQuitGate,
     run_loop: CFRunLoop,
@@ -617,6 +677,9 @@ impl Runtime {
             asr_worker: Some(asr_worker),
             asr_connected: true,
             model_preparation: Some(model_preparation),
+            permission_migration: None,
+            prepared_model_paths: None,
+            permission_build_identity: None,
             updater,
             orderly_quit: OrderlyQuitGate::default(),
             run_loop: CFRunLoop::get_main(),
@@ -742,6 +805,7 @@ impl Runtime {
         self.drain_updater_worker_results();
         self.drain_updater_actions();
         self.drain_model_preparation();
+        self.drain_permission_migration();
         self.drain_microphone_permission_completions();
 
         self.drain_menu_commands();
@@ -796,20 +860,87 @@ impl Runtime {
 
         let plan = model_preparation_plan(result);
         debug_assert_eq!(
-            plan.starts_permission_setup(),
-            matches!(&plan, ModelPreparationPlan::LoadVerified(_))
+            plan.starts_permission_migration(),
+            matches!(&plan, ModelPreparationPlan::BeginPermissionMigration(_))
         );
         match plan {
-            ModelPreparationPlan::LoadVerified(paths) => {
-                if self.asr_commands.send(AsrCommand::Load(paths)).is_err() {
+            ModelPreparationPlan::BeginPermissionMigration(paths) => {
+                self.begin_permission_migration(paths);
+            }
+            ModelPreparationPlan::Failed(failure) => {
+                self.dispatch(AppEvent::ModelPreparationFailed(failure));
+            }
+        }
+    }
+
+    fn begin_permission_migration(&mut self, paths: ModelPaths) {
+        if self.permission_migration.is_some() {
+            return;
+        }
+        self.dispatch(AppEvent::PermissionMigrationStarted);
+        self.prepared_model_paths = Some(paths.clone());
+        let (events, worker) = spawn_permission_migration_worker(paths);
+        self.permission_migration = Some(PermissionMigrationTask::new(events, worker));
+    }
+
+    fn retry_permission_migration(&mut self) {
+        if self.permission_migration.is_some() {
+            return;
+        }
+        let Some(paths) = self.prepared_model_paths.take() else {
+            return;
+        };
+        self.begin_permission_migration(paths);
+    }
+
+    fn drain_permission_migration(&mut self) {
+        let received = self
+            .permission_migration
+            .as_ref()
+            .map(PermissionMigrationTask::try_recv);
+        let completed = match received {
+            Some(Ok(result)) => Some(Some(result)),
+            Some(Err(TryRecvError::Disconnected)) => Some(None),
+            Some(Err(TryRecvError::Empty)) | None => None,
+        };
+        let Some(completed) = completed else {
+            return;
+        };
+
+        if let Some(task) = self.permission_migration.take() {
+            if task.join_completed().is_err() {
+                tracing::error!(error_category = "permission_migration_worker_panic");
+            }
+        }
+
+        let Some(result) = completed else {
+            tracing::error!(error_category = "permission_migration_worker_disconnected");
+            self.dispatch(AppEvent::PermissionMigrationFailed);
+            return;
+        };
+        match result.migration {
+            Ok(success) => {
+                self.prepared_model_paths = None;
+                self.permission_build_identity = match success {
+                    PermissionMigrationSuccess::Release(identity) => Some(identity),
+                    PermissionMigrationSuccess::DevelopmentBypass => None,
+                };
+                self.dispatch(AppEvent::PermissionMigrationCompleted);
+                self.start_permission_setup();
+                if self
+                    .asr_commands
+                    .send(AsrCommand::Load(result.paths))
+                    .is_err()
+                {
                     self.dispatch(AppEvent::ModelLoaded(Err(
                         "ASR worker unavailable".to_owned()
                     )));
                 }
-                self.start_permission_setup();
             }
-            ModelPreparationPlan::Failed(failure) => {
-                self.dispatch(AppEvent::ModelPreparationFailed(failure));
+            Err(error) => {
+                tracing::error!(error = ?error, error_category = "permission_migration");
+                self.prepared_model_paths = Some(result.paths);
+                self.dispatch(AppEvent::PermissionMigrationFailed);
             }
         }
     }
@@ -846,6 +977,7 @@ impl Runtime {
                     }
                 }
                 MenuAction::RetryModelPreparation => self.begin_model_preparation(),
+                MenuAction::RetryPermissionMigration => self.retry_permission_migration(),
             }
         }
     }
@@ -1032,6 +1164,14 @@ impl Runtime {
 
     fn poll_permissions(&mut self) {
         let permissions = SystemPermissionProbe::check();
+        if let Some(identity) = self.permission_build_identity.as_ref() {
+            let mut marker_store = SystemPermissionMigrationStore::standard();
+            if persist_setup_completion_if_granted(identity, permissions, &mut marker_store)
+                .is_err()
+            {
+                tracing::warn!(error_category = "permission_setup_marker_persistence");
+            }
+        }
         if permissions.microphone {
             let mut boundary = SystemMicrophonePermissionBoundary {
                 completion_sender: self.microphone_permissions.completion_sender(),
@@ -1332,6 +1472,7 @@ impl Drop for Runtime {
             let _ = worker.join();
         }
         self.model_preparation.take();
+        self.permission_migration.take();
         self.updater.take();
         tracing::info!(lifecycle = "terminated");
     }
@@ -1348,6 +1489,8 @@ const fn status_name(status: &AppStatus) -> &'static str {
         AppStatus::PreparingModel => "preparing_model",
         AppStatus::ModelRepairRequired => "model_repair_required",
         AppStatus::ModelPreparationFailed => "model_preparation_failed",
+        AppStatus::ResettingPermissions => "resetting_permissions",
+        AppStatus::PermissionResetFailed => "permission_reset_failed",
         AppStatus::PermissionBlocked(_) => "permission_blocked",
         AppStatus::Ready => "ready",
         AppStatus::Recording => "recording",
@@ -1442,9 +1585,10 @@ mod tests {
     use super::{
         apply_output_menu_command, capture_start_result_event, milliseconds_to_seconds,
         model_preparation_plan, reset_hotkey_before_drop, spawn_model_preparation_worker_with,
-        status_name, wait_for_smoke_child, AssignmentTracker, DeferredTapState,
-        MicrophonePermissionRuntime, ModelPreparationPlan, ModelPreparationTask, PasteFlow,
-        PasteFlowBoundary, PasteInsertion, RuntimePreferences, TapState, TimerKind, EVENT_DRAIN_MS,
+        spawn_permission_migration_worker_with, status_name, wait_for_smoke_child,
+        AssignmentTracker, DeferredTapState, MicrophonePermissionRuntime, ModelPreparationPlan,
+        ModelPreparationTask, PasteFlow, PasteFlowBoundary, PasteInsertion,
+        PermissionMigrationTask, RuntimePreferences, TapState, TimerKind, EVENT_DRAIN_MS,
         PERMISSION_POLL_MS,
     };
     use crate::audio::AudioError;
@@ -1456,6 +1600,10 @@ mod tests {
     use crate::output_preferences::{
         OutputPreferenceController, OutputPreferenceError, OutputPreferenceRepository,
         RawOutputPreferenceStore,
+    };
+    use crate::permission_migration::{
+        PermissionMigrationError, PermissionMigrationRunError, PermissionMigrationSuccess,
+        TccService,
     };
     use crate::permissions::{MicrophoneAuthorization, MicrophonePermissionBoundary};
     use crate::preferences::{
@@ -1485,15 +1633,18 @@ mod tests {
     }
 
     #[test]
-    fn model_preparation_plan_never_loads_asr_or_starts_permissions_on_failure() {
+    fn model_preparation_success_only_starts_permission_migration() {
         let failed = model_preparation_plan(Err(ModelStoreError::RepairRequired));
         assert!(matches!(failed, ModelPreparationPlan::Failed(_)));
-        assert!(!failed.starts_permission_setup());
+        assert!(!failed.starts_permission_migration());
 
         let (_temp, verified) = verified_model_fixture();
         let ready = model_preparation_plan(Ok(verified));
-        assert!(matches!(ready, ModelPreparationPlan::LoadVerified(_)));
-        assert!(ready.starts_permission_setup());
+        assert!(matches!(
+            ready,
+            ModelPreparationPlan::BeginPermissionMigration(_)
+        ));
+        assert!(ready.starts_permission_migration());
     }
 
     #[test]
@@ -1544,6 +1695,63 @@ mod tests {
         assert!(
             returned_before_release,
             "dropping a blocked model preparation task waited for its worker"
+        );
+    }
+
+    #[test]
+    fn permission_migration_worker_runs_off_appkit_and_returns_paths_on_failure() {
+        let caller = thread::current().id();
+        let (_temp, verified) = verified_model_fixture();
+        let expected_encoder = verified.paths().encoder().to_owned();
+        let (thread_sender, thread_receiver) = std::sync::mpsc::channel();
+        let (events, worker) =
+            spawn_permission_migration_worker_with(verified.into_paths(), move || {
+                thread_sender.send(thread::current().id()).unwrap();
+                Err(PermissionMigrationRunError::Migration(
+                    PermissionMigrationError::ResetFailed(TccService::ListenEvent),
+                ))
+            });
+
+        assert_ne!(thread_receiver.recv().unwrap(), caller);
+        let result = events.recv().unwrap();
+        assert_eq!(result.paths.encoder(), expected_encoder);
+        assert!(result.migration.is_err());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_permission_migration_task_does_not_wait_for_blocked_worker() {
+        let (_temp, verified) = verified_model_fixture();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let (events, worker) =
+            spawn_permission_migration_worker_with(verified.into_paths(), move || {
+                started_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                finished_sender.send(()).unwrap();
+                Ok(PermissionMigrationSuccess::DevelopmentBypass)
+            });
+        started_receiver.recv().unwrap();
+        let task = PermissionMigrationTask::new(events, worker);
+        let (dropped_sender, dropped_receiver) = std::sync::mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(task);
+            dropped_sender.send(()).unwrap();
+        });
+
+        let returned_before_release = dropped_receiver
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok();
+        release_sender.send(()).unwrap();
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        dropper.join().unwrap();
+
+        assert!(
+            returned_before_release,
+            "dropping a blocked permission migration task waited for its worker"
         );
     }
 

@@ -204,6 +204,7 @@ struct StatusActionProjection {
 enum StatusActionKind {
     Permission(PermissionKind),
     RetryModelPreparation,
+    RetryPermissionMigration,
 }
 
 impl StatusActionProjection {
@@ -220,6 +221,12 @@ impl StatusActionProjection {
                 visible: true,
                 enabled: true,
                 kind: Some(StatusActionKind::RetryModelPreparation),
+            },
+            AppStatus::PermissionResetFailed => Self {
+                title: "Повторить сброс разрешений",
+                visible: true,
+                enabled: true,
+                kind: Some(StatusActionKind::RetryPermissionMigration),
             },
             _ => Self {
                 title: "Открыть настройки…",
@@ -248,6 +255,18 @@ impl MenuProjection {
             ),
             AppStatus::ModelPreparationFailed => (
                 "● Ошибка подготовки модели".into(),
+                "exclamationmark.triangle.fill",
+                false,
+                SymbolStyle::HierarchicalRed,
+            ),
+            AppStatus::ResettingPermissions => (
+                "● Сброс разрешений…".into(),
+                "hourglass",
+                false,
+                SymbolStyle::Template,
+            ),
+            AppStatus::PermissionResetFailed => (
+                "● Не удалось сбросить разрешения".into(),
                 "exclamationmark.triangle.fill",
                 false,
                 SymbolStyle::HierarchicalRed,
@@ -352,6 +371,7 @@ fn toggled_append_space(selected: bool) -> (bool, MenuCommand) {
 pub(crate) enum MenuAction {
     OpenPermission(PermissionKind),
     RetryModelPreparation,
+    RetryPermissionMigration,
 }
 
 #[derive(Clone)]
@@ -489,6 +509,9 @@ declare_class!(
                 }
                 Some(StatusActionKind::RetryModelPreparation) => {
                     MenuAction::RetryModelPreparation
+                }
+                Some(StatusActionKind::RetryPermissionMigration) => {
+                    MenuAction::RetryPermissionMigration
                 }
                 None => return,
             };
@@ -1235,6 +1258,37 @@ mod tests {
             assert!(action.enabled);
             assert_eq!(action.kind, Some(StatusActionKind::RetryModelPreparation));
         }
+    }
+
+    #[test]
+    fn permission_migration_has_factual_status_and_one_targeted_retry() {
+        assert_eq!(
+            MenuProjection::from_status(&AppStatus::ResettingPermissions),
+            MenuProjection {
+                title: "● Сброс разрешений…".into(),
+                symbol: "hourglass",
+                pulse: false,
+                style: SymbolStyle::Template,
+            }
+        );
+        assert_eq!(
+            MenuProjection::from_status(&AppStatus::PermissionResetFailed),
+            MenuProjection {
+                title: "● Не удалось сбросить разрешения".into(),
+                symbol: "exclamationmark.triangle.fill",
+                pulse: false,
+                style: SymbolStyle::HierarchicalRed,
+            }
+        );
+        assert_eq!(
+            StatusActionProjection::from_status(&AppStatus::PermissionResetFailed),
+            StatusActionProjection {
+                title: "Повторить сброс разрешений",
+                visible: true,
+                enabled: true,
+                kind: Some(StatusActionKind::RetryPermissionMigration),
+            }
+        );
     }
 
     #[test]
