@@ -16,7 +16,7 @@ objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = [
   "NSArray", "NSData", "NSString", "NSURL", "NSUserDefaults", "NSTimer", "NSRunLoop", "NSThread", "NSProcessInfo",
 ] }
-objc2-app-kit = { version = "0.2", features = [
+objc2-app-kit = { version = "0.3", features = [
   "NSApplication", "NSStatusBar", "NSStatusItem", "NSStatusBarButton",
   "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSWorkspace", "NSImage",
   "NSButton", "NSButtonCell", "NSControl", "NSResponder", "NSView", "NSCell",
