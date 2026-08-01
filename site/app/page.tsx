@@ -1,7 +1,7 @@
 const DOWNLOAD_URL =
-  "https://github.com/Torin2023/PTT2me/releases/download/v1.0.5/PTT2me-1.0.5-macos-arm64.dmg";
+  "https://github.com/Torin2023/PTT2me/releases/download/v1.1.0/PTT2me-1.1.0-full-macos-arm64.dmg";
 const REPOSITORY_URL = "https://github.com/Torin2023/PTT2me";
-const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.0.5`;
+const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.1.0`;
 
 const steps = [
   ["01", "Удерживайте", "Нажмите и удерживайте выбранную клавишу."],
@@ -41,7 +41,7 @@ export default function Home() {
           <p className="eyebrow">
             <span className="eyebrow-line" aria-hidden="true" />
             Локальная диктовка для macOS
-            <span className="preview-badge">Preview 1.0.5</span>
+            <span className="preview-badge">Preview 1.1.0</span>
           </p>
           <h1>
             Говорите —
@@ -55,7 +55,7 @@ export default function Home() {
           </p>
           <div className="hero-actions">
             <a className="button" href={DOWNLOAD_URL}>
-              Скачать PTT2me 1.0.5
+              Скачать PTT2me 1.1.0
               <span aria-hidden="true">↘</span>
             </a>
             <a className="text-link" href={REPOSITORY_URL}>
@@ -64,7 +64,7 @@ export default function Home() {
             </a>
           </div>
           <p className="compatibility">
-            Apple Silicon <i /> macOS 13+ <i /> 182 МБ <i /> без облака
+            Apple Silicon <i /> macOS 13+ <i /> 183 МБ <i /> без облака
           </p>
         </div>
 
@@ -222,13 +222,13 @@ export default function Home() {
 
       <section className="section updates-section" id="updates">
         <div className="section-heading">
-          <p className="eyebrow">После публикации PTT2me 1.1.0</p>
+          <p className="eyebrow">PTT2me 1.1.0 опубликована</p>
           <div>
             <h2>Проверка обновлений с ручной установкой.</h2>
             <p className="release-boundary">
-              Этот раздел описывает поведение PTT2me 1.1.0 после публикации
-              релиза. Доступная сейчас Preview 1.0.5 не проверяет обновления
-              автоматически.
+              Установку 1.0.5 нужно один раз заменить вручную из Full DMG.
+              После этого PTT2me сможет предлагать следующие подписанные
+              обновления.
             </p>
           </div>
         </div>
@@ -339,11 +339,11 @@ export default function Home() {
 
       <section className="section install" id="install">
         <div className="install-copy">
-          <p className="eyebrow">PTT2me Preview 1.0.5</p>
+          <p className="eyebrow">PTT2me Preview 1.1.0</p>
           <h2>Готовы говорить?</h2>
           <p>Для Mac с Apple Silicon и macOS 13 Ventura или новее.</p>
           <a className="button" href={DOWNLOAD_URL}>
-            Скачать Preview DMG · 182 МБ
+            Скачать Full DMG · 183 МБ
             <span aria-hidden="true">↘</span>
           </a>
         </div>
@@ -387,11 +387,11 @@ export default function Home() {
         <p>
           SHA-256{" "}
           <code>
-            d89a1767edfb2c010ba98ffc59f6c35f8e346958c492b3ed33b4596f303a7c8c
+            f8cc1cfc92634aceaf35e1c887d86d6194a4f1f5dc16ebd47b0654725f38b0d0
           </code>
         </p>
         <div>
-          <a href={RELEASE_URL}>Preview-релиз 1.0.5</a>
+          <a href={RELEASE_URL}>Preview-релиз 1.1.0</a>
           <a href={REPOSITORY_URL}>GitHub</a>
         </div>
       </footer>

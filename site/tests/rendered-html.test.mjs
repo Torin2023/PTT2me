@@ -25,7 +25,7 @@ async function render(path = "/") {
   );
 }
 
-test("renders the current PTT2me v1.0.5 product contract", async () => {
+test("renders the current PTT2me v1.1.0 product contract", async () => {
   const response = await render();
   assert.equal(response.status, 200);
 
@@ -38,19 +38,19 @@ test("renders the current PTT2me v1.0.5 product contract", async () => {
   assert.match(html, /Говорите —[\s\S]*текст уже там/);
   assert.match(html, /Без облака/);
   assert.match(html, /Микрофон/);
-  assert.match(html, /Preview 1\.0\.5/);
-  assert.match(html, /class="preview-badge">Preview 1\.0\.5<\/span>/);
+  assert.match(html, /Preview 1\.1\.0/);
+  assert.match(html, /class="preview-badge">Preview 1\.1\.0<\/span>/);
   assert.match(
     html,
-    /https:\/\/github\.com\/Torin2023\/PTT2me\/releases\/download\/v1\.0\.5\/PTT2me-1\.0\.5-macos-arm64\.dmg/,
+    /https:\/\/github\.com\/Torin2023\/PTT2me\/releases\/download\/v1\.1\.0\/PTT2me-1\.1\.0-full-macos-arm64\.dmg/,
   );
   assert.match(
     html,
-    /https:\/\/github\.com\/Torin2023\/PTT2me\/releases\/tag\/v1\.0\.5/,
+    /https:\/\/github\.com\/Torin2023\/PTT2me\/releases\/tag\/v1\.1\.0/,
   );
   assert.match(
     html,
-    /d89a1767edfb2c010ba98ffc59f6c35f8e346958c492b3ed33b4596f303a7c8c/,
+    /f8cc1cfc92634aceaf35e1c887d86d6194a4f1f5dc16ebd47b0654725f38b0d0/,
   );
   assert.match(html, /поле, где находится курсор/);
   assert.match(html, /Назначьте удобную клавишу/);
@@ -66,7 +66,7 @@ test("renders the current PTT2me v1.0.5 product contract", async () => {
   );
   assert.doesNotMatch(
     html,
-    /releases\/download\/v1\.0\.5\/[^"']+\.sha256/,
+    /releases\/download\/v1\.1\.0\/[^"']+\.sha256/,
   );
   assert.doesNotMatch(
     html,
@@ -74,12 +74,13 @@ test("renders the current PTT2me v1.0.5 product contract", async () => {
   );
 });
 
-test("documents the 1.1.0 update flow without replacing the v1.0.5 download", async () => {
+test("documents the published 1.1.0 update flow", async () => {
   const response = await render();
   assert.equal(response.status, 200);
 
   const html = await response.text();
-  assert.match(html, /После публикации PTT2me 1\.1\.0/);
+  assert.match(html, /PTT2me 1\.1\.0 опубликована/);
+  assert.match(html, /Установку 1\.0\.5 нужно один раз заменить вручную/);
   assert.match(html, /через 60 секунд после запуска/);
   assert.match(html, /не чаще одного раза в 24 часа/);
   assert.match(html, /Проверить обновления…/);
@@ -108,11 +109,7 @@ test("documents the 1.1.0 update flow without replacing the v1.0.5 download", as
 
   assert.doesNotMatch(html, /tccutil/i);
   assert.doesNotMatch(html, /application_update/);
-  assert.doesNotMatch(
-    html,
-    /releases\/download\/v1\.1\.0|releases\/tag\/v1\.1\.0/,
-  );
-  assert.doesNotMatch(html, /Скачать PTT2me 1\.1\.0/);
+  assert.match(html, /Скачать PTT2me 1\.1\.0/);
 });
 
 test("removes the disposable starter preview", async () => {
