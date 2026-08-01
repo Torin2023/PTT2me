@@ -86,6 +86,21 @@ impl VerifiedDownload {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenVerifiedDmg {
+    path: PathBuf,
+}
+
+impl OpenVerifiedDmg {
+    fn from_verified_path(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryAction {
     ManualCheck,
@@ -98,6 +113,19 @@ pub enum OfferDisposition {
     Available,
     DivergedLocal,
     RepairRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryContext {
+    ModelRecheck {
+        release: Box<VerifiedRelease>,
+        artifact: SelectedArtifact,
+        disposition: OfferDisposition,
+    },
+    Download {
+        release: Box<VerifiedRelease>,
+        artifact: SelectedArtifact,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,9 +169,22 @@ pub enum UpdaterState {
         artifact: SelectedArtifact,
         path: PathBuf,
     },
+    VerifyingForOpen {
+        release: Box<VerifiedRelease>,
+        artifact: SelectedArtifact,
+        path: PathBuf,
+        operation_id: OperationId,
+    },
+    Opening {
+        release: Box<VerifiedRelease>,
+        artifact: SelectedArtifact,
+        path: PathBuf,
+        operation_id: OperationId,
+    },
     Failed {
         failure: UpdateFailure,
         retry: RetryAction,
+        context: Option<RetryContext>,
     },
 }
 
@@ -164,9 +205,15 @@ pub enum UpdaterCommand {
         release: Box<VerifiedRelease>,
         artifact: SelectedArtifact,
     },
+    VerifyBeforeOpen {
+        operation_id: OperationId,
+        release: Box<VerifiedRelease>,
+        artifact: SelectedArtifact,
+        path: PathBuf,
+    },
     OpenDmg {
         operation_id: OperationId,
-        path: PathBuf,
+        dmg: OpenVerifiedDmg,
     },
     RequestOrderlyQuit,
 }
@@ -212,7 +259,12 @@ pub enum UpdaterEvent {
         operation_id: OperationId,
         failure: UpdateFailure,
     },
+    RetryRequested,
     OpenRequested,
+    OpenVerificationCompleted {
+        operation_id: OperationId,
+        result: Result<OpenVerifiedDmg, UpdateFailure>,
+    },
     OpenCompleted {
         operation_id: OperationId,
         result: Result<(), UpdateFailure>,
@@ -226,6 +278,7 @@ pub struct Updater {
     state: UpdaterState,
     next_operation_id: u64,
     active_operation: Option<OperationId>,
+    automatic_check_at: Option<u64>,
     last_open_failure: Option<UpdateFailure>,
 }
 
@@ -242,6 +295,7 @@ impl Updater {
             state: UpdaterState::Idle,
             next_operation_id: 1,
             active_operation: None,
+            automatic_check_at: None,
             last_open_failure: None,
         }
     }
@@ -260,24 +314,28 @@ impl Updater {
                 launch_at,
                 now,
                 last_attempt,
-            } => vec![UpdaterCommand::ScheduleAutomaticCheck(
-                next_automatic_check_at(launch_at, now, last_attempt),
-            )],
+            } => {
+                let deadline = next_automatic_check_at(launch_at, now, last_attempt);
+                self.automatic_check_at = Some(deadline);
+                vec![UpdaterCommand::ScheduleAutomaticCheck(deadline)]
+            }
             UpdaterEvent::AutomaticCheckDue {
                 launch_at,
                 now,
                 last_attempt,
             } => {
+                let deadline = *self
+                    .automatic_check_at
+                    .get_or_insert_with(|| next_automatic_check_at(launch_at, now, last_attempt));
+                if now < deadline {
+                    return vec![UpdaterCommand::ScheduleAutomaticCheck(deadline)];
+                }
                 if !self.can_start_operation() {
-                    return Vec::new();
+                    let retry_at = now.saturating_add(FIRST_AUTOMATIC_CHECK_DELAY_SECONDS);
+                    self.automatic_check_at = Some(retry_at);
+                    return vec![UpdaterCommand::ScheduleAutomaticCheck(retry_at)];
                 }
-                if automatic_check_due(now, last_attempt) {
-                    self.start_check(CheckReason::Automatic, now)
-                } else {
-                    vec![UpdaterCommand::ScheduleAutomaticCheck(
-                        next_automatic_check_at(launch_at, now, last_attempt),
-                    )]
-                }
+                self.start_check(CheckReason::Automatic, now)
             }
             UpdaterEvent::ManualCheckRequested { now } => {
                 if !self.can_start_operation() {
@@ -311,7 +369,12 @@ impl Updater {
                 operation_id,
                 failure,
             } => self.download_failed(operation_id, failure),
+            UpdaterEvent::RetryRequested => self.retry_failed_operation(),
             UpdaterEvent::OpenRequested => self.request_open(),
+            UpdaterEvent::OpenVerificationCompleted {
+                operation_id,
+                result,
+            } => self.open_verification_completed(operation_id, result),
             UpdaterEvent::OpenCompleted {
                 operation_id,
                 result,
@@ -340,15 +403,15 @@ impl Updater {
 
     fn start_check(&mut self, reason: CheckReason, now: u64) -> Vec<UpdaterCommand> {
         let operation_id = self.allocate_operation();
+        let next_attempt = now.saturating_add(AUTOMATIC_CHECK_INTERVAL_SECONDS);
+        self.automatic_check_at = Some(next_attempt);
         self.state = UpdaterState::Checking {
             reason,
             operation_id,
         };
         vec![
             UpdaterCommand::PersistLastAttempt(now),
-            UpdaterCommand::ScheduleAutomaticCheck(
-                now.saturating_add(AUTOMATIC_CHECK_INTERVAL_SECONDS),
-            ),
+            UpdaterCommand::ScheduleAutomaticCheck(next_attempt),
             UpdaterCommand::FetchManifest {
                 operation_id,
                 reason,
@@ -379,6 +442,7 @@ impl Updater {
                     UpdaterState::Failed {
                         failure: UpdateFailure::UntrustedManifest,
                         retry: RetryAction::ManualCheck,
+                        context: None,
                     }
                 } else {
                     UpdaterState::Idle
@@ -409,6 +473,7 @@ impl Updater {
             UpdaterState::Failed {
                 failure,
                 retry: RetryAction::ManualCheck,
+                context: None,
             }
         };
         Vec::new()
@@ -522,9 +587,11 @@ impl Updater {
         failure: UpdateFailure,
     ) -> Vec<UpdaterCommand> {
         let UpdaterState::RecheckingModel {
+            release,
+            artifact,
+            disposition,
             operation_id: expected,
-            ..
-        } = self.state
+        } = self.state.clone()
         else {
             return Vec::new();
         };
@@ -534,6 +601,11 @@ impl Updater {
         self.state = UpdaterState::Failed {
             failure,
             retry: RetryAction::ModelRecheck,
+            context: Some(RetryContext::ModelRecheck {
+                release,
+                artifact,
+                disposition,
+            }),
         };
         Vec::new()
     }
@@ -568,9 +640,10 @@ impl Updater {
         failure: UpdateFailure,
     ) -> Vec<UpdaterCommand> {
         let UpdaterState::Downloading {
+            release,
+            artifact,
             operation_id: expected,
-            ..
-        } = self.state
+        } = self.state.clone()
         else {
             return Vec::new();
         };
@@ -580,21 +653,131 @@ impl Updater {
         self.state = UpdaterState::Failed {
             failure,
             retry: RetryAction::Download,
+            context: Some(RetryContext::Download { release, artifact }),
         };
         Vec::new()
+    }
+
+    fn retry_failed_operation(&mut self) -> Vec<UpdaterCommand> {
+        if !self.can_start_operation() {
+            return Vec::new();
+        }
+        let UpdaterState::Failed {
+            retry,
+            context: Some(context),
+            ..
+        } = self.state.clone()
+        else {
+            return Vec::new();
+        };
+        match (retry, context) {
+            (
+                RetryAction::ModelRecheck,
+                RetryContext::ModelRecheck {
+                    release,
+                    artifact,
+                    disposition,
+                },
+            ) => {
+                let operation_id = self.allocate_operation();
+                let required_model = release.required_model.clone();
+                self.state = UpdaterState::RecheckingModel {
+                    release,
+                    artifact,
+                    disposition,
+                    operation_id,
+                };
+                vec![UpdaterCommand::RecheckModel {
+                    operation_id,
+                    required_model,
+                }]
+            }
+            (RetryAction::Download, RetryContext::Download { release, artifact }) => {
+                let operation_id = self.allocate_operation();
+                self.state = UpdaterState::Downloading {
+                    release: release.clone(),
+                    artifact: artifact.clone(),
+                    operation_id,
+                };
+                vec![UpdaterCommand::DownloadAndVerify {
+                    operation_id,
+                    release,
+                    artifact,
+                }]
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn request_open(&mut self) -> Vec<UpdaterCommand> {
         if !self.can_start_operation() {
             return Vec::new();
         }
-        let UpdaterState::ReadyToInstall { path, .. } = &self.state else {
+        let UpdaterState::ReadyToInstall {
+            release,
+            artifact,
+            path,
+        } = self.state.clone()
+        else {
             return Vec::new();
         };
-        let path = path.clone();
         let operation_id = self.allocate_operation();
         self.last_open_failure = None;
-        vec![UpdaterCommand::OpenDmg { operation_id, path }]
+        self.state = UpdaterState::VerifyingForOpen {
+            release: release.clone(),
+            artifact: artifact.clone(),
+            path: path.clone(),
+            operation_id,
+        };
+        vec![UpdaterCommand::VerifyBeforeOpen {
+            operation_id,
+            release,
+            artifact,
+            path,
+        }]
+    }
+
+    fn open_verification_completed(
+        &mut self,
+        operation_id: OperationId,
+        result: Result<OpenVerifiedDmg, UpdateFailure>,
+    ) -> Vec<UpdaterCommand> {
+        let UpdaterState::VerifyingForOpen {
+            release,
+            artifact,
+            path,
+            operation_id: expected,
+        } = self.state.clone()
+        else {
+            return Vec::new();
+        };
+        if expected != operation_id || !self.finish_operation(operation_id) {
+            return Vec::new();
+        }
+        let dmg = match result {
+            Ok(dmg) if dmg.path == path => dmg,
+            Ok(_) => {
+                self.state =
+                    failed_download_context(UpdateFailure::DigestMismatch, release, artifact);
+                return Vec::new();
+            }
+            Err(failure) => {
+                self.state = failed_download_context(failure, release, artifact);
+                return Vec::new();
+            }
+        };
+
+        let open_id = self.allocate_operation();
+        self.state = UpdaterState::Opening {
+            release,
+            artifact,
+            path,
+            operation_id: open_id,
+        };
+        vec![UpdaterCommand::OpenDmg {
+            operation_id: open_id,
+            dmg,
+        }]
     }
 
     fn open_completed(
@@ -602,15 +785,27 @@ impl Updater {
         operation_id: OperationId,
         result: Result<(), UpdateFailure>,
     ) -> Vec<UpdaterCommand> {
-        if !matches!(self.state, UpdaterState::ReadyToInstall { .. })
-            || !self.finish_operation(operation_id)
-        {
+        let UpdaterState::Opening {
+            release,
+            artifact,
+            path,
+            operation_id: expected,
+        } = self.state.clone()
+        else {
+            return Vec::new();
+        };
+        if expected != operation_id || !self.finish_operation(operation_id) {
             return Vec::new();
         }
         match result {
             Ok(()) => vec![UpdaterCommand::RequestOrderlyQuit],
             Err(failure) => {
                 self.last_open_failure = Some(failure);
+                self.state = UpdaterState::ReadyToInstall {
+                    release,
+                    artifact,
+                    path,
+                };
                 Vec::new()
             }
         }
@@ -690,8 +885,69 @@ fn project_offer_after_recheck(
     }
 }
 
+fn failed_download_context(
+    failure: UpdateFailure,
+    release: Box<VerifiedRelease>,
+    artifact: SelectedArtifact,
+) -> UpdaterState {
+    UpdaterState::Failed {
+        failure,
+        retry: RetryAction::Download,
+        context: Some(RetryContext::Download { release, artifact }),
+    }
+}
+
 // Artifact cache and worker boundaries. All production implementations reject
 // AppKit's main thread; Task 5 owns dispatching these synchronous boundaries.
+
+fn artifact_cache_paths(
+    cache_root: &Path,
+    release: &VerifiedRelease,
+    kind: ArtifactKind,
+) -> (PathBuf, PathBuf) {
+    let file_name = format!(
+        "PTT2me-{}-{}-{}-macos-arm64.dmg",
+        release.version,
+        release.build,
+        kind.cache_label()
+    );
+    let final_path = cache_root.join(&file_name);
+    let partial_path = cache_root.join(format!("{file_name}.part"));
+    (final_path, partial_path)
+}
+
+fn lookup_verified_download(
+    cache_root: &Path,
+    release: &VerifiedRelease,
+    kind: ArtifactKind,
+    artifact: &ArtifactDescriptor,
+) -> Result<Option<PathBuf>, UpdateFailure> {
+    if artifact.size == 0 || artifact.size > MAX_UPDATE_ARTIFACT_BYTES {
+        return Err(UpdateFailure::InvalidArtifactSize);
+    }
+    fs::create_dir_all(cache_root).map_err(|_| UpdateFailure::Storage)?;
+    let (final_path, partial_path) = artifact_cache_paths(cache_root, release, kind);
+    remove_stale_partial(&partial_path)?;
+
+    match fs::symlink_metadata(&final_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let cached = File::open(&final_path).map_err(|_| UpdateFailure::Storage)?;
+            if verify_artifact(cached, artifact).is_ok() {
+                Ok(Some(final_path))
+            } else {
+                fs::remove_file(&final_path).map_err(|_| UpdateFailure::Storage)?;
+                Ok(None)
+            }
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::remove_file(&final_path).map_err(|_| UpdateFailure::Storage)?;
+            Ok(None)
+        }
+        Ok(_) => Err(UpdateFailure::Storage),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(UpdateFailure::Storage),
+    }
+}
 
 pub fn cache_verified_download(
     cache_root: &Path,
@@ -721,36 +977,10 @@ fn cache_verified_download_with_promoter(
     content_length: Option<u64>,
     promote: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> Result<PathBuf, UpdateFailure> {
-    if artifact.size == 0 || artifact.size > MAX_UPDATE_ARTIFACT_BYTES {
-        return Err(UpdateFailure::InvalidArtifactSize);
+    if let Some(cached) = lookup_verified_download(cache_root, release, kind, artifact)? {
+        return Ok(cached);
     }
-    fs::create_dir_all(cache_root).map_err(|_| UpdateFailure::Storage)?;
-    let file_name = format!(
-        "PTT2me-{}-{}-{}-macos-arm64.dmg",
-        release.version,
-        release.build,
-        kind.cache_label()
-    );
-    let final_path = cache_root.join(&file_name);
-    let partial_path = cache_root.join(format!("{file_name}.part"));
-
-    match fs::symlink_metadata(&final_path) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            let cached = File::open(&final_path).map_err(|_| UpdateFailure::Storage)?;
-            if verify_artifact(cached, artifact).is_ok() {
-                return Ok(final_path);
-            }
-            fs::remove_file(&final_path).map_err(|_| UpdateFailure::Storage)?;
-        }
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            fs::remove_file(&final_path).map_err(|_| UpdateFailure::Storage)?;
-        }
-        Ok(_) => return Err(UpdateFailure::Storage),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return Err(UpdateFailure::Storage),
-    }
-
-    remove_stale_partial(&partial_path)?;
+    let (final_path, partial_path) = artifact_cache_paths(cache_root, release, kind);
 
     if let Some(length) = content_length {
         if length != artifact.size {
@@ -835,6 +1065,13 @@ pub trait UpdateFetch: Send + Sync {
 }
 
 pub trait UpdateStorage: Send + Sync {
+    fn lookup_verified(
+        &self,
+        release: &VerifiedRelease,
+        kind: ArtifactKind,
+        artifact: &ArtifactDescriptor,
+    ) -> Result<Option<PathBuf>, UpdateFailure>;
+
     fn store_verified(
         &self,
         release: &VerifiedRelease,
@@ -852,7 +1089,7 @@ pub trait UpdateClock: Send + Sync {
 }
 
 pub trait DmgOpener: Send + Sync {
-    fn open_dmg(&self, path: &Path) -> Result<(), UpdateFailure>;
+    fn open_dmg(&self, dmg: &OpenVerifiedDmg) -> Result<(), UpdateFailure>;
 }
 
 pub trait QuarantineChecker: Send + Sync {
@@ -885,6 +1122,9 @@ where
         kind: ArtifactKind,
         artifact: &ArtifactDescriptor,
     ) -> Result<VerifiedDownload, UpdateFailure> {
+        if let Some(path) = self.storage.lookup_verified(release, kind, artifact)? {
+            return self.finish_download(path);
+        }
         let mut response = self.fetch.fetch_artifact(artifact)?;
         let path = self.storage.store_verified(
             release,
@@ -893,6 +1133,36 @@ where
             response.reader.as_mut(),
             response.content_length,
         )?;
+        self.finish_download(path)
+    }
+
+    pub fn verify_for_open(
+        &self,
+        release: &VerifiedRelease,
+        kind: ArtifactKind,
+        artifact: &ArtifactDescriptor,
+        expected_path: &Path,
+    ) -> Result<OpenVerifiedDmg, UpdateFailure> {
+        let Some(path) = self.storage.lookup_verified(release, kind, artifact)? else {
+            return Err(UpdateFailure::DigestMismatch);
+        };
+        if path != expected_path {
+            return Err(UpdateFailure::DigestMismatch);
+        }
+        match self.quarantine.has_quarantine(&path) {
+            Ok(true) => Ok(OpenVerifiedDmg::from_verified_path(path)),
+            Ok(false) => {
+                self.storage.discard(&path)?;
+                Err(UpdateFailure::QuarantineMissing)
+            }
+            Err(failure) => {
+                let _ = self.storage.discard(&path);
+                Err(failure)
+            }
+        }
+    }
+
+    fn finish_download(&self, path: PathBuf) -> Result<VerifiedDownload, UpdateFailure> {
         match self.quarantine.has_quarantine(&path) {
             Ok(true) => Ok(VerifiedDownload::from_verified_path(path)),
             Ok(false) => {
@@ -918,6 +1188,16 @@ impl FileUpdateStorage {
 }
 
 impl UpdateStorage for FileUpdateStorage {
+    fn lookup_verified(
+        &self,
+        release: &VerifiedRelease,
+        kind: ArtifactKind,
+        artifact: &ArtifactDescriptor,
+    ) -> Result<Option<PathBuf>, UpdateFailure> {
+        ensure_background_thread()?;
+        lookup_verified_download(&self.cache_root, release, kind, artifact)
+    }
+
     fn store_verified(
         &self,
         release: &VerifiedRelease,
@@ -1142,9 +1422,9 @@ impl QuarantineChecker for MacOsQuarantineChecker {
 pub struct MacOsWorkspaceOpener;
 
 impl DmgOpener for MacOsWorkspaceOpener {
-    fn open_dmg(&self, path: &Path) -> Result<(), UpdateFailure> {
+    fn open_dmg(&self, dmg: &OpenVerifiedDmg) -> Result<(), UpdateFailure> {
         ensure_background_thread()?;
-        let path = path.to_str().ok_or(UpdateFailure::OpenDmg)?;
+        let path = dmg.path().to_str().ok_or(UpdateFailure::OpenDmg)?;
         let path = NSString::from_str(path);
         let url = unsafe { NSURL::fileURLWithPath(&path) };
         if unsafe { NSWorkspace::sharedWorkspace().openURL(&url) } {
