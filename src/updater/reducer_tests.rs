@@ -188,6 +188,55 @@ fn launch_cache_is_reverified_silently_without_recording_a_network_attempt() {
 }
 
 #[test]
+fn automatic_network_failure_restores_the_verified_cached_offer() {
+    let mut updater = updater();
+    let (bytes, _) = manifest(
+        "1.0.6",
+        202608011200,
+        "0123456789abcdef0123456789abcdef01234567",
+        "13.0",
+    );
+    let cache_operation_id = match updater
+        .handle(UpdaterEvent::Launched {
+            launch_at: 1_000,
+            now: 1_000,
+            last_attempt: None,
+        })
+        .as_slice()
+    {
+        [_, UpdaterCommand::LoadCachedManifest { operation_id }] => *operation_id,
+        unexpected => panic!("unexpected launch commands: {unexpected:?}"),
+    };
+    updater.handle(UpdaterEvent::CachedManifestReceived {
+        operation_id: cache_operation_id,
+        bytes,
+        model: ModelAvailability::Missing,
+    });
+    let cached_offer = updater.state().clone();
+    assert!(matches!(cached_offer, UpdaterState::Available { .. }));
+
+    let commands = updater.handle(UpdaterEvent::AutomaticCheckDue {
+        launch_at: 1_000,
+        now: 1_060,
+        last_attempt: None,
+    });
+    let operation_id = match commands.as_slice() {
+        [UpdaterCommand::ScheduleAutomaticCheck(87_460), UpdaterCommand::PersistLastAttempt { operation_id, .. }, UpdaterCommand::FetchManifest {
+            operation_id: fetch_id,
+            reason: CheckReason::Automatic,
+        }] if operation_id == fetch_id => *operation_id,
+        unexpected => panic!("unexpected automatic commands: {unexpected:?}"),
+    };
+
+    updater.handle(UpdaterEvent::ManifestFailed {
+        operation_id,
+        failure: UpdateFailure::Network,
+    });
+
+    assert_eq!(updater.state(), &cached_offer);
+}
+
+#[test]
 fn invalid_cached_envelope_stays_silent_and_late_cache_cannot_replace_manual_check() {
     let mut invalid = updater();
     let cache_id = match invalid

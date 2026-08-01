@@ -276,6 +276,7 @@ pub struct Updater {
     active_operation: Option<OperationId>,
     automatic_check_at: Option<u64>,
     pending_cache_operation: Option<OperationId>,
+    automatic_fallback: Option<UpdaterState>,
     last_open_failure: Option<UpdateFailure>,
 }
 
@@ -294,6 +295,7 @@ impl Updater {
             active_operation: None,
             automatic_check_at: None,
             pending_cache_operation: None,
+            automatic_fallback: None,
             last_open_failure: None,
         }
     }
@@ -415,6 +417,11 @@ impl Updater {
 
     fn start_check(&mut self, reason: CheckReason, now: u64) -> Vec<UpdaterCommand> {
         self.pending_cache_operation = None;
+        if reason == CheckReason::Automatic {
+            self.automatic_fallback = Some(self.state.clone());
+        } else {
+            self.automatic_fallback = None;
+        }
         let operation_id = self.allocate_operation();
         let next_attempt = now.saturating_add(AUTOMATIC_CHECK_INTERVAL_SECONDS);
         self.automatic_check_at = Some(next_attempt);
@@ -468,15 +475,15 @@ impl Updater {
         if expected != operation_id || !self.finish_operation(operation_id) {
             return Vec::new();
         }
-        self.state = if reason == CheckReason::Manual {
-            UpdaterState::Failed {
+        if reason == CheckReason::Automatic {
+            self.restore_automatic_fallback();
+        } else {
+            self.state = UpdaterState::Failed {
                 failure: UpdateFailure::Storage,
                 retry: RetryAction::ManualCheck,
                 context: None,
-            }
-        } else {
-            UpdaterState::Idle
-        };
+            };
+        }
         Vec::new()
     }
 
@@ -498,21 +505,22 @@ impl Updater {
         }
         match verify_envelope(bytes, &self.public_key) {
             Ok(release) => {
+                self.automatic_fallback = None;
                 self.project_release(release, model, reason);
                 return vec![UpdaterCommand::StoreVerifiedManifest {
                     bytes: bytes.to_vec(),
                 }];
             }
             Err(_) => {
-                self.state = if reason == CheckReason::Manual {
-                    UpdaterState::Failed {
+                if reason == CheckReason::Automatic {
+                    self.restore_automatic_fallback();
+                } else {
+                    self.state = UpdaterState::Failed {
                         failure: UpdateFailure::UntrustedManifest,
                         retry: RetryAction::ManualCheck,
                         context: None,
-                    }
-                } else {
-                    UpdaterState::Idle
-                };
+                    };
+                }
             }
         }
         Vec::new()
@@ -533,16 +541,20 @@ impl Updater {
         if expected != operation_id || !self.finish_operation(operation_id) {
             return Vec::new();
         }
-        self.state = if reason == CheckReason::Automatic {
-            UpdaterState::Idle
+        if reason == CheckReason::Automatic {
+            self.restore_automatic_fallback();
         } else {
-            UpdaterState::Failed {
+            self.state = UpdaterState::Failed {
                 failure,
                 retry: RetryAction::ManualCheck,
                 context: None,
-            }
-        };
+            };
+        }
         Vec::new()
+    }
+
+    fn restore_automatic_fallback(&mut self) {
+        self.state = self.automatic_fallback.take().unwrap_or(UpdaterState::Idle);
     }
 
     fn project_release(
