@@ -7,7 +7,7 @@ description = "Minimal offline GigaAM v3 push-to-talk for macOS"
 [dependencies]
 base64 = "0.22"
 block2 = "0.5"
-cpal = "0.15"
+cpal = "0.18"
 core-foundation = "0.10"
 core-graphics = "0.24"
 ed25519-dalek = "2"
