@@ -26,7 +26,7 @@ rtrb = "0.3.4"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
