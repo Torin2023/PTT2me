@@ -2,21 +2,23 @@
 
 PTT2me is a minimal, fully local macOS menu-bar app: hold Fn/Globe, speak,
 release the key, and the recognized Russian text is inserted at the cursor's
-current location. Recognition uses the bundled GigaAM v3 model. Insertion
-prefers the focused Accessibility text field and preserves the previous
-pasteboard whenever compatibility requires Command-V fallback.
+current location. Recognition uses one fixed GigaAM v3 model. A Full build
+contains that model for an offline first launch, then keeps the verified copy
+outside the application bundle so later model-free Update builds can reuse it.
+Insertion prefers the focused Accessibility text field and preserves the
+previous pasteboard whenever compatibility requires Command-V fallback.
 
 ## Requirements and workflow
 
 - Apple Silicon (`arm64`) Mac
 - macOS 13 Ventura or newer
 
-PTT2me loads its fixed model at startup. When the status becomes `Готово`,
-hold Fn/Globe while speaking and release it. Fn/Globe and a 500 ms hold
-threshold are the default settings. Recording begins immediately when the
-trigger is pressed; a hold that reaches the selected threshold is recognized
-on release. The app keeps recording for another 180 ms, recognizes the
-captured phrase, and inserts a
+PTT2me verifies and prepares its fixed model at startup. When the status
+becomes `Готово`, hold Fn/Globe while speaking and release it. Fn/Globe and a
+500 ms hold threshold are the default settings. Recording begins immediately
+when the trigger is pressed; a hold that reaches the selected threshold is
+recognized on release. The app keeps recording for another 180 ms, recognizes
+the captured phrase, and inserts a
 non-empty result into whichever editable field owns the cursor at that moment.
 A capture ends automatically after 25 seconds.
 
@@ -51,6 +53,10 @@ PTT2me 1.0.5
 Выйти
 ```
 
+This menu snapshot describes the currently published Preview 1.0.5. The
+updater rows described below ship only with PTT2me 1.1.0 after that release is
+published.
+
 The status and version rows are informational. While a permission is missing,
 `Открыть настройки…` opens its exact Privacy & Security pane and can be used
 repeatedly.
@@ -71,6 +77,15 @@ punctuation is never added, removed, or rewritten by PTT2me.
 
 `Выйти` terminates the app.
 
+## Published release
+
+The public download remains Preview 1.0.5:
+[PTT2me-1.0.5-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.0.5/PTT2me-1.0.5-macos-arm64.dmg)
+(182 MB, SHA-256
+`d89a1767edfb2c010ba98ffc59f6c35f8e346958c492b3ed33b4596f303a7c8c`).
+Preview 1.0.5 does not check for updates. No 1.1.0 download URL, size,
+checksum, or release page is published yet.
+
 ## Build
 
 Place these four non-empty build assets in
@@ -86,12 +101,17 @@ tokens.txt
 Then run:
 
 ```bash
-scripts/build-app.sh
+scripts/build-app.sh \
+  --variant full \
+  --model-manifest models/manifests/gigaam-v3-rnnt-v1.json \
+  --model-source vendor/models/gigaam-v3-rnnt
 ```
 
 The script builds only `aarch64-apple-darwin`, obtains the two native runtime
-libraries from the Cargo release output, and creates the self-contained
-`dist/PTT2me.app`.
+libraries from the Cargo release output, verifies the exact committed model
+manifest, and creates the self-contained Full app at `dist/PTT2me.app`.
+The release coordinator creates the Update variant from the same compiled app
+and removes only `Contents/Resources/models`.
 
 ## Automated checks
 
@@ -108,80 +128,128 @@ cargo audit --deny warnings
 ```
 
 These checks compile and test the program; they do not download or substitute
-an ASR model. PTT2me has one fixed GigaAM v3 RNNT model, supplied as frozen
-build assets and embedded in the application bundle.
+an ASR model. Release builds consume the fixed GigaAM v3 RNNT files supplied
+locally at the release gate. Full contains them for bootstrap; Update does not.
 
-## Local DMG release
+## Release artifacts
 
-To rebuild the app and create a local Apple Silicon DMG, run:
+The controlled release command `scripts/build-release-artifacts.sh` creates
+both DMGs and their checksums from one clean Git commit:
 
-```bash
-scripts/build-dmg.sh
+```text
+PTT2me-X.Y.Z-full-macos-arm64.dmg
+PTT2me-X.Y.Z-update-macos-arm64.dmg
+PTT2me-X.Y.Z-signed-update-manifest.json
 ```
 
-The command creates `dist/PTT2me-1.0.5-macos-arm64.dmg` and its
-`.sha256` checksum. The image contains `PTT2me.app` and an `Applications`
-link for drag-and-drop installation. It uses ad-hoc signing and is not
-notarized for public distribution.
+Full and Update contain the same executable, frameworks, version, build,
+source commit, and update-verification public key. Full also contains the fixed
+model; Update contains no model. The product site and every fresh installation
+use Full only. Update is selected only inside an already installed PTT2me.
 
-Before each new release, explicitly bump the package version in `Cargo.toml`
-and synchronize `Cargo.lock` with Cargo. Rebuilding an existing release does
-not change its version automatically.
+The release coordinator requires an explicit stable version, 12-digit UTC
+build, exact clean `HEAD`, model source, committed model manifest, publication
+timestamp, and matching key pair. The private signing key must remain outside
+Git. The package version stays 1.0.5 during development and is changed once to
+exactly 1.1.0 at the final release gate.
 
-The release gate runs on a controlled Apple Silicon Mac where the four frozen
-model files have already been provisioned in `vendor/models/gigaam-v3-rnnt/`.
-No model is fetched at build or runtime. Before publishing a DMG:
+## Updating (PTT2me 1.1.0 after publication)
 
-1. Run `scripts/build-dmg.sh`; its bundle check initializes the model embedded
-   in the generated `PTT2me.app` and fails after 180 seconds instead of waiting
-   forever.
-2. Launch the built app in a normal macOS user session and verify the fixed
-   model reaches `Готово`.
-3. Put `CLIPBOARD-НЕ-ВСТАВЛЯТЬ` in the pasteboard and verify dictation in
-   ChatGPT, a native text view, HTML `input`, `textarea`, contenteditable,
-   Telegram, and Discord. The marker must never be inserted; the next manual
-   Command-V must still produce it.
-4. Verify rich text, an image, and a Finder file URL survive a fallback
-   insertion.
-5. Perform 20 short presses and 20 long holds with Fn/Globe and an assigned
-   ordinary trigger. Short presses must perform the configured macOS action
-   without ASR; long holds must run PTT without the short system action.
-6. Revoke each permission in turn and verify the corresponding status,
-   repeatable `Открыть настройки…` action, and return to `Готово`.
-7. Move the cursor to another editable field during recognition and verify the
-   result is inserted at its final location.
+This behavior starts only after PTT2me 1.1.0 is published. Preview 1.0.5
+cannot discover that release and must be replaced once with the published
+1.1.0 Full DMG.
+
+- The first automatic manifest request starts no earlier than 60 seconds after
+  launch. Later automatic requests run no more than once per 24 hours.
+  `Проверить обновления…` bypasses the interval.
+- The signed release record is requested from GitHub Pages without a user,
+  device, or telemetry identifier. The endpoint is
+  `https://torin2023.github.io/PTT2me/channels/stable.json`. A previously
+  verified record may be shown from cache after restart.
+- A check never downloads or installs a DMG. Download starts only when the user
+  chooses `Скачать обновление <version>…`; bytes come from GitHub Release and
+  are verified before use.
+- A fresh installation always uses Full. The running app selects the
+  model-free Update only after verifying the exact external model at
+  `~/Library/Application Support/PTT2me/models/gigaam-v3-rnnt-v1/`.
+  A missing, changed, or invalid model selects Full instead.
+- Replacing `PTT2me.app` does not remove the external model. Full provisions it
+  when needed; Update reuses it only after verification.
+
+To install an offered update:
+
+1. Choose `Скачать обновление <version>…`.
+2. When verification finishes, choose `Открыть DMG и выйти…`.
+3. Replace `PTT2me.app` in `/Applications` through Finder.
+4. If macOS blocks the ad-hoc-signed build, allow only PTT2me with
+   `Открыть всё равно` in Privacy & Security. Do not disable Gatekeeper.
+5. Launch the new build and grant Accessibility, Input Monitoring, and
+   Microphone again.
 
 ## Permissions and launch
 
 PTT2me requires exactly Microphone, Input Monitoring, and Accessibility
-permission. Build the app first, then use:
+permission. Starting with the published 1.1.0 build, launch ordering is fixed:
 
-```bash
-scripts/grant-and-run.sh
-scripts/grant-and-run.sh --open-panes
-scripts/grant-and-run.sh --reset
-```
+1. PTT2me verifies or provisions the external model.
+2. On the first usable launch of a new version/build/source-commit identity,
+   it automatically resets only its Accessibility, Input Monitoring, and
+   Microphone decisions.
+3. The menu shows `Сброс разрешений…` while this runs. A failure blocks
+   dictation and exposes the single targeted action
+   `Повторить сброс разрешений`.
+4. After a successful reset, grant the same three permissions again in System
+   Settings. `Открыть настройки…` opens the pane for the first missing
+   permission and can be used repeatedly.
 
-The default command preserves existing grants. `--open-panes` opens the three
-relevant System Settings panes. `--reset` resets only PTT2me's three grants
-and guides their interactive setup.
+There are no Terminal commands in the normal install or update flow. Closing
+PTT2me during manual permission setup does not repeat a completed reset; the
+next launch resumes with the first missing permission.
+
+## Stored data and full uninstall
+
+Starting with the published 1.1.0 build, PTT2me keeps:
+
+- the verified model below
+  `~/Library/Application Support/PTT2me/models/gigaam-v3-rnnt-v1/`;
+- the cached signed release record and verified downloaded DMGs below
+  `~/Library/Caches/com.ptt2me.app/`;
+- trigger, threshold, `Пробел в конце`, last network-check timestamp, and
+  `PermissionsResetForBuild` / `PermissionsSetupCompletedForBuild`
+  markers in macOS user defaults, normally represented by
+  `~/Library/Preferences/com.ptt2me.app.plist`.
+
+To remove PTT2me completely, quit it, remove
+`/Applications/PTT2me.app`, `~/Library/Application Support/PTT2me/`,
+`~/Library/Caches/com.ptt2me.app/`, and
+`~/Library/Preferences/com.ptt2me.app.plist`. Then remove PTT2me from
+Accessibility, Input Monitoring, and Microphone in System Settings. Replacing
+or deleting the app bundle alone intentionally leaves the external model in
+place.
 
 ## Privacy
 
-Audio and recognized text are processed locally. PTT2me stores only the
-selected trigger, hold threshold, and `Пробел в конце` boolean preference in
-macOS user defaults. It does not retain audio, transcripts, recognized text,
-history, or other application data.
-Recognized text is used temporarily for insertion. Direct Accessibility
-and Unicode insertion do not modify the pasteboard. The compatibility fallback
+Audio and recognized text are processed locally. PTT2me does not retain audio,
+transcripts, recognized text, or dictation history. Update discovery requests
+only the signed release record from GitHub Pages and carries no product user,
+device, or telemetry identifier. A DMG request to GitHub Release occurs only
+after the user's download action.
+
+Recognized text is used temporarily for insertion. Direct Accessibility and
+Unicode insertion do not modify the pasteboard. The compatibility fallback
 restores every previous pasteboard item and representation unless newer
 contents were copied during insertion.
 
 ## Troubleshooting
 
-- `Ошибка модели`: the bundled model or native runtime could not be loaded.
-  Rebuild with `scripts/build-app.sh`; the app must be restarted after fixing
-  the bundle.
+- `Требуется восстановление модели`: the external model is missing or
+  invalid and this app contains no verified bundled copy. Install the offered
+  Full DMG.
+- `Ошибка подготовки модели`: provisioning or verification failed. Fix the
+  storage problem and choose `Повторить подготовку модели`.
+- `Не удалось сбросить разрешения`: choose
+  `Повторить сброс разрешений`. Model preparation remains complete and is
+  not repeated.
 - `Ошибка микрофона`: the input device could not start or stop. Confirm
   Microphone permission and try the next Fn hold.
 - `Ошибка Fn`: Input Monitoring is missing or the Fn event tap could not be
