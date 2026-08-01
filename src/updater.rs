@@ -40,7 +40,7 @@ pub enum UpdaterState {
 pub enum UpdaterCommand {
     PersistLastAttempt(u64),
     FetchManifest(CheckReason),
-    DownloadAndVerify(VerifiedRelease),
+    DownloadAndVerify(Box<VerifiedRelease>),
     OpenDmgAndQuit(PathBuf),
 }
 
@@ -111,7 +111,7 @@ impl Updater {
                 };
                 let release = release.clone();
                 self.state = UpdaterState::Downloading(release.clone());
-                vec![UpdaterCommand::DownloadAndVerify(release)]
+                vec![UpdaterCommand::DownloadAndVerify(Box::new(release))]
             }
             UpdaterEvent::DownloadVerified(path) => {
                 if !matches!(self.state, UpdaterState::Downloading(_)) {
@@ -145,6 +145,7 @@ impl Updater {
                 self.state = match classify_release(&self.installed, &release) {
                     ReleaseDisposition::Available => UpdaterState::Available(release),
                     ReleaseDisposition::Current => UpdaterState::Current,
+                    ReleaseDisposition::DivergedLocal => UpdaterState::Available(release),
                     ReleaseDisposition::UnpublishedLocal => UpdaterState::UnpublishedLocal,
                 };
             }
@@ -179,7 +180,7 @@ pub fn cache_verified_download(
 
     if final_path.is_file() {
         let cached = File::open(&final_path).map_err(|_| UpdateFailure::Storage)?;
-        if verify_artifact(cached, release).is_ok() {
+        if verify_artifact(cached, &release.fresh_install).is_ok() {
             return Ok(final_path);
         }
         fs::remove_file(&final_path).map_err(|_| UpdateFailure::Storage)?;
@@ -200,7 +201,7 @@ pub fn cache_verified_download(
         drop(writer);
 
         let downloaded = File::open(&partial_path).map_err(|_| UpdateFailure::Storage)?;
-        verify_artifact(downloaded, release).map_err(map_artifact_error)?;
+        verify_artifact(downloaded, &release.fresh_install).map_err(map_artifact_error)?;
         fs::rename(&partial_path, &final_path).map_err(|_| UpdateFailure::Storage)?;
         Ok(final_path.clone())
     })();
@@ -234,7 +235,9 @@ mod tests {
         cache_verified_download, CheckReason, UpdateFailure, Updater, UpdaterCommand, UpdaterEvent,
         UpdaterState,
     };
-    use crate::update_manifest::{InstalledBuild, VerifiedRelease};
+    use crate::update_manifest::{
+        ArtifactDescriptor, InstalledBuild, MacOsVersion, RequiredModel, VerifiedRelease,
+    };
 
     const PRIVATE_KEY: [u8; 32] = [0x29; 32];
     const DAY_SECONDS: u64 = 24 * 60 * 60;
@@ -248,9 +251,20 @@ mod tests {
             "source_commit": "0123456789abcdef0123456789abcdef01234567",
             "minimum_macos": "13.0",
             "architecture": "arm64",
-            "download_url": format!("https://github.com/Torin2023/PTT2me/releases/download/v{version}/PTT2me-{version}-macos-arm64.dmg"),
-            "sha256": "024e5cfd5ac7dd791c40e312a4abd2f6b351324c0d8b6e6d4d41356e7f072d2a",
-            "size": 28,
+            "required_model": {
+                "id": "gigaam-v3-rnnt-v1",
+                "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "fresh_install": {
+                "url": format!("https://github.com/Torin2023/PTT2me/releases/download/v{version}/PTT2me-{version}-full-macos-arm64.dmg"),
+                "sha256": "024e5cfd5ac7dd791c40e312a4abd2f6b351324c0d8b6e6d4d41356e7f072d2a",
+                "size": 28
+            },
+            "application_update": {
+                "url": format!("https://github.com/Torin2023/PTT2me/releases/download/v{version}/PTT2me-{version}-update-macos-arm64.dmg"),
+                "sha256": "024e5cfd5ac7dd791c40e312a4abd2f6b351324c0d8b6e6d4d41356e7f072d2a",
+                "size": 28
+            },
             "published_at": "2026-08-01T12:00:00Z"
         }))
         .unwrap();
@@ -266,7 +280,15 @@ mod tests {
 
     fn updater() -> Updater {
         let (_, key) = manifest("1.0.6", 202608011200);
-        Updater::new(InstalledBuild::parse("1.0.5", 202607310831).unwrap(), key)
+        Updater::new(
+            InstalledBuild::parse(
+                "1.0.5",
+                202607310831,
+                "1111111111111111111111111111111111111111",
+            )
+            .unwrap(),
+            key,
+        )
     }
 
     #[test]
@@ -399,7 +421,15 @@ mod tests {
     #[test]
     fn local_build_newer_than_github_is_reported_without_downgrade() {
         let (_, key) = manifest("1.0.6", 202608011200);
-        let mut updater = Updater::new(InstalledBuild::parse("1.0.7", 202608021200).unwrap(), key);
+        let mut updater = Updater::new(
+            InstalledBuild::parse(
+                "1.0.7",
+                202608021200,
+                "1111111111111111111111111111111111111111",
+            )
+            .unwrap(),
+            key,
+        );
         let (manifest, _) = manifest("1.0.6", 202608011200);
         updater.handle(UpdaterEvent::ManualCheckRequested);
 
@@ -415,10 +445,23 @@ mod tests {
             version: semver::Version::parse("1.0.6").unwrap(),
             build: 202608011200,
             source_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-            minimum_macos: "13.0".to_owned(),
-            download_url: "https://github.com/Torin2023/PTT2me/releases/download/v1.0.6/PTT2me-1.0.6-macos-arm64.dmg".to_owned(),
-            sha256: "024e5cfd5ac7dd791c40e312a4abd2f6b351324c0d8b6e6d4d41356e7f072d2a".to_owned(),
-            size: b"verified PTT2me dmg fixture".len() as u64,
+            minimum_macos: MacOsVersion::parse("13.0").unwrap(),
+            required_model: RequiredModel {
+                id: "gigaam-v3-rnnt-v1".to_owned(),
+                manifest_sha256:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_owned(),
+            },
+            fresh_install: ArtifactDescriptor {
+                url: "https://github.com/Torin2023/PTT2me/releases/download/v1.0.6/PTT2me-1.0.6-full-macos-arm64.dmg".to_owned(),
+                sha256: "024e5cfd5ac7dd791c40e312a4abd2f6b351324c0d8b6e6d4d41356e7f072d2a".to_owned(),
+                size: b"verified PTT2me dmg fixture".len() as u64,
+            },
+            application_update: ArtifactDescriptor {
+                url: "https://github.com/Torin2023/PTT2me/releases/download/v1.0.6/PTT2me-1.0.6-update-macos-arm64.dmg".to_owned(),
+                sha256: "024e5cfd5ac7dd791c40e312a4abd2f6b351324c0d8b6e6d4d41356e7f072d2a".to_owned(),
+                size: b"verified PTT2me dmg fixture".len() as u64,
+            },
             published_at: "2026-08-01T12:00:00Z".to_owned(),
         }
     }
