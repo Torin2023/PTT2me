@@ -1,13 +1,31 @@
+use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use objc2_app_kit::NSWorkspace;
+use objc2_foundation::{NSString, NSThread, NSURL};
+
+use crate::constants::{
+    MAX_UPDATE_ARTIFACT_BYTES, MAX_UPDATE_MANIFEST_BYTES, UPDATE_CONNECT_TIMEOUT_SECONDS,
+    UPDATE_MAX_REDIRECTS, UPDATE_OVERALL_TIMEOUT_SECONDS, UPDATE_READ_TIMEOUT_SECONDS,
+};
 use crate::update_manifest::{
-    classify_release, verify_artifact, verify_envelope, InstalledBuild, ManifestError,
-    ReleaseDisposition, VerifiedRelease,
+    classify_release, select_artifact, verify_artifact, verify_envelope, ArtifactDescriptor,
+    InstalledBuild, MacOsVersion, ManifestError, ModelAvailability, ReleaseDisposition,
+    RequiredModel, VerifiedRelease,
 };
 
 pub const AUTOMATIC_CHECK_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
+pub const FIRST_AUTOMATIC_CHECK_DELAY_SECONDS: u64 = 60;
+
+// Pure reducer contract. Commands describe side effects; operation results
+// re-enter through events and stale operation IDs are ignored.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OperationId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckReason {
@@ -21,52 +39,210 @@ pub enum UpdateFailure {
     UntrustedManifest,
     Storage,
     DigestMismatch,
+    InvalidArtifactSize,
+    ContentLengthMismatch,
+    BodySizeMismatch,
+    ManifestTooLarge,
+    HttpStatus,
+    InsecureTransport,
+    QuarantineMissing,
+    WrongThread,
     OpenDmg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactKind {
+    Full,
+    Update,
+}
+
+impl ArtifactKind {
+    const fn cache_label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Update => "update",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedArtifact {
+    pub kind: ArtifactKind,
+    pub descriptor: ArtifactDescriptor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedDownload {
+    path: PathBuf,
+}
+
+impl VerifiedDownload {
+    fn from_verified_path(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryAction {
+    ManualCheck,
+    Download,
+    ModelRecheck,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferDisposition {
+    Available,
+    DivergedLocal,
+    RepairRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdaterState {
     Idle,
-    Checking(CheckReason),
+    Checking {
+        reason: CheckReason,
+        operation_id: OperationId,
+    },
     Current,
-    Available(VerifiedRelease),
-    Downloading(VerifiedRelease),
-    ReadyToInstall(PathBuf),
+    Available {
+        release: Box<VerifiedRelease>,
+        artifact: SelectedArtifact,
+    },
+    DivergedLocal {
+        release: Box<VerifiedRelease>,
+        artifact: SelectedArtifact,
+    },
+    RepairRequired {
+        release: Box<VerifiedRelease>,
+        artifact: SelectedArtifact,
+    },
+    Incompatible {
+        release: Box<VerifiedRelease>,
+        required_macos: MacOsVersion,
+    },
     UnpublishedLocal,
-    Failed(UpdateFailure),
+    RecheckingModel {
+        release: Box<VerifiedRelease>,
+        artifact: SelectedArtifact,
+        disposition: OfferDisposition,
+        operation_id: OperationId,
+    },
+    Downloading {
+        release: Box<VerifiedRelease>,
+        artifact: SelectedArtifact,
+        operation_id: OperationId,
+    },
+    ReadyToInstall {
+        release: Box<VerifiedRelease>,
+        artifact: SelectedArtifact,
+        path: PathBuf,
+    },
+    Failed {
+        failure: UpdateFailure,
+        retry: RetryAction,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdaterCommand {
     PersistLastAttempt(u64),
-    FetchManifest(CheckReason),
-    DownloadAndVerify(Box<VerifiedRelease>),
-    OpenDmgAndQuit(PathBuf),
+    ScheduleAutomaticCheck(u64),
+    FetchManifest {
+        operation_id: OperationId,
+        reason: CheckReason,
+    },
+    RecheckModel {
+        operation_id: OperationId,
+        required_model: RequiredModel,
+    },
+    DownloadAndVerify {
+        operation_id: OperationId,
+        release: Box<VerifiedRelease>,
+        artifact: SelectedArtifact,
+    },
+    OpenDmg {
+        operation_id: OperationId,
+        path: PathBuf,
+    },
+    RequestOrderlyQuit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdaterEvent {
-    AutomaticCheckDue { now: u64, last_attempt: Option<u64> },
-    ManualCheckRequested,
-    ManifestReceived(Vec<u8>),
-    ManifestFailed(UpdateFailure),
+    Launched {
+        launch_at: u64,
+        now: u64,
+        last_attempt: Option<u64>,
+    },
+    AutomaticCheckDue {
+        launch_at: u64,
+        now: u64,
+        last_attempt: Option<u64>,
+    },
+    ManualCheckRequested {
+        now: u64,
+    },
+    ManifestReceived {
+        operation_id: OperationId,
+        bytes: Vec<u8>,
+        model: ModelAvailability,
+    },
+    ManifestFailed {
+        operation_id: OperationId,
+        failure: UpdateFailure,
+    },
     DownloadRequested,
-    DownloadVerified(PathBuf),
-    DownloadFailed(UpdateFailure),
+    ModelRechecked {
+        operation_id: OperationId,
+        model: ModelAvailability,
+    },
+    ModelRecheckFailed {
+        operation_id: OperationId,
+        failure: UpdateFailure,
+    },
+    DownloadVerified {
+        operation_id: OperationId,
+        download: VerifiedDownload,
+    },
+    DownloadFailed {
+        operation_id: OperationId,
+        failure: UpdateFailure,
+    },
+    OpenRequested,
+    OpenCompleted {
+        operation_id: OperationId,
+        result: Result<(), UpdateFailure>,
+    },
 }
 
 pub struct Updater {
     installed: InstalledBuild,
     public_key: [u8; 32],
+    running_macos: MacOsVersion,
     state: UpdaterState,
+    next_operation_id: u64,
+    active_operation: Option<OperationId>,
+    last_open_failure: Option<UpdateFailure>,
 }
 
 impl Updater {
-    pub const fn new(installed: InstalledBuild, public_key: [u8; 32]) -> Self {
+    pub const fn new(
+        installed: InstalledBuild,
+        public_key: [u8; 32],
+        running_macos: MacOsVersion,
+    ) -> Self {
         Self {
             installed,
             public_key,
+            running_macos,
             state: UpdaterState::Idle,
+            next_operation_id: 1,
+            active_operation: None,
+            last_open_failure: None,
         }
     }
 
@@ -74,84 +250,136 @@ impl Updater {
         &self.state
     }
 
+    pub const fn last_open_failure(&self) -> Option<UpdateFailure> {
+        self.last_open_failure
+    }
+
     pub fn handle(&mut self, event: UpdaterEvent) -> Vec<UpdaterCommand> {
         match event {
-            UpdaterEvent::AutomaticCheckDue { now, last_attempt } => {
-                if !automatic_check_due(now, last_attempt) || !self.can_start_check() {
+            UpdaterEvent::Launched {
+                launch_at,
+                now,
+                last_attempt,
+            } => vec![UpdaterCommand::ScheduleAutomaticCheck(
+                next_automatic_check_at(launch_at, now, last_attempt),
+            )],
+            UpdaterEvent::AutomaticCheckDue {
+                launch_at,
+                now,
+                last_attempt,
+            } => {
+                if !self.can_start_operation() {
                     return Vec::new();
                 }
-                self.state = UpdaterState::Checking(CheckReason::Automatic);
-                vec![
-                    UpdaterCommand::PersistLastAttempt(now),
-                    UpdaterCommand::FetchManifest(CheckReason::Automatic),
-                ]
+                if automatic_check_due(now, last_attempt) {
+                    self.start_check(CheckReason::Automatic, now)
+                } else {
+                    vec![UpdaterCommand::ScheduleAutomaticCheck(
+                        next_automatic_check_at(launch_at, now, last_attempt),
+                    )]
+                }
             }
-            UpdaterEvent::ManualCheckRequested => {
-                if !self.can_start_check() {
+            UpdaterEvent::ManualCheckRequested { now } => {
+                if !self.can_start_operation() {
                     return Vec::new();
                 }
-                self.state = UpdaterState::Checking(CheckReason::Manual);
-                vec![UpdaterCommand::FetchManifest(CheckReason::Manual)]
+                self.start_check(CheckReason::Manual, now)
             }
-            UpdaterEvent::ManifestReceived(bytes) => self.receive_manifest(&bytes),
-            UpdaterEvent::ManifestFailed(failure) => {
-                let visible = matches!(self.state, UpdaterState::Checking(CheckReason::Manual));
-                if matches!(self.state, UpdaterState::Checking(_)) {
-                    self.state = if visible {
-                        UpdaterState::Failed(failure)
-                    } else {
-                        UpdaterState::Idle
-                    };
-                }
-                Vec::new()
-            }
-            UpdaterEvent::DownloadRequested => {
-                let UpdaterState::Available(release) = &self.state else {
-                    return Vec::new();
-                };
-                let release = release.clone();
-                self.state = UpdaterState::Downloading(release.clone());
-                vec![UpdaterCommand::DownloadAndVerify(Box::new(release))]
-            }
-            UpdaterEvent::DownloadVerified(path) => {
-                if !matches!(self.state, UpdaterState::Downloading(_)) {
-                    return Vec::new();
-                }
-                self.state = UpdaterState::ReadyToInstall(path.clone());
-                vec![UpdaterCommand::OpenDmgAndQuit(path)]
-            }
-            UpdaterEvent::DownloadFailed(failure) => {
-                if matches!(self.state, UpdaterState::Downloading(_)) {
-                    self.state = UpdaterState::Failed(failure);
-                }
-                Vec::new()
-            }
+            UpdaterEvent::ManifestReceived {
+                operation_id,
+                bytes,
+                model,
+            } => self.receive_manifest(operation_id, &bytes, model),
+            UpdaterEvent::ManifestFailed {
+                operation_id,
+                failure,
+            } => self.manifest_failed(operation_id, failure),
+            UpdaterEvent::DownloadRequested => self.request_download(),
+            UpdaterEvent::ModelRechecked {
+                operation_id,
+                model,
+            } => self.model_rechecked(operation_id, model),
+            UpdaterEvent::ModelRecheckFailed {
+                operation_id,
+                failure,
+            } => self.model_recheck_failed(operation_id, failure),
+            UpdaterEvent::DownloadVerified {
+                operation_id,
+                download,
+            } => self.download_verified(operation_id, download),
+            UpdaterEvent::DownloadFailed {
+                operation_id,
+                failure,
+            } => self.download_failed(operation_id, failure),
+            UpdaterEvent::OpenRequested => self.request_open(),
+            UpdaterEvent::OpenCompleted {
+                operation_id,
+                result,
+            } => self.open_completed(operation_id, result),
         }
     }
 
-    fn can_start_check(&self) -> bool {
-        !matches!(
-            self.state,
-            UpdaterState::Checking(_) | UpdaterState::Downloading(_)
-        )
+    fn can_start_operation(&self) -> bool {
+        self.active_operation.is_none()
     }
 
-    fn receive_manifest(&mut self, bytes: &[u8]) -> Vec<UpdaterCommand> {
-        let UpdaterState::Checking(reason) = self.state else {
+    fn allocate_operation(&mut self) -> OperationId {
+        let operation_id = OperationId(self.next_operation_id);
+        self.next_operation_id = self.next_operation_id.wrapping_add(1).max(1);
+        self.active_operation = Some(operation_id);
+        operation_id
+    }
+
+    fn finish_operation(&mut self, operation_id: OperationId) -> bool {
+        if self.active_operation != Some(operation_id) {
+            return false;
+        }
+        self.active_operation = None;
+        true
+    }
+
+    fn start_check(&mut self, reason: CheckReason, now: u64) -> Vec<UpdaterCommand> {
+        let operation_id = self.allocate_operation();
+        self.state = UpdaterState::Checking {
+            reason,
+            operation_id,
+        };
+        vec![
+            UpdaterCommand::PersistLastAttempt(now),
+            UpdaterCommand::ScheduleAutomaticCheck(
+                now.saturating_add(AUTOMATIC_CHECK_INTERVAL_SECONDS),
+            ),
+            UpdaterCommand::FetchManifest {
+                operation_id,
+                reason,
+            },
+        ]
+    }
+
+    fn receive_manifest(
+        &mut self,
+        operation_id: OperationId,
+        bytes: &[u8],
+        model: ModelAvailability,
+    ) -> Vec<UpdaterCommand> {
+        let UpdaterState::Checking {
+            reason,
+            operation_id: expected,
+        } = self.state
+        else {
             return Vec::new();
         };
+        if expected != operation_id || !self.finish_operation(operation_id) {
+            return Vec::new();
+        }
         match verify_envelope(bytes, &self.public_key) {
-            Ok(release) => {
-                self.state = match classify_release(&self.installed, &release) {
-                    ReleaseDisposition::Available => UpdaterState::Available(release),
-                    ReleaseDisposition::Current => UpdaterState::Current,
-                    ReleaseDisposition::DivergedLocal => UpdaterState::Available(release),
-                    ReleaseDisposition::UnpublishedLocal => UpdaterState::UnpublishedLocal,
-                };
-            }
+            Ok(release) => self.project_release(release, model, reason),
             Err(_) => {
                 self.state = if reason == CheckReason::Manual {
-                    UpdaterState::Failed(UpdateFailure::UntrustedManifest)
+                    UpdaterState::Failed {
+                        failure: UpdateFailure::UntrustedManifest,
+                        retry: RetryAction::ManualCheck,
+                    }
                 } else {
                     UpdaterState::Idle
                 };
@@ -159,40 +387,387 @@ impl Updater {
         }
         Vec::new()
     }
+
+    fn manifest_failed(
+        &mut self,
+        operation_id: OperationId,
+        failure: UpdateFailure,
+    ) -> Vec<UpdaterCommand> {
+        let UpdaterState::Checking {
+            reason,
+            operation_id: expected,
+        } = self.state
+        else {
+            return Vec::new();
+        };
+        if expected != operation_id || !self.finish_operation(operation_id) {
+            return Vec::new();
+        }
+        self.state = if reason == CheckReason::Automatic {
+            UpdaterState::Idle
+        } else {
+            UpdaterState::Failed {
+                failure,
+                retry: RetryAction::ManualCheck,
+            }
+        };
+        Vec::new()
+    }
+
+    fn project_release(
+        &mut self,
+        release: VerifiedRelease,
+        model: ModelAvailability,
+        reason: CheckReason,
+    ) {
+        let disposition = classify_release(&self.installed, &release);
+        if disposition == ReleaseDisposition::UnpublishedLocal {
+            self.state = UpdaterState::UnpublishedLocal;
+            return;
+        }
+        if self.running_macos < release.minimum_macos {
+            if reason == CheckReason::Automatic {
+                self.state = UpdaterState::Idle;
+                return;
+            }
+            let required_macos = release.minimum_macos;
+            self.state = UpdaterState::Incompatible {
+                release: Box::new(release),
+                required_macos,
+            };
+            return;
+        }
+
+        let artifact = selected_artifact(&release, &model);
+        self.state = match disposition {
+            ReleaseDisposition::Available => UpdaterState::Available {
+                release: Box::new(release),
+                artifact,
+            },
+            ReleaseDisposition::DivergedLocal => UpdaterState::DivergedLocal {
+                release: Box::new(release),
+                artifact,
+            },
+            ReleaseDisposition::Current if artifact.kind == ArtifactKind::Full => {
+                UpdaterState::RepairRequired {
+                    release: Box::new(release),
+                    artifact,
+                }
+            }
+            ReleaseDisposition::Current => UpdaterState::Current,
+            ReleaseDisposition::UnpublishedLocal => UpdaterState::UnpublishedLocal,
+        };
+    }
+
+    fn request_download(&mut self) -> Vec<UpdaterCommand> {
+        if !self.can_start_operation() {
+            return Vec::new();
+        }
+        let Some((release, artifact, disposition)) = download_offer(&self.state) else {
+            return Vec::new();
+        };
+        let operation_id = self.allocate_operation();
+        let required_model = release.required_model.clone();
+        self.state = UpdaterState::RecheckingModel {
+            release,
+            artifact,
+            disposition,
+            operation_id,
+        };
+        vec![UpdaterCommand::RecheckModel {
+            operation_id,
+            required_model,
+        }]
+    }
+
+    fn model_rechecked(
+        &mut self,
+        operation_id: OperationId,
+        model: ModelAvailability,
+    ) -> Vec<UpdaterCommand> {
+        let UpdaterState::RecheckingModel {
+            release,
+            artifact: previous,
+            disposition,
+            operation_id: expected,
+        } = self.state.clone()
+        else {
+            return Vec::new();
+        };
+        if expected != operation_id || !self.finish_operation(operation_id) {
+            return Vec::new();
+        }
+        let artifact = selected_artifact(&release, &model);
+        if artifact.kind != previous.kind {
+            self.state = project_offer_after_recheck(release, artifact, disposition);
+            return Vec::new();
+        }
+
+        let download_id = self.allocate_operation();
+        self.state = UpdaterState::Downloading {
+            release: release.clone(),
+            artifact: artifact.clone(),
+            operation_id: download_id,
+        };
+        vec![UpdaterCommand::DownloadAndVerify {
+            operation_id: download_id,
+            release,
+            artifact,
+        }]
+    }
+
+    fn model_recheck_failed(
+        &mut self,
+        operation_id: OperationId,
+        failure: UpdateFailure,
+    ) -> Vec<UpdaterCommand> {
+        let UpdaterState::RecheckingModel {
+            operation_id: expected,
+            ..
+        } = self.state
+        else {
+            return Vec::new();
+        };
+        if expected != operation_id || !self.finish_operation(operation_id) {
+            return Vec::new();
+        }
+        self.state = UpdaterState::Failed {
+            failure,
+            retry: RetryAction::ModelRecheck,
+        };
+        Vec::new()
+    }
+
+    fn download_verified(
+        &mut self,
+        operation_id: OperationId,
+        download: VerifiedDownload,
+    ) -> Vec<UpdaterCommand> {
+        let UpdaterState::Downloading {
+            release,
+            artifact,
+            operation_id: expected,
+        } = self.state.clone()
+        else {
+            return Vec::new();
+        };
+        if expected != operation_id || !self.finish_operation(operation_id) {
+            return Vec::new();
+        }
+        self.state = UpdaterState::ReadyToInstall {
+            release,
+            artifact,
+            path: download.path,
+        };
+        Vec::new()
+    }
+
+    fn download_failed(
+        &mut self,
+        operation_id: OperationId,
+        failure: UpdateFailure,
+    ) -> Vec<UpdaterCommand> {
+        let UpdaterState::Downloading {
+            operation_id: expected,
+            ..
+        } = self.state
+        else {
+            return Vec::new();
+        };
+        if expected != operation_id || !self.finish_operation(operation_id) {
+            return Vec::new();
+        }
+        self.state = UpdaterState::Failed {
+            failure,
+            retry: RetryAction::Download,
+        };
+        Vec::new()
+    }
+
+    fn request_open(&mut self) -> Vec<UpdaterCommand> {
+        if !self.can_start_operation() {
+            return Vec::new();
+        }
+        let UpdaterState::ReadyToInstall { path, .. } = &self.state else {
+            return Vec::new();
+        };
+        let path = path.clone();
+        let operation_id = self.allocate_operation();
+        self.last_open_failure = None;
+        vec![UpdaterCommand::OpenDmg { operation_id, path }]
+    }
+
+    fn open_completed(
+        &mut self,
+        operation_id: OperationId,
+        result: Result<(), UpdateFailure>,
+    ) -> Vec<UpdaterCommand> {
+        if !matches!(self.state, UpdaterState::ReadyToInstall { .. })
+            || !self.finish_operation(operation_id)
+        {
+            return Vec::new();
+        }
+        match result {
+            Ok(()) => vec![UpdaterCommand::RequestOrderlyQuit],
+            Err(failure) => {
+                self.last_open_failure = Some(failure);
+                Vec::new()
+            }
+        }
+    }
 }
 
 pub const fn automatic_check_due(now: u64, last_attempt: Option<u64>) -> bool {
     match last_attempt {
         None => true,
-        Some(previous) => now.saturating_sub(previous) >= AUTOMATIC_CHECK_INTERVAL_SECONDS,
+        Some(previous) if previous > now => false,
+        Some(previous) => now - previous >= AUTOMATIC_CHECK_INTERVAL_SECONDS,
     }
 }
+
+pub const fn next_automatic_check_at(launch_at: u64, now: u64, last_attempt: Option<u64>) -> u64 {
+    let launch_floor = launch_at.saturating_add(FIRST_AUTOMATIC_CHECK_DELAY_SECONDS);
+    let Some(previous) = last_attempt else {
+        return launch_floor;
+    };
+    let clamped_previous = if previous > now { now } else { previous };
+    let due = clamped_previous.saturating_add(AUTOMATIC_CHECK_INTERVAL_SECONDS);
+    if due > launch_floor {
+        due
+    } else {
+        launch_floor
+    }
+}
+
+fn selected_artifact(release: &VerifiedRelease, model: &ModelAvailability) -> SelectedArtifact {
+    let descriptor = select_artifact(release, model);
+    let kind = if descriptor == &release.application_update {
+        ArtifactKind::Update
+    } else {
+        ArtifactKind::Full
+    };
+    SelectedArtifact {
+        kind,
+        descriptor: descriptor.clone(),
+    }
+}
+
+fn download_offer(
+    state: &UpdaterState,
+) -> Option<(Box<VerifiedRelease>, SelectedArtifact, OfferDisposition)> {
+    match state {
+        UpdaterState::Available { release, artifact } => Some((
+            release.clone(),
+            artifact.clone(),
+            OfferDisposition::Available,
+        )),
+        UpdaterState::DivergedLocal { release, artifact } => Some((
+            release.clone(),
+            artifact.clone(),
+            OfferDisposition::DivergedLocal,
+        )),
+        UpdaterState::RepairRequired { release, artifact } => Some((
+            release.clone(),
+            artifact.clone(),
+            OfferDisposition::RepairRequired,
+        )),
+        _ => None,
+    }
+}
+
+fn project_offer_after_recheck(
+    release: Box<VerifiedRelease>,
+    artifact: SelectedArtifact,
+    disposition: OfferDisposition,
+) -> UpdaterState {
+    match disposition {
+        OfferDisposition::Available => UpdaterState::Available { release, artifact },
+        OfferDisposition::DivergedLocal => UpdaterState::DivergedLocal { release, artifact },
+        OfferDisposition::RepairRequired if artifact.kind == ArtifactKind::Update => {
+            UpdaterState::Current
+        }
+        OfferDisposition::RepairRequired => UpdaterState::RepairRequired { release, artifact },
+    }
+}
+
+// Artifact cache and worker boundaries. All production implementations reject
+// AppKit's main thread; Task 5 owns dispatching these synchronous boundaries.
 
 pub fn cache_verified_download(
     cache_root: &Path,
     release: &VerifiedRelease,
-    mut reader: impl Read,
+    kind: ArtifactKind,
+    artifact: &ArtifactDescriptor,
+    reader: impl Read,
+    content_length: Option<u64>,
 ) -> Result<PathBuf, UpdateFailure> {
+    cache_verified_download_with_promoter(
+        cache_root,
+        release,
+        kind,
+        artifact,
+        reader,
+        content_length,
+        |partial, final_path| fs::rename(partial, final_path),
+    )
+}
+
+fn cache_verified_download_with_promoter(
+    cache_root: &Path,
+    release: &VerifiedRelease,
+    kind: ArtifactKind,
+    artifact: &ArtifactDescriptor,
+    mut reader: impl Read,
+    content_length: Option<u64>,
+    promote: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<PathBuf, UpdateFailure> {
+    if artifact.size == 0 || artifact.size > MAX_UPDATE_ARTIFACT_BYTES {
+        return Err(UpdateFailure::InvalidArtifactSize);
+    }
     fs::create_dir_all(cache_root).map_err(|_| UpdateFailure::Storage)?;
-    let file_name = format!("PTT2me-{}-macos-arm64.dmg", release.version);
+    let file_name = format!(
+        "PTT2me-{}-{}-{}-macos-arm64.dmg",
+        release.version,
+        release.build,
+        kind.cache_label()
+    );
     let final_path = cache_root.join(&file_name);
     let partial_path = cache_root.join(format!("{file_name}.part"));
 
-    if final_path.is_file() {
-        let cached = File::open(&final_path).map_err(|_| UpdateFailure::Storage)?;
-        if verify_artifact(cached, &release.fresh_install).is_ok() {
-            return Ok(final_path);
+    match fs::symlink_metadata(&final_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let cached = File::open(&final_path).map_err(|_| UpdateFailure::Storage)?;
+            if verify_artifact(cached, artifact).is_ok() {
+                return Ok(final_path);
+            }
+            fs::remove_file(&final_path).map_err(|_| UpdateFailure::Storage)?;
         }
-        fs::remove_file(&final_path).map_err(|_| UpdateFailure::Storage)?;
-    }
-    if partial_path.exists() {
-        fs::remove_file(&partial_path).map_err(|_| UpdateFailure::Storage)?;
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::remove_file(&final_path).map_err(|_| UpdateFailure::Storage)?;
+        }
+        Ok(_) => return Err(UpdateFailure::Storage),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(UpdateFailure::Storage),
     }
 
+    remove_stale_partial(&partial_path)?;
+
+    if let Some(length) = content_length {
+        if length != artifact.size {
+            return Err(UpdateFailure::ContentLengthMismatch);
+        }
+    }
+
+    let mut promoted = false;
     let write_result = (|| {
         let file = File::create(&partial_path).map_err(|_| UpdateFailure::Storage)?;
         let mut writer = BufWriter::new(file);
-        std::io::copy(&mut reader, &mut writer).map_err(|_| UpdateFailure::Network)?;
+        let limit = artifact
+            .size
+            .checked_add(1)
+            .ok_or(UpdateFailure::InvalidArtifactSize)?;
+        let copied = io::copy(&mut reader.by_ref().take(limit), &mut writer)
+            .map_err(|_| UpdateFailure::Network)?;
         writer.flush().map_err(|_| UpdateFailure::Storage)?;
         writer
             .get_ref()
@@ -200,16 +775,41 @@ pub fn cache_verified_download(
             .map_err(|_| UpdateFailure::Storage)?;
         drop(writer);
 
+        if copied != artifact.size {
+            return Err(UpdateFailure::BodySizeMismatch);
+        }
+
         let downloaded = File::open(&partial_path).map_err(|_| UpdateFailure::Storage)?;
-        verify_artifact(downloaded, &release.fresh_install).map_err(map_artifact_error)?;
-        fs::rename(&partial_path, &final_path).map_err(|_| UpdateFailure::Storage)?;
+        verify_artifact(downloaded, artifact).map_err(map_artifact_error)?;
+        promote(&partial_path, &final_path).map_err(|_| UpdateFailure::Storage)?;
+        promoted = true;
+
+        let promoted_file = File::open(&final_path).map_err(|_| UpdateFailure::Storage)?;
+        verify_artifact(promoted_file, artifact).map_err(map_artifact_error)?;
+        File::open(cache_root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| UpdateFailure::Storage)?;
         Ok(final_path.clone())
     })();
 
     if write_result.is_err() {
         let _ = fs::remove_file(&partial_path);
+        if promoted {
+            let _ = fs::remove_file(&final_path);
+        }
     }
     write_result
+}
+
+fn remove_stale_partial(partial_path: &Path) -> Result<(), UpdateFailure> {
+    match fs::symlink_metadata(partial_path) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            fs::remove_file(partial_path).map_err(|_| UpdateFailure::Storage)
+        }
+        Ok(_) => Err(UpdateFailure::Storage),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(UpdateFailure::Storage),
+    }
 }
 
 fn map_artifact_error(error: ManifestError) -> UpdateFailure {
@@ -221,304 +821,348 @@ fn map_artifact_error(error: ManifestError) -> UpdateFailure {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::io::{self, Cursor, Read};
-    use std::path::PathBuf;
+pub struct DownloadResponse {
+    pub content_length: Option<u64>,
+    pub reader: Box<dyn Read + Send>,
+}
 
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine;
-    use ed25519_dalek::{Signer, SigningKey};
-    use serde_json::json;
+pub trait UpdateFetch: Send + Sync {
+    fn fetch_manifest(&self, url: &str) -> Result<Vec<u8>, UpdateFailure>;
+    fn fetch_artifact(
+        &self,
+        artifact: &ArtifactDescriptor,
+    ) -> Result<DownloadResponse, UpdateFailure>;
+}
 
-    use super::{
-        cache_verified_download, CheckReason, UpdateFailure, Updater, UpdaterCommand, UpdaterEvent,
-        UpdaterState,
-    };
-    use crate::update_manifest::{
-        ArtifactDescriptor, InstalledBuild, MacOsVersion, RequiredModel, VerifiedRelease,
-    };
+pub trait UpdateStorage: Send + Sync {
+    fn store_verified(
+        &self,
+        release: &VerifiedRelease,
+        kind: ArtifactKind,
+        artifact: &ArtifactDescriptor,
+        reader: &mut (dyn Read + Send),
+        content_length: Option<u64>,
+    ) -> Result<PathBuf, UpdateFailure>;
 
-    const PRIVATE_KEY: [u8; 32] = [0x29; 32];
-    const DAY_SECONDS: u64 = 24 * 60 * 60;
+    fn discard(&self, path: &Path) -> Result<(), UpdateFailure>;
+}
 
-    fn manifest(version: &str, build: u64) -> (Vec<u8>, [u8; 32]) {
-        let signing_key = SigningKey::from_bytes(&PRIVATE_KEY);
-        let payload = serde_json::to_vec(&json!({
-            "channel": "stable",
-            "version": version,
-            "build": build,
-            "source_commit": "0123456789abcdef0123456789abcdef01234567",
-            "minimum_macos": "13.0",
-            "architecture": "arm64",
-            "required_model": {
-                "id": "gigaam-v3-rnnt-v1",
-                "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            },
-            "fresh_install": {
-                "url": format!("https://github.com/Torin2023/PTT2me/releases/download/v{version}/PTT2me-{version}-full-macos-arm64.dmg"),
-                "sha256": "024e5cfd5ac7dd791c40e312a4abd2f6b351324c0d8b6e6d4d41356e7f072d2a",
-                "size": 28
-            },
-            "application_update": {
-                "url": format!("https://github.com/Torin2023/PTT2me/releases/download/v{version}/PTT2me-{version}-update-macos-arm64.dmg"),
-                "sha256": "024e5cfd5ac7dd791c40e312a4abd2f6b351324c0d8b6e6d4d41356e7f072d2a",
-                "size": 28
-            },
-            "published_at": "2026-08-01T12:00:00Z"
-        }))
-        .unwrap();
-        let signature = signing_key.sign(&payload);
-        let envelope = serde_json::to_vec(&json!({
-            "schema": 1,
-            "payload": STANDARD.encode(payload),
-            "signature": STANDARD.encode(signature.to_bytes())
-        }))
-        .unwrap();
-        (envelope, signing_key.verifying_key().to_bytes())
-    }
+pub trait UpdateClock: Send + Sync {
+    fn now(&self) -> u64;
+}
 
-    fn updater() -> Updater {
-        let (_, key) = manifest("1.0.6", 202608011200);
-        Updater::new(
-            InstalledBuild::parse(
-                "1.0.5",
-                202607310831,
-                "1111111111111111111111111111111111111111",
-            )
-            .unwrap(),
-            key,
-        )
-    }
+pub trait DmgOpener: Send + Sync {
+    fn open_dmg(&self, path: &Path) -> Result<(), UpdateFailure>;
+}
 
-    #[test]
-    fn automatic_check_runs_only_when_twenty_four_hours_have_elapsed() {
-        let mut updater = updater();
+pub trait QuarantineChecker: Send + Sync {
+    fn has_quarantine(&self, path: &Path) -> Result<bool, UpdateFailure>;
+}
 
-        assert!(updater
-            .handle(UpdaterEvent::AutomaticCheckDue {
-                now: 200_000,
-                last_attempt: Some(200_000 - DAY_SECONDS + 1),
-            })
-            .is_empty());
-        assert_eq!(updater.state(), &UpdaterState::Idle);
+pub struct ArtifactWorker<F, S, Q> {
+    fetch: F,
+    storage: S,
+    quarantine: Q,
+}
 
-        assert_eq!(
-            updater.handle(UpdaterEvent::AutomaticCheckDue {
-                now: 200_000,
-                last_attempt: Some(200_000 - DAY_SECONDS),
-            }),
-            vec![
-                UpdaterCommand::PersistLastAttempt(200_000),
-                UpdaterCommand::FetchManifest(CheckReason::Automatic),
-            ]
-        );
-        assert_eq!(
-            updater.state(),
-            &UpdaterState::Checking(CheckReason::Automatic)
-        );
-    }
-
-    #[test]
-    fn manual_check_bypasses_automatic_interval() {
-        let mut updater = updater();
-
-        assert_eq!(
-            updater.handle(UpdaterEvent::ManualCheckRequested),
-            vec![UpdaterCommand::FetchManifest(CheckReason::Manual)]
-        );
-        assert_eq!(
-            updater.state(),
-            &UpdaterState::Checking(CheckReason::Manual)
-        );
-    }
-
-    #[test]
-    fn automatic_failure_is_silent_but_manual_failure_is_visible() {
-        let mut automatic = updater();
-        automatic.handle(UpdaterEvent::AutomaticCheckDue {
-            now: DAY_SECONDS,
-            last_attempt: None,
-        });
-        assert!(automatic
-            .handle(UpdaterEvent::ManifestFailed(UpdateFailure::Network))
-            .is_empty());
-        assert_eq!(automatic.state(), &UpdaterState::Idle);
-
-        let mut manual = updater();
-        manual.handle(UpdaterEvent::ManualCheckRequested);
-        assert!(manual
-            .handle(UpdaterEvent::ManifestFailed(UpdateFailure::Network))
-            .is_empty());
-        assert_eq!(
-            manual.state(),
-            &UpdaterState::Failed(UpdateFailure::Network)
-        );
-    }
-
-    #[test]
-    fn verified_newer_manifest_requires_explicit_download_request() {
-        let mut updater = updater();
-        let (manifest, _) = manifest("1.0.6", 202608011200);
-        updater.handle(UpdaterEvent::ManualCheckRequested);
-
-        assert!(updater
-            .handle(UpdaterEvent::ManifestReceived(manifest))
-            .is_empty());
-        let UpdaterState::Available(release) = updater.state() else {
-            panic!("newer signed release must become available");
-        };
-        assert_eq!(release.version.to_string(), "1.0.6");
-
-        let commands = updater.handle(UpdaterEvent::DownloadRequested);
-        assert_eq!(commands.len(), 1);
-        assert!(matches!(commands[0], UpdaterCommand::DownloadAndVerify(_)));
-        assert!(matches!(updater.state(), UpdaterState::Downloading(_)));
-    }
-
-    #[test]
-    fn invalid_manifest_never_exposes_a_download_action() {
-        let mut updater = updater();
-        updater.handle(UpdaterEvent::ManualCheckRequested);
-
-        assert!(updater
-            .handle(UpdaterEvent::ManifestReceived(b"not signed json".to_vec()))
-            .is_empty());
-        assert_eq!(
-            updater.state(),
-            &UpdaterState::Failed(UpdateFailure::UntrustedManifest)
-        );
-        assert!(updater.handle(UpdaterEvent::DownloadRequested).is_empty());
-    }
-
-    #[test]
-    fn verified_download_is_opened_and_app_quits_but_digest_failure_is_not() {
-        let mut verified = updater();
-        let (manifest, _) = manifest("1.0.6", 202608011200);
-        verified.handle(UpdaterEvent::ManualCheckRequested);
-        verified.handle(UpdaterEvent::ManifestReceived(manifest.clone()));
-        verified.handle(UpdaterEvent::DownloadRequested);
-        let dmg = PathBuf::from("/cache/PTT2me-1.0.6-macos-arm64.dmg");
-        assert_eq!(
-            verified.handle(UpdaterEvent::DownloadVerified(dmg.clone())),
-            vec![UpdaterCommand::OpenDmgAndQuit(dmg.clone())]
-        );
-        assert_eq!(verified.state(), &UpdaterState::ReadyToInstall(dmg));
-
-        let mut rejected = updater();
-        rejected.handle(UpdaterEvent::ManualCheckRequested);
-        rejected.handle(UpdaterEvent::ManifestReceived(manifest));
-        rejected.handle(UpdaterEvent::DownloadRequested);
-        assert!(rejected
-            .handle(UpdaterEvent::DownloadFailed(UpdateFailure::DigestMismatch))
-            .is_empty());
-        assert_eq!(
-            rejected.state(),
-            &UpdaterState::Failed(UpdateFailure::DigestMismatch)
-        );
-    }
-
-    #[test]
-    fn local_build_newer_than_github_is_reported_without_downgrade() {
-        let (_, key) = manifest("1.0.6", 202608011200);
-        let mut updater = Updater::new(
-            InstalledBuild::parse(
-                "1.0.7",
-                202608021200,
-                "1111111111111111111111111111111111111111",
-            )
-            .unwrap(),
-            key,
-        );
-        let (manifest, _) = manifest("1.0.6", 202608011200);
-        updater.handle(UpdaterEvent::ManualCheckRequested);
-
-        assert!(updater
-            .handle(UpdaterEvent::ManifestReceived(manifest))
-            .is_empty());
-        assert_eq!(updater.state(), &UpdaterState::UnpublishedLocal);
-        assert!(updater.handle(UpdaterEvent::DownloadRequested).is_empty());
-    }
-
-    fn cache_release() -> VerifiedRelease {
-        VerifiedRelease {
-            version: semver::Version::parse("1.0.6").unwrap(),
-            build: 202608011200,
-            source_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-            minimum_macos: MacOsVersion::parse("13.0").unwrap(),
-            required_model: RequiredModel {
-                id: "gigaam-v3-rnnt-v1".to_owned(),
-                manifest_sha256:
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                        .to_owned(),
-            },
-            fresh_install: ArtifactDescriptor {
-                url: "https://github.com/Torin2023/PTT2me/releases/download/v1.0.6/PTT2me-1.0.6-full-macos-arm64.dmg".to_owned(),
-                sha256: "024e5cfd5ac7dd791c40e312a4abd2f6b351324c0d8b6e6d4d41356e7f072d2a".to_owned(),
-                size: b"verified PTT2me dmg fixture".len() as u64,
-            },
-            application_update: ArtifactDescriptor {
-                url: "https://github.com/Torin2023/PTT2me/releases/download/v1.0.6/PTT2me-1.0.6-update-macos-arm64.dmg".to_owned(),
-                sha256: "024e5cfd5ac7dd791c40e312a4abd2f6b351324c0d8b6e6d4d41356e7f072d2a".to_owned(),
-                size: b"verified PTT2me dmg fixture".len() as u64,
-            },
-            published_at: "2026-08-01T12:00:00Z".to_owned(),
+impl<F, S, Q> ArtifactWorker<F, S, Q>
+where
+    F: UpdateFetch,
+    S: UpdateStorage,
+    Q: QuarantineChecker,
+{
+    pub const fn new(fetch: F, storage: S, quarantine: Q) -> Self {
+        Self {
+            fetch,
+            storage,
+            quarantine,
         }
     }
 
-    #[test]
-    fn verified_download_is_atomically_promoted_without_partial_file() {
-        let cache = tempfile::tempdir().unwrap();
-        let release = cache_release();
-
-        let path = cache_verified_download(
-            cache.path(),
-            &release,
-            Cursor::new(b"verified PTT2me dmg fixture"),
-        )
-        .unwrap();
-
-        assert_eq!(path.file_name().unwrap(), "PTT2me-1.0.6-macos-arm64.dmg");
-        assert_eq!(std::fs::read(path).unwrap(), b"verified PTT2me dmg fixture");
-        assert!(!cache
-            .path()
-            .join("PTT2me-1.0.6-macos-arm64.dmg.part")
-            .exists());
-    }
-
-    #[test]
-    fn rejected_download_leaves_no_final_or_partial_file() {
-        let cache = tempfile::tempdir().unwrap();
-        let release = cache_release();
-
-        assert_eq!(
-            cache_verified_download(cache.path(), &release, Cursor::new(vec![b'x'; 28])),
-            Err(UpdateFailure::DigestMismatch)
-        );
-        assert!(std::fs::read_dir(cache.path()).unwrap().next().is_none());
-    }
-
-    struct PanicReader;
-
-    impl Read for PanicReader {
-        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
-            panic!("a valid cached artifact must be reused without reading the network body")
+    pub fn download(
+        &self,
+        release: &VerifiedRelease,
+        kind: ArtifactKind,
+        artifact: &ArtifactDescriptor,
+    ) -> Result<VerifiedDownload, UpdateFailure> {
+        let mut response = self.fetch.fetch_artifact(artifact)?;
+        let path = self.storage.store_verified(
+            release,
+            kind,
+            artifact,
+            response.reader.as_mut(),
+            response.content_length,
+        )?;
+        match self.quarantine.has_quarantine(&path) {
+            Ok(true) => Ok(VerifiedDownload::from_verified_path(path)),
+            Ok(false) => {
+                self.storage.discard(&path)?;
+                Err(UpdateFailure::QuarantineMissing)
+            }
+            Err(failure) => {
+                let _ = self.storage.discard(&path);
+                Err(failure)
+            }
         }
-    }
-
-    #[test]
-    fn valid_cached_artifact_is_reused_without_consuming_download() {
-        let cache = tempfile::tempdir().unwrap();
-        let release = cache_release();
-        let first = cache_verified_download(
-            cache.path(),
-            &release,
-            Cursor::new(b"verified PTT2me dmg fixture"),
-        )
-        .unwrap();
-
-        let reused = cache_verified_download(cache.path(), &release, PanicReader).unwrap();
-
-        assert_eq!(reused, first);
     }
 }
+
+pub struct FileUpdateStorage {
+    cache_root: PathBuf,
+}
+
+impl FileUpdateStorage {
+    pub const fn new(cache_root: PathBuf) -> Self {
+        Self { cache_root }
+    }
+}
+
+impl UpdateStorage for FileUpdateStorage {
+    fn store_verified(
+        &self,
+        release: &VerifiedRelease,
+        kind: ArtifactKind,
+        artifact: &ArtifactDescriptor,
+        reader: &mut (dyn Read + Send),
+        content_length: Option<u64>,
+    ) -> Result<PathBuf, UpdateFailure> {
+        ensure_background_thread()?;
+        cache_verified_download(
+            &self.cache_root,
+            release,
+            kind,
+            artifact,
+            reader,
+            content_length,
+        )
+    }
+
+    fn discard(&self, path: &Path) -> Result<(), UpdateFailure> {
+        ensure_background_thread()?;
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(UpdateFailure::Storage),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl UpdateClock for SystemClock {
+    fn now(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpsUpdateFetch {
+    agent: ureq::Agent,
+}
+
+impl Default for HttpsUpdateFetch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HttpsUpdateFetch {
+    pub fn new() -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .https_only(true)
+            .timeout_connect(Duration::from_secs(UPDATE_CONNECT_TIMEOUT_SECONDS))
+            .timeout_read(Duration::from_secs(UPDATE_READ_TIMEOUT_SECONDS))
+            .redirects(UPDATE_MAX_REDIRECTS)
+            .build();
+        Self { agent }
+    }
+
+    fn response(&self, url: &str) -> Result<(ureq::Response, Instant), UpdateFailure> {
+        ensure_background_thread()?;
+        let started_at = Instant::now();
+        let response = self.agent.get(url).call().map_err(map_ureq_error)?;
+        Ok((response, started_at))
+    }
+}
+
+impl UpdateFetch for HttpsUpdateFetch {
+    fn fetch_manifest(&self, url: &str) -> Result<Vec<u8>, UpdateFailure> {
+        let (response, started_at) = self.response(url)?;
+        let content_length = validate_http_response_metadata(
+            response.status(),
+            response.get_url(),
+            response.header("Content-Length"),
+            None,
+        )?;
+        if content_length.is_some_and(|length| length > MAX_UPDATE_MANIFEST_BYTES) {
+            return Err(UpdateFailure::ManifestTooLarge);
+        }
+        read_bounded_manifest(OverallDeadlineReader::new(
+            response.into_reader(),
+            started_at,
+        ))
+    }
+
+    fn fetch_artifact(
+        &self,
+        artifact: &ArtifactDescriptor,
+    ) -> Result<DownloadResponse, UpdateFailure> {
+        if artifact.size == 0 || artifact.size > MAX_UPDATE_ARTIFACT_BYTES {
+            return Err(UpdateFailure::InvalidArtifactSize);
+        }
+        let (response, started_at) = self.response(&artifact.url)?;
+        let content_length = validate_http_response_metadata(
+            response.status(),
+            response.get_url(),
+            response.header("Content-Length"),
+            Some(artifact.size),
+        )?;
+        Ok(DownloadResponse {
+            content_length,
+            reader: Box::new(OverallDeadlineReader::new(
+                response.into_reader(),
+                started_at,
+            )),
+        })
+    }
+}
+
+struct OverallDeadlineReader<R> {
+    inner: R,
+    started_at: Instant,
+}
+
+impl<R> OverallDeadlineReader<R> {
+    const fn new(inner: R, started_at: Instant) -> Self {
+        Self { inner, started_at }
+    }
+}
+
+impl<R: Read> Read for OverallDeadlineReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.started_at.elapsed() >= Duration::from_secs(UPDATE_OVERALL_TIMEOUT_SECONDS) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "update request exceeded overall timeout",
+            ));
+        }
+        let read = self.inner.read(buffer)?;
+        if self.started_at.elapsed() >= Duration::from_secs(UPDATE_OVERALL_TIMEOUT_SECONDS) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "update request exceeded overall timeout",
+            ));
+        }
+        Ok(read)
+    }
+}
+
+pub fn read_bounded_manifest(mut reader: impl Read) -> Result<Vec<u8>, UpdateFailure> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(MAX_UPDATE_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| UpdateFailure::Network)?;
+    if bytes.len() as u64 > MAX_UPDATE_MANIFEST_BYTES {
+        return Err(UpdateFailure::ManifestTooLarge);
+    }
+    Ok(bytes)
+}
+
+pub fn validate_http_response_metadata(
+    status: u16,
+    final_url: &str,
+    content_length: Option<&str>,
+    expected_length: Option<u64>,
+) -> Result<Option<u64>, UpdateFailure> {
+    if !(200..300).contains(&status) {
+        return Err(UpdateFailure::HttpStatus);
+    }
+    if !final_url.starts_with("https://") {
+        return Err(UpdateFailure::InsecureTransport);
+    }
+    let parsed_length = match content_length {
+        Some(value) => Some(
+            value
+                .parse::<u64>()
+                .map_err(|_| UpdateFailure::ContentLengthMismatch)?,
+        ),
+        None => None,
+    };
+    if let (Some(actual), Some(expected)) = (parsed_length, expected_length) {
+        if actual != expected {
+            return Err(UpdateFailure::ContentLengthMismatch);
+        }
+    }
+    Ok(parsed_length)
+}
+
+fn map_ureq_error(error: ureq::Error) -> UpdateFailure {
+    match error {
+        ureq::Error::Status(_, _) => UpdateFailure::HttpStatus,
+        ureq::Error::Transport(_) => UpdateFailure::Network,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MacOsQuarantineChecker;
+
+impl QuarantineChecker for MacOsQuarantineChecker {
+    fn has_quarantine(&self, path: &Path) -> Result<bool, UpdateFailure> {
+        ensure_background_thread()?;
+        let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| UpdateFailure::Storage)?;
+        let attribute = b"com.apple.quarantine\0";
+        let result = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                attribute.as_ptr().cast(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+            )
+        };
+        if result >= 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOATTR) {
+            Ok(false)
+        } else {
+            Err(UpdateFailure::Storage)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MacOsWorkspaceOpener;
+
+impl DmgOpener for MacOsWorkspaceOpener {
+    fn open_dmg(&self, path: &Path) -> Result<(), UpdateFailure> {
+        ensure_background_thread()?;
+        let path = path.to_str().ok_or(UpdateFailure::OpenDmg)?;
+        let path = NSString::from_str(path);
+        let url = unsafe { NSURL::fileURLWithPath(&path) };
+        if unsafe { NSWorkspace::sharedWorkspace().openURL(&url) } {
+            Ok(())
+        } else {
+            Err(UpdateFailure::OpenDmg)
+        }
+    }
+}
+
+fn ensure_background_thread() -> Result<(), UpdateFailure> {
+    if NSThread::isMainThread_class() {
+        Err(UpdateFailure::WrongThread)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "updater/reducer_tests.rs"]
+mod tests;
