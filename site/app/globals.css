@@ -692,6 +692,126 @@ main {
   line-height: 1.7;
 }
 
+.updates-section {
+  position: relative;
+}
+
+.release-boundary {
+  max-width: 720px;
+  margin: 30px 0 0;
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 1.65;
+}
+
+.update-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-top: 82px;
+}
+
+.update-cards article,
+.update-notes article {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.update-cards article {
+  min-height: 270px;
+  padding: 30px;
+}
+
+.update-cards article > span {
+  color: var(--accent);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10px;
+}
+
+.update-cards h3,
+.update-flow h3,
+.update-notes h3 {
+  margin: 46px 0 14px;
+  font-size: 23px;
+  font-weight: 530;
+  letter-spacing: -0.04em;
+}
+
+.update-cards p,
+.update-flow li,
+.update-notes article > p:not(.eyebrow),
+.update-privacy-note {
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.update-cards p,
+.update-notes p {
+  margin-bottom: 0;
+}
+
+.update-flow {
+  display: grid;
+  grid-template-columns: 0.7fr 1.3fr;
+  gap: 40px;
+  margin-top: 72px;
+  padding: 48px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.update-flow h3 {
+  margin: 0;
+}
+
+.update-flow ol {
+  margin: 0;
+  padding-left: 25px;
+}
+
+.update-flow li {
+  padding: 0 0 18px 8px;
+}
+
+.update-flow li:last-child {
+  padding-bottom: 0;
+}
+
+.update-notes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 72px;
+}
+
+.update-notes article {
+  padding: 34px;
+}
+
+.update-notes .eyebrow {
+  margin-bottom: 24px;
+}
+
+.update-notes h3 {
+  margin-top: 0;
+}
+
+.update-notes code {
+  color: #d8d1ca;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 0.88em;
+  overflow-wrap: anywhere;
+}
+
+.update-privacy-note {
+  max-width: 760px;
+  margin: 30px 0 0 auto;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10px;
+}
+
 .install {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -889,7 +1009,13 @@ footer > div a:hover {
   }
 
   .steps,
-  .permissions {
+  .permissions,
+  .update-cards,
+  .update-notes {
+    grid-template-columns: 1fr;
+  }
+
+  .update-flow {
     grid-template-columns: 1fr;
   }
 
@@ -1036,6 +1162,23 @@ footer > div a:hover {
 
   .permissions article {
     padding: 23px 20px;
+  }
+
+  .update-cards {
+    margin-top: 52px;
+  }
+
+  .update-cards article {
+    min-height: 0;
+    padding: 24px 20px;
+  }
+
+  .update-cards h3 {
+    margin-top: 26px;
+  }
+
+  .update-notes article {
+    padding: 26px 20px;
   }
 
   footer > div {

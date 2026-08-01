@@ -74,6 +74,47 @@ test("renders the current PTT2me v1.0.5 product contract", async () => {
   );
 });
 
+test("documents the 1.1.0 update flow without replacing the v1.0.5 download", async () => {
+  const response = await render();
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /После публикации PTT2me 1\.1\.0/);
+  assert.match(html, /через 60 секунд после запуска/);
+  assert.match(html, /не чаще одного раза в 24 часа/);
+  assert.match(html, /Проверить обновления…/);
+  assert.match(html, /Full DMG/);
+  assert.match(html, /Update DMG без модели/);
+  assert.match(html, /модель проверена/);
+  assert.match(
+    html,
+    /~\/Library\/Application Support\/PTT2me\/models\/gigaam-v3-rnnt-v1\//,
+  );
+  assert.match(html, /Скачать обновление/);
+  assert.match(html, /GitHub Release/);
+  assert.match(html, /Открыть DMG и выйти…/);
+  assert.match(html, /замените PTT2me\.app через Finder/);
+  assert.match(html, /Открыть всё равно/);
+  assert.match(html, /сначала проверяет и подготавливает модель/);
+  assert.match(
+    html,
+    /Универсального доступа, Мониторинга ввода и Микрофона/,
+  );
+  assert.match(html, /Повторить сброс разрешений/);
+  assert.match(html, /выдайте три разрешения заново/);
+  assert.match(html, /Полное удаление/);
+  assert.match(html, /~\/Library\/Caches\/com\.ptt2me\.app\//);
+  assert.match(html, /~\/Library\/Preferences\/com\.ptt2me\.app\.plist/);
+
+  assert.doesNotMatch(html, /tccutil/i);
+  assert.doesNotMatch(html, /application_update/);
+  assert.doesNotMatch(
+    html,
+    /releases\/download\/v1\.1\.0|releases\/tag\/v1\.1\.0/,
+  );
+  assert.doesNotMatch(html, /Скачать PTT2me 1\.1\.0/);
+});
+
 test("removes the disposable starter preview", async () => {
   await assert.rejects(access(new URL("app/_sites-preview", root)));
 });
