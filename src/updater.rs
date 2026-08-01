@@ -1,12 +1,16 @@
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use objc2::rc::Retained;
 use objc2_app_kit::NSWorkspace;
-use objc2_foundation::{NSString, NSThread, NSURL};
+use objc2_foundation::{NSThread, NSURL};
 
 use crate::constants::{
     MAX_UPDATE_ARTIFACT_BYTES, MAX_UPDATE_MANIFEST_BYTES, UPDATE_CONNECT_TIMEOUT_SECONDS,
@@ -86,21 +90,6 @@ impl VerifiedDownload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenVerifiedDmg {
-    path: PathBuf,
-}
-
-impl OpenVerifiedDmg {
-    fn from_verified_path(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryAction {
     ManualCheck,
@@ -125,6 +114,7 @@ pub enum RetryContext {
     Download {
         release: Box<VerifiedRelease>,
         artifact: SelectedArtifact,
+        disposition: OfferDisposition,
     },
 }
 
@@ -162,22 +152,19 @@ pub enum UpdaterState {
     Downloading {
         release: Box<VerifiedRelease>,
         artifact: SelectedArtifact,
+        disposition: OfferDisposition,
         operation_id: OperationId,
     },
     ReadyToInstall {
         release: Box<VerifiedRelease>,
         artifact: SelectedArtifact,
+        disposition: OfferDisposition,
         path: PathBuf,
-    },
-    VerifyingForOpen {
-        release: Box<VerifiedRelease>,
-        artifact: SelectedArtifact,
-        path: PathBuf,
-        operation_id: OperationId,
     },
     Opening {
         release: Box<VerifiedRelease>,
         artifact: SelectedArtifact,
+        disposition: OfferDisposition,
         path: PathBuf,
         operation_id: OperationId,
     },
@@ -205,15 +192,11 @@ pub enum UpdaterCommand {
         release: Box<VerifiedRelease>,
         artifact: SelectedArtifact,
     },
-    VerifyBeforeOpen {
+    VerifyAndOpenDmg {
         operation_id: OperationId,
         release: Box<VerifiedRelease>,
         artifact: SelectedArtifact,
-        path: PathBuf,
-    },
-    OpenDmg {
-        operation_id: OperationId,
-        dmg: OpenVerifiedDmg,
+        expected_path: PathBuf,
     },
     RequestOrderlyQuit,
 }
@@ -261,10 +244,6 @@ pub enum UpdaterEvent {
     },
     RetryRequested,
     OpenRequested,
-    OpenVerificationCompleted {
-        operation_id: OperationId,
-        result: Result<OpenVerifiedDmg, UpdateFailure>,
-    },
     OpenCompleted {
         operation_id: OperationId,
         result: Result<(), UpdateFailure>,
@@ -371,10 +350,6 @@ impl Updater {
             } => self.download_failed(operation_id, failure),
             UpdaterEvent::RetryRequested => self.retry_failed_operation(),
             UpdaterEvent::OpenRequested => self.request_open(),
-            UpdaterEvent::OpenVerificationCompleted {
-                operation_id,
-                result,
-            } => self.open_verification_completed(operation_id, result),
             UpdaterEvent::OpenCompleted {
                 operation_id,
                 result,
@@ -572,6 +547,7 @@ impl Updater {
         self.state = UpdaterState::Downloading {
             release: release.clone(),
             artifact: artifact.clone(),
+            disposition,
             operation_id: download_id,
         };
         vec![UpdaterCommand::DownloadAndVerify {
@@ -618,6 +594,7 @@ impl Updater {
         let UpdaterState::Downloading {
             release,
             artifact,
+            disposition,
             operation_id: expected,
         } = self.state.clone()
         else {
@@ -629,6 +606,7 @@ impl Updater {
         self.state = UpdaterState::ReadyToInstall {
             release,
             artifact,
+            disposition,
             path: download.path,
         };
         Vec::new()
@@ -642,6 +620,7 @@ impl Updater {
         let UpdaterState::Downloading {
             release,
             artifact,
+            disposition,
             operation_id: expected,
         } = self.state.clone()
         else {
@@ -653,7 +632,11 @@ impl Updater {
         self.state = UpdaterState::Failed {
             failure,
             retry: RetryAction::Download,
-            context: Some(RetryContext::Download { release, artifact }),
+            context: Some(RetryContext::Download {
+                release,
+                artifact,
+                disposition,
+            }),
         };
         Vec::new()
     }
@@ -692,17 +675,25 @@ impl Updater {
                     required_model,
                 }]
             }
-            (RetryAction::Download, RetryContext::Download { release, artifact }) => {
-                let operation_id = self.allocate_operation();
-                self.state = UpdaterState::Downloading {
-                    release: release.clone(),
-                    artifact: artifact.clone(),
-                    operation_id,
-                };
-                vec![UpdaterCommand::DownloadAndVerify {
-                    operation_id,
+            (
+                RetryAction::Download,
+                RetryContext::Download {
                     release,
                     artifact,
+                    disposition,
+                },
+            ) => {
+                let operation_id = self.allocate_operation();
+                let required_model = release.required_model.clone();
+                self.state = UpdaterState::RecheckingModel {
+                    release,
+                    artifact,
+                    disposition,
+                    operation_id,
+                };
+                vec![UpdaterCommand::RecheckModel {
+                    operation_id,
+                    required_model,
                 }]
             }
             _ => Vec::new(),
@@ -716,6 +707,7 @@ impl Updater {
         let UpdaterState::ReadyToInstall {
             release,
             artifact,
+            disposition,
             path,
         } = self.state.clone()
         else {
@@ -723,60 +715,18 @@ impl Updater {
         };
         let operation_id = self.allocate_operation();
         self.last_open_failure = None;
-        self.state = UpdaterState::VerifyingForOpen {
+        self.state = UpdaterState::Opening {
             release: release.clone(),
             artifact: artifact.clone(),
+            disposition,
             path: path.clone(),
             operation_id,
         };
-        vec![UpdaterCommand::VerifyBeforeOpen {
+        vec![UpdaterCommand::VerifyAndOpenDmg {
             operation_id,
             release,
             artifact,
-            path,
-        }]
-    }
-
-    fn open_verification_completed(
-        &mut self,
-        operation_id: OperationId,
-        result: Result<OpenVerifiedDmg, UpdateFailure>,
-    ) -> Vec<UpdaterCommand> {
-        let UpdaterState::VerifyingForOpen {
-            release,
-            artifact,
-            path,
-            operation_id: expected,
-        } = self.state.clone()
-        else {
-            return Vec::new();
-        };
-        if expected != operation_id || !self.finish_operation(operation_id) {
-            return Vec::new();
-        }
-        let dmg = match result {
-            Ok(dmg) if dmg.path == path => dmg,
-            Ok(_) => {
-                self.state =
-                    failed_download_context(UpdateFailure::DigestMismatch, release, artifact);
-                return Vec::new();
-            }
-            Err(failure) => {
-                self.state = failed_download_context(failure, release, artifact);
-                return Vec::new();
-            }
-        };
-
-        let open_id = self.allocate_operation();
-        self.state = UpdaterState::Opening {
-            release,
-            artifact,
-            path,
-            operation_id: open_id,
-        };
-        vec![UpdaterCommand::OpenDmg {
-            operation_id: open_id,
-            dmg,
+            expected_path: path,
         }]
     }
 
@@ -788,6 +738,7 @@ impl Updater {
         let UpdaterState::Opening {
             release,
             artifact,
+            disposition,
             path,
             operation_id: expected,
         } = self.state.clone()
@@ -799,13 +750,19 @@ impl Updater {
         }
         match result {
             Ok(()) => vec![UpdaterCommand::RequestOrderlyQuit],
-            Err(failure) => {
-                self.last_open_failure = Some(failure);
+            Err(UpdateFailure::OpenDmg) => {
+                self.last_open_failure = Some(UpdateFailure::OpenDmg);
                 self.state = UpdaterState::ReadyToInstall {
                     release,
                     artifact,
+                    disposition,
                     path,
                 };
+                Vec::new()
+            }
+            Err(failure) => {
+                self.last_open_failure = Some(failure);
+                self.state = failed_download_context(failure, release, artifact, disposition);
                 Vec::new()
             }
         }
@@ -889,11 +846,16 @@ fn failed_download_context(
     failure: UpdateFailure,
     release: Box<VerifiedRelease>,
     artifact: SelectedArtifact,
+    disposition: OfferDisposition,
 ) -> UpdaterState {
     UpdaterState::Failed {
         failure,
         retry: RetryAction::Download,
-        context: Some(RetryContext::Download { release, artifact }),
+        context: Some(RetryContext::Download {
+            release,
+            artifact,
+            disposition,
+        }),
     }
 }
 
@@ -1089,7 +1051,12 @@ pub trait UpdateClock: Send + Sync {
 }
 
 pub trait DmgOpener: Send + Sync {
-    fn open_dmg(&self, dmg: &OpenVerifiedDmg) -> Result<(), UpdateFailure>;
+    fn verify_and_open_dmg(
+        &self,
+        release: &VerifiedRelease,
+        artifact: &SelectedArtifact,
+        expected_path: &Path,
+    ) -> Result<(), UpdateFailure>;
 }
 
 pub trait QuarantineChecker: Send + Sync {
@@ -1134,32 +1101,6 @@ where
             response.content_length,
         )?;
         self.finish_download(path)
-    }
-
-    pub fn verify_for_open(
-        &self,
-        release: &VerifiedRelease,
-        kind: ArtifactKind,
-        artifact: &ArtifactDescriptor,
-        expected_path: &Path,
-    ) -> Result<OpenVerifiedDmg, UpdateFailure> {
-        let Some(path) = self.storage.lookup_verified(release, kind, artifact)? else {
-            return Err(UpdateFailure::DigestMismatch);
-        };
-        if path != expected_path {
-            return Err(UpdateFailure::DigestMismatch);
-        }
-        match self.quarantine.has_quarantine(&path) {
-            Ok(true) => Ok(OpenVerifiedDmg::from_verified_path(path)),
-            Ok(false) => {
-                self.storage.discard(&path)?;
-                Err(UpdateFailure::QuarantineMissing)
-            }
-            Err(failure) => {
-                let _ = self.storage.discard(&path);
-                Err(failure)
-            }
-        }
     }
 
     fn finish_download(&self, path: PathBuf) -> Result<VerifiedDownload, UpdateFailure> {
@@ -1418,20 +1359,242 @@ impl QuarantineChecker for MacOsQuarantineChecker {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MacOsWorkspaceOpener;
+fn read_fd_stat(fd: RawFd) -> Result<libc::stat, UpdateFailure> {
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(UpdateFailure::Storage);
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn read_relative_stat(directory_fd: RawFd, name: &CString) -> Result<libc::stat, UpdateFailure> {
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            directory_fd,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(UpdateFailure::DigestMismatch);
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn validate_controlled_directory(stat: &libc::stat) -> Result<(), UpdateFailure> {
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || stat.st_uid != unsafe { libc::geteuid() }
+        || stat.st_mode & (libc::S_IWGRP | libc::S_IWOTH) != 0
+    {
+        return Err(UpdateFailure::Storage);
+    }
+    Ok(())
+}
+
+fn validate_controlled_artifact(
+    stat: &libc::stat,
+    expected_size: u64,
+) -> Result<(), UpdateFailure> {
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || stat.st_size < 0
+        || stat.st_size as u64 != expected_size
+    {
+        return Err(UpdateFailure::DigestMismatch);
+    }
+    if stat.st_uid != unsafe { libc::geteuid() }
+        || stat.st_mode & (libc::S_IWGRP | libc::S_IWOTH) != 0
+    {
+        return Err(UpdateFailure::Storage);
+    }
+    Ok(())
+}
+
+fn same_file_identity(left: &libc::stat, right: &libc::stat) -> bool {
+    left.st_dev == right.st_dev && left.st_ino == right.st_ino && left.st_size == right.st_size
+}
+
+fn same_verified_snapshot(left: &libc::stat, right: &libc::stat) -> bool {
+    same_file_identity(left, right)
+        && left.st_mtime == right.st_mtime
+        && left.st_mtime_nsec == right.st_mtime_nsec
+        && left.st_ctime == right.st_ctime
+        && left.st_ctime_nsec == right.st_ctime_nsec
+}
+
+fn open_controlled_directory(path: &Path) -> Result<File, UpdateFailure> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| UpdateFailure::Storage)?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(UpdateFailure::Storage);
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn open_controlled_artifact(directory_fd: RawFd, name: &CString) -> Result<File, UpdateFailure> {
+    let fd = unsafe {
+        libc::openat(
+            directory_fd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return if matches!(error.raw_os_error(), Some(code) if code == libc::ELOOP || code == libc::ENOENT)
+        {
+            Err(UpdateFailure::DigestMismatch)
+        } else {
+            Err(UpdateFailure::Storage)
+        };
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn descriptor_has_quarantine(fd: RawFd) -> Result<bool, UpdateFailure> {
+    let attribute = b"com.apple.quarantine\0";
+    let result =
+        unsafe { libc::fgetxattr(fd, attribute.as_ptr().cast(), std::ptr::null_mut(), 0, 0, 0) };
+    if result >= 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOATTR) {
+        Ok(false)
+    } else {
+        Err(UpdateFailure::Storage)
+    }
+}
+
+fn verify_and_open_dmg_with<AfterHash, OpenPath>(
+    cache_root: &Path,
+    release: &VerifiedRelease,
+    artifact: &SelectedArtifact,
+    expected_path: &Path,
+    after_hash: AfterHash,
+    open_path: OpenPath,
+) -> Result<(), UpdateFailure>
+where
+    AfterHash: FnOnce() -> io::Result<()>,
+    OpenPath: FnOnce(&Path) -> bool,
+{
+    if !cache_root.is_absolute() {
+        return Err(UpdateFailure::Storage);
+    }
+    let signed_descriptor = match artifact.kind {
+        ArtifactKind::Full => &release.fresh_install,
+        ArtifactKind::Update => &release.application_update,
+    };
+    if &artifact.descriptor != signed_descriptor {
+        return Err(UpdateFailure::DigestMismatch);
+    }
+    let (canonical_path, _) = artifact_cache_paths(cache_root, release, artifact.kind);
+    if expected_path != canonical_path {
+        return Err(UpdateFailure::DigestMismatch);
+    }
+    let name = expected_path
+        .file_name()
+        .ok_or(UpdateFailure::DigestMismatch)?;
+    let name = CString::new(name.as_bytes()).map_err(|_| UpdateFailure::Storage)?;
+
+    let directory = open_controlled_directory(cache_root)?;
+    let directory_stat = read_fd_stat(directory.as_raw_fd())?;
+    validate_controlled_directory(&directory_stat)?;
+
+    let file = open_controlled_artifact(directory.as_raw_fd(), &name)?;
+    let verified_stat = read_fd_stat(file.as_raw_fd())?;
+    validate_controlled_artifact(&verified_stat, artifact.descriptor.size)?;
+    let limit = artifact
+        .descriptor
+        .size
+        .checked_add(1)
+        .ok_or(UpdateFailure::InvalidArtifactSize)?;
+    verify_artifact((&file).take(limit), &artifact.descriptor).map_err(map_artifact_error)?;
+
+    after_hash().map_err(|_| UpdateFailure::Storage)?;
+    if !descriptor_has_quarantine(file.as_raw_fd())? {
+        return Err(UpdateFailure::QuarantineMissing);
+    }
+
+    let final_file_stat = read_fd_stat(file.as_raw_fd())?;
+    validate_controlled_artifact(&final_file_stat, artifact.descriptor.size)?;
+    if !same_verified_snapshot(&verified_stat, &final_file_stat) {
+        return Err(UpdateFailure::DigestMismatch);
+    }
+    let path_directory_stat = read_relative_stat(
+        libc::AT_FDCWD,
+        &CString::new(cache_root.as_os_str().as_bytes()).map_err(|_| UpdateFailure::Storage)?,
+    )?;
+    validate_controlled_directory(&path_directory_stat)?;
+    if !same_file_identity(&directory_stat, &path_directory_stat) {
+        return Err(UpdateFailure::DigestMismatch);
+    }
+    let path_file_stat = read_relative_stat(directory.as_raw_fd(), &name)?;
+    validate_controlled_artifact(&path_file_stat, artifact.descriptor.size)?;
+    if !same_file_identity(&final_file_stat, &path_file_stat) {
+        return Err(UpdateFailure::DigestMismatch);
+    }
+
+    // NSWorkspace accepts only a path URL. Holding both descriptors through
+    // openURL and checking identity immediately beforehand narrows replacement
+    // races, but cannot cryptographically bind LaunchServices to this inode
+    // against hostile code already running as the same UID.
+    let opened = open_path(expected_path);
+    drop(file);
+    drop(directory);
+    if opened {
+        Ok(())
+    } else {
+        Err(UpdateFailure::OpenDmg)
+    }
+}
+
+fn file_url_for_path(path: &Path) -> Result<Retained<NSURL>, UpdateFailure> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| UpdateFailure::OpenDmg)?;
+    let path = NonNull::new(path.as_ptr().cast_mut()).ok_or(UpdateFailure::OpenDmg)?;
+    Ok(unsafe {
+        NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(path, false, None)
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct MacOsWorkspaceOpener {
+    cache_root: PathBuf,
+}
+
+impl MacOsWorkspaceOpener {
+    pub const fn new(cache_root: PathBuf) -> Self {
+        Self { cache_root }
+    }
+}
 
 impl DmgOpener for MacOsWorkspaceOpener {
-    fn open_dmg(&self, dmg: &OpenVerifiedDmg) -> Result<(), UpdateFailure> {
+    fn verify_and_open_dmg(
+        &self,
+        release: &VerifiedRelease,
+        artifact: &SelectedArtifact,
+        expected_path: &Path,
+    ) -> Result<(), UpdateFailure> {
         ensure_background_thread()?;
-        let path = dmg.path().to_str().ok_or(UpdateFailure::OpenDmg)?;
-        let path = NSString::from_str(path);
-        let url = unsafe { NSURL::fileURLWithPath(&path) };
-        if unsafe { NSWorkspace::sharedWorkspace().openURL(&url) } {
-            Ok(())
-        } else {
-            Err(UpdateFailure::OpenDmg)
-        }
+        verify_and_open_dmg_with(
+            &self.cache_root,
+            release,
+            artifact,
+            expected_path,
+            || Ok(()),
+            |path| {
+                let Ok(url) = file_url_for_path(path) else {
+                    return false;
+                };
+                unsafe { NSWorkspace::sharedWorkspace().openURL(&url) }
+            },
+        )
     }
 }
 

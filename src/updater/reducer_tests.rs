@@ -1,6 +1,9 @@
 use std::cell::Cell;
+use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io::{self, Cursor, Read};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -10,12 +13,12 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
 
 use super::{
-    cache_verified_download, cache_verified_download_with_promoter, next_automatic_check_at,
-    read_bounded_manifest, validate_http_response_metadata, ArtifactKind, ArtifactWorker,
-    CheckReason, DownloadResponse, FileUpdateStorage, OpenVerifiedDmg, OperationId,
-    QuarantineChecker, RetryAction, RetryContext, SelectedArtifact, UpdateFailure, UpdateFetch,
-    Updater, UpdaterCommand, UpdaterEvent, UpdaterState, VerifiedDownload,
-    AUTOMATIC_CHECK_INTERVAL_SECONDS, FIRST_AUTOMATIC_CHECK_DELAY_SECONDS,
+    cache_verified_download, cache_verified_download_with_promoter, file_url_for_path,
+    next_automatic_check_at, read_bounded_manifest, validate_http_response_metadata,
+    verify_and_open_dmg_with, ArtifactKind, ArtifactWorker, CheckReason, DownloadResponse,
+    FileUpdateStorage, OperationId, QuarantineChecker, RetryAction, RetryContext, SelectedArtifact,
+    UpdateFailure, UpdateFetch, Updater, UpdaterCommand, UpdaterEvent, UpdaterState,
+    VerifiedDownload, AUTOMATIC_CHECK_INTERVAL_SECONDS, FIRST_AUTOMATIC_CHECK_DELAY_SECONDS,
 };
 use crate::constants::MAX_UPDATE_ARTIFACT_BYTES;
 use crate::update_manifest::{
@@ -714,7 +717,7 @@ fn model_recheck_retry_preserves_the_offer_without_restarting_discovery() {
 }
 
 #[test]
-fn download_retry_reuses_the_verified_release_and_artifact_context() {
+fn download_retry_rechecks_the_required_model_before_fetching_again() {
     let mut updater = updater();
     let failed_id = begin_verified_download(&mut updater);
     assert!(updater
@@ -724,20 +727,32 @@ fn download_retry_reuses_the_verified_release_and_artifact_context() {
         })
         .is_empty());
 
-    let retry_id = match updater.handle(UpdaterEvent::RetryRequested).as_slice() {
-        [UpdaterCommand::DownloadAndVerify {
-            operation_id,
-            release,
-            artifact,
-        }] if release.version.to_string() == "1.0.6" && artifact.kind == ArtifactKind::Update => {
-            *operation_id
+    assert!(matches!(
+        updater.state(),
+        UpdaterState::Failed {
+            retry: RetryAction::Download,
+            context: Some(RetryContext::Download {
+                disposition: super::OfferDisposition::Available,
+                artifact: SelectedArtifact {
+                    kind: ArtifactKind::Update,
+                    ..
+                },
+                ..
+            }),
+            ..
         }
-        unexpected => panic!("expected executable download retry, got {unexpected:?}"),
+    ));
+    let retry_id = match updater.handle(UpdaterEvent::RetryRequested).as_slice() {
+        [UpdaterCommand::RecheckModel {
+            operation_id,
+            required_model,
+        }] if required_model.id == "gigaam-v3-rnnt-v1" => *operation_id,
+        unexpected => panic!("expected model-safe download retry, got {unexpected:?}"),
     };
     assert_ne!(retry_id, failed_id);
     assert!(matches!(
         updater.state(),
-        UpdaterState::Downloading {
+        UpdaterState::RecheckingModel {
             operation_id,
             artifact: SelectedArtifact {
                 kind: ArtifactKind::Update,
@@ -746,10 +761,72 @@ fn download_retry_reuses_the_verified_release_and_artifact_context() {
             ..
         } if operation_id == &retry_id
     ));
+
+    assert!(matches!(
+        updater
+            .handle(UpdaterEvent::ModelRechecked {
+                operation_id: retry_id,
+                model: ModelAvailability::Verified("gigaam-v3-rnnt-v1".to_owned()),
+            })
+            .as_slice(),
+        [UpdaterCommand::DownloadAndVerify {
+            artifact: SelectedArtifact {
+                kind: ArtifactKind::Update,
+                ..
+            },
+            ..
+        }]
+    ));
 }
 
 #[test]
-fn explicit_open_revalidates_with_stale_suppression_and_quits_only_after_open_success() {
+fn download_retry_model_drift_returns_to_full_offer_for_fresh_confirmation() {
+    let mut updater = updater();
+    let failed_id = begin_verified_download(&mut updater);
+    assert!(updater
+        .handle(UpdaterEvent::DownloadFailed {
+            operation_id: failed_id,
+            failure: UpdateFailure::Network,
+        })
+        .is_empty());
+    let retry_id = match updater.handle(UpdaterEvent::RetryRequested).as_slice() {
+        [UpdaterCommand::RecheckModel { operation_id, .. }] => *operation_id,
+        unexpected => panic!("expected retry model recheck, got {unexpected:?}"),
+    };
+
+    assert!(updater
+        .handle(UpdaterEvent::ModelRechecked {
+            operation_id: retry_id,
+            model: ModelAvailability::Missing,
+        })
+        .is_empty());
+    let (artifact, disposition) = offered_artifact(updater.state());
+    assert_eq!(disposition, "available");
+    assert_eq!(artifact.kind, ArtifactKind::Full);
+
+    let confirmation_recheck = match updater.handle(UpdaterEvent::DownloadRequested).as_slice() {
+        [UpdaterCommand::RecheckModel { operation_id, .. }] => *operation_id,
+        unexpected => panic!("expected fresh Full confirmation, got {unexpected:?}"),
+    };
+    assert!(matches!(
+        updater
+            .handle(UpdaterEvent::ModelRechecked {
+                operation_id: confirmation_recheck,
+                model: ModelAvailability::Missing,
+            })
+            .as_slice(),
+        [UpdaterCommand::DownloadAndVerify {
+            artifact: SelectedArtifact {
+                kind: ArtifactKind::Full,
+                ..
+            },
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn explicit_open_is_one_verified_boundary_with_stale_suppression_and_quit_after_success() {
     let mut updater = updater();
     let download_id = begin_verified_download(&mut updater);
     let dmg = PathBuf::from("/cache/PTT2me-1.0.6-update.dmg");
@@ -765,52 +842,31 @@ fn explicit_open_revalidates_with_stale_suppression_and_quits_only_after_open_su
         UpdaterState::ReadyToInstall { path, .. } if path == &dmg
     ));
 
-    let verification_id = match updater.handle(UpdaterEvent::OpenRequested).as_slice() {
-        [UpdaterCommand::VerifyBeforeOpen {
+    let open_id = match updater.handle(UpdaterEvent::OpenRequested).as_slice() {
+        [UpdaterCommand::VerifyAndOpenDmg {
             operation_id,
             release,
             artifact,
-            path,
+            expected_path,
         }] if release.version.to_string() == "1.0.6"
             && artifact.kind == ArtifactKind::Update
-            && path == &dmg =>
+            && expected_path == &dmg =>
         {
             *operation_id
         }
-        unexpected => panic!("expected explicit verification command, got {unexpected:?}"),
+        unexpected => panic!("expected one verified-open command, got {unexpected:?}"),
     };
     assert!(matches!(
         updater.state(),
-        UpdaterState::VerifyingForOpen { operation_id, .. }
-            if operation_id == &verification_id
+        UpdaterState::Opening { operation_id, .. } if operation_id == &open_id
     ));
 
-    let verified = OpenVerifiedDmg::from_verified_path(dmg.clone());
     assert!(updater
-        .handle(UpdaterEvent::OpenVerificationCompleted {
-            operation_id: OperationId(verification_id.0 + 1_000),
-            result: Ok(verified.clone()),
+        .handle(UpdaterEvent::OpenCompleted {
+            operation_id: OperationId(open_id.0 + 1_000),
+            result: Ok(()),
         })
         .is_empty());
-    assert!(matches!(
-        updater.state(),
-        UpdaterState::VerifyingForOpen { operation_id, .. }
-            if operation_id == &verification_id
-    ));
-
-    let open_id = match updater
-        .handle(UpdaterEvent::OpenVerificationCompleted {
-            operation_id: verification_id,
-            result: Ok(verified),
-        })
-        .as_slice()
-    {
-        [UpdaterCommand::OpenDmg {
-            operation_id,
-            dmg: verified,
-        }] if verified.path() == dmg => *operation_id,
-        unexpected => panic!("expected typed open command, got {unexpected:?}"),
-    };
     assert!(matches!(
         updater.state(),
         UpdaterState::Opening { operation_id, .. } if operation_id == &open_id
@@ -828,19 +884,9 @@ fn explicit_open_revalidates_with_stale_suppression_and_quits_only_after_open_su
     ));
     assert_eq!(updater.last_open_failure(), Some(UpdateFailure::OpenDmg));
 
-    let retry_verification_id = match updater.handle(UpdaterEvent::OpenRequested).as_slice() {
-        [UpdaterCommand::VerifyBeforeOpen { operation_id, .. }] => *operation_id,
-        unexpected => panic!("expected verification retry, got {unexpected:?}"),
-    };
-    let retry_id = match updater
-        .handle(UpdaterEvent::OpenVerificationCompleted {
-            operation_id: retry_verification_id,
-            result: Ok(OpenVerifiedDmg::from_verified_path(dmg)),
-        })
-        .as_slice()
-    {
-        [UpdaterCommand::OpenDmg { operation_id, .. }] => *operation_id,
-        unexpected => panic!("expected typed open retry, got {unexpected:?}"),
+    let retry_id = match updater.handle(UpdaterEvent::OpenRequested).as_slice() {
+        [UpdaterCommand::VerifyAndOpenDmg { operation_id, .. }] => *operation_id,
+        unexpected => panic!("expected verified-open retry, got {unexpected:?}"),
     };
     assert_eq!(
         updater.handle(UpdaterEvent::OpenCompleted {
@@ -861,14 +907,14 @@ fn failed_open_time_verification_never_opens_and_exposes_a_download_retry() {
             download: VerifiedDownload::from_verified_path(PathBuf::from("/cache/ready.dmg")),
         })
         .is_empty());
-    let verification_id = match updater.handle(UpdaterEvent::OpenRequested).as_slice() {
-        [UpdaterCommand::VerifyBeforeOpen { operation_id, .. }] => *operation_id,
-        unexpected => panic!("expected verification command, got {unexpected:?}"),
+    let open_id = match updater.handle(UpdaterEvent::OpenRequested).as_slice() {
+        [UpdaterCommand::VerifyAndOpenDmg { operation_id, .. }] => *operation_id,
+        unexpected => panic!("expected verified-open command, got {unexpected:?}"),
     };
 
     assert!(updater
-        .handle(UpdaterEvent::OpenVerificationCompleted {
-            operation_id: verification_id,
+        .handle(UpdaterEvent::OpenCompleted {
+            operation_id: open_id,
             result: Err(UpdateFailure::DigestMismatch),
         })
         .is_empty());
@@ -877,8 +923,15 @@ fn failed_open_time_verification_never_opens_and_exposes_a_download_retry() {
         UpdaterState::Failed {
             failure: UpdateFailure::DigestMismatch,
             retry: RetryAction::Download,
-            context: Some(RetryContext::Download { .. }),
+            context: Some(RetryContext::Download {
+                disposition: super::OfferDisposition::Available,
+                ..
+            }),
         }
+    ));
+    assert!(matches!(
+        updater.handle(UpdaterEvent::RetryRequested).as_slice(),
+        [UpdaterCommand::RecheckModel { .. }]
     ));
 }
 
@@ -1283,88 +1336,274 @@ fn offline_cache_hit_still_fails_closed_when_quarantine_is_missing() {
     assert!(!final_path.exists());
 }
 
+fn cached_update(
+    release: &VerifiedRelease,
+    quarantine: bool,
+) -> (tempfile::TempDir, PathBuf, SelectedArtifact) {
+    let cache = tempfile::tempdir().unwrap();
+    let path = cache_verified_download(
+        cache.path(),
+        release,
+        ArtifactKind::Update,
+        &release.application_update,
+        Cursor::new(b"verified PTT2me update dmg fixture"),
+        Some(34),
+    )
+    .unwrap();
+    if quarantine {
+        set_quarantine(&path);
+    }
+    (
+        cache,
+        path,
+        SelectedArtifact {
+            kind: ArtifactKind::Update,
+            descriptor: release.application_update.clone(),
+        },
+    )
+}
+
+fn set_quarantine(path: &Path) {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let attribute = b"com.apple.quarantine\0";
+    let value = b"0081;00000000;PTT2meTests;";
+    let result = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            attribute.as_ptr().cast(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    assert_eq!(result, 0, "setxattr failed: {}", io::Error::last_os_error());
+}
+
 #[test]
-fn open_time_verification_rejects_corruption_and_symlink_replacement() {
+fn verified_open_boundary_hashes_quarantine_checks_and_opens_one_held_descriptor() {
     let release = verified_release();
+    let (cache, path, artifact) = cached_update(&release, true);
 
-    let corrupt_cache = tempfile::tempdir().unwrap();
-    let corrupt_path = cache_verified_download(
-        corrupt_cache.path(),
-        &release,
-        ArtifactKind::Update,
-        &release.application_update,
-        Cursor::new(b"verified PTT2me update dmg fixture"),
-        Some(34),
-    )
-    .unwrap();
-    fs::write(&corrupt_path, b"corrupted after ReadyToInstall").unwrap();
-    let corrupt_worker = ArtifactWorker::new(
-        OfflineFetch,
-        FileUpdateStorage::new(corrupt_cache.path().to_owned()),
-        FixedQuarantine(true),
-    );
     assert_eq!(
-        corrupt_worker.verify_for_open(
+        verify_and_open_dmg_with(
+            cache.path(),
             &release,
-            ArtifactKind::Update,
-            &release.application_update,
-            &corrupt_path,
+            &artifact,
+            &path,
+            || Ok(()),
+            |opened_path| {
+                assert_eq!(opened_path, path);
+                true
+            },
         ),
-        Err(UpdateFailure::DigestMismatch)
+        Ok(())
     );
+}
 
-    let replacement_cache = tempfile::tempdir().unwrap();
-    let replacement_path = cache_verified_download(
-        replacement_cache.path(),
-        &release,
-        ArtifactKind::Update,
-        &release.application_update,
-        Cursor::new(b"verified PTT2me update dmg fixture"),
-        Some(34),
-    )
-    .unwrap();
-    fs::remove_file(&replacement_path).unwrap();
-    let replacement_target = replacement_cache.path().join("replacement.dmg");
-    fs::write(&replacement_target, b"verified PTT2me update dmg fixture").unwrap();
-    std::os::unix::fs::symlink(&replacement_target, &replacement_path).unwrap();
-    let replacement_worker = ArtifactWorker::new(
-        OfflineFetch,
-        FileUpdateStorage::new(replacement_cache.path().to_owned()),
-        FixedQuarantine(true),
-    );
+#[test]
+fn verified_open_boundary_reports_workspace_false_without_lying_about_success() {
+    let release = verified_release();
+    let (cache, path, artifact) = cached_update(&release, true);
+
     assert_eq!(
-        replacement_worker.verify_for_open(
+        verify_and_open_dmg_with(
+            cache.path(),
             &release,
-            ArtifactKind::Update,
-            &release.application_update,
-            &replacement_path,
+            &artifact,
+            &path,
+            || Ok(()),
+            |_| false,
+        ),
+        Err(UpdateFailure::OpenDmg)
+    );
+}
+
+#[test]
+fn workspace_file_url_preserves_non_utf8_native_path_bytes() {
+    let path = PathBuf::from(OsStr::from_bytes(b"/tmp/PTT2me-cache-\xff.dmg"));
+
+    let url = file_url_for_path(&path).unwrap();
+    let round_trip = unsafe { CStr::from_ptr(url.fileSystemRepresentation().as_ptr()) };
+
+    assert_eq!(round_trip.to_bytes(), path.as_os_str().as_bytes());
+}
+
+#[test]
+fn verified_open_boundary_rejects_corruption_before_workspace_open() {
+    let release = verified_release();
+    let (cache, path, artifact) = cached_update(&release, true);
+    fs::write(&path, vec![b'x'; 34]).unwrap();
+
+    assert_eq!(
+        verify_and_open_dmg_with(
+            cache.path(),
+            &release,
+            &artifact,
+            &path,
+            || Ok(()),
+            |_| panic!("workspace must not receive corrupt bytes"),
         ),
         Err(UpdateFailure::DigestMismatch)
     );
 }
 
 #[test]
-fn open_time_verification_rechecks_quarantine_before_creating_typed_open_value() {
-    let cache = tempfile::tempdir().unwrap();
+fn verified_open_boundary_rejects_valid_bytes_at_a_noncanonical_cache_path() {
     let release = verified_release();
-    let path = cache_verified_download(
-        cache.path(),
-        &release,
-        ArtifactKind::Full,
-        &release.fresh_install,
-        Cursor::new(b"verified PTT2me full dmg fixture"),
-        Some(32),
-    )
-    .unwrap();
-    let worker = ArtifactWorker::new(
-        OfflineFetch,
-        FileUpdateStorage::new(cache.path().to_owned()),
-        FixedQuarantine(false),
-    );
+    let (cache, _path, artifact) = cached_update(&release, true);
+    let other_path = cache.path().join("other.dmg");
+    fs::write(&other_path, b"verified PTT2me update dmg fixture").unwrap();
+    set_quarantine(&other_path);
 
     assert_eq!(
-        worker.verify_for_open(&release, ArtifactKind::Full, &release.fresh_install, &path,),
+        verify_and_open_dmg_with(
+            cache.path(),
+            &release,
+            &artifact,
+            &other_path,
+            || Ok(()),
+            |_| panic!("workspace must not receive a noncanonical cache path"),
+        ),
+        Err(UpdateFailure::DigestMismatch)
+    );
+}
+
+#[test]
+fn verified_open_boundary_rejects_regular_replacement_at_post_hash_barrier() {
+    let release = verified_release();
+    let (cache, path, artifact) = cached_update(&release, true);
+
+    assert_eq!(
+        verify_and_open_dmg_with(
+            cache.path(),
+            &release,
+            &artifact,
+            &path,
+            || {
+                fs::remove_file(&path)?;
+                fs::write(&path, b"verified PTT2me update dmg fixture")?;
+                set_quarantine(&path);
+                Ok(())
+            },
+            |_| panic!("workspace must not receive a replacement inode"),
+        ),
+        Err(UpdateFailure::DigestMismatch)
+    );
+}
+
+#[test]
+fn verified_open_boundary_rejects_symlink_replacement_at_post_hash_barrier() {
+    let release = verified_release();
+    let (cache, path, artifact) = cached_update(&release, true);
+    let target = cache.path().join("replacement-target.dmg");
+    fs::write(&target, b"verified PTT2me update dmg fixture").unwrap();
+    set_quarantine(&target);
+
+    assert_eq!(
+        verify_and_open_dmg_with(
+            cache.path(),
+            &release,
+            &artifact,
+            &path,
+            || {
+                fs::remove_file(&path)?;
+                std::os::unix::fs::symlink(&target, &path)?;
+                Ok(())
+            },
+            |_| panic!("workspace must not receive a symlink replacement"),
+        ),
+        Err(UpdateFailure::DigestMismatch)
+    );
+}
+
+#[test]
+fn quarantine_is_read_from_held_descriptor_not_quarantined_replacement_path() {
+    let release = verified_release();
+    let (cache, path, artifact) = cached_update(&release, false);
+    let barrier_ran = Cell::new(false);
+
+    assert_eq!(
+        verify_and_open_dmg_with(
+            cache.path(),
+            &release,
+            &artifact,
+            &path,
+            || {
+                barrier_ran.set(true);
+                fs::remove_file(&path)?;
+                fs::write(&path, b"verified PTT2me update dmg fixture")?;
+                set_quarantine(&path);
+                Ok(())
+            },
+            |_| panic!("workspace must not receive an unquarantined descriptor"),
+        ),
         Err(UpdateFailure::QuarantineMissing)
     );
-    assert!(!path.exists());
+    assert!(barrier_ran.get());
+}
+
+#[test]
+fn verified_open_boundary_rejects_group_or_world_writable_cache_root() {
+    let release = verified_release();
+    let (cache, path, artifact) = cached_update(&release, true);
+    fs::set_permissions(cache.path(), fs::Permissions::from_mode(0o777)).unwrap();
+
+    assert_eq!(
+        verify_and_open_dmg_with(
+            cache.path(),
+            &release,
+            &artifact,
+            &path,
+            || Ok(()),
+            |_| panic!("workspace must not receive a path from an uncontrolled cache"),
+        ),
+        Err(UpdateFailure::Storage)
+    );
+}
+
+#[test]
+fn verified_open_boundary_rejects_group_or_world_writable_artifact() {
+    let release = verified_release();
+    let (cache, path, artifact) = cached_update(&release, true);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+
+    assert_eq!(
+        verify_and_open_dmg_with(
+            cache.path(),
+            &release,
+            &artifact,
+            &path,
+            || Ok(()),
+            |_| panic!("workspace must not receive an uncontrolled artifact"),
+        ),
+        Err(UpdateFailure::Storage)
+    );
+}
+
+#[test]
+fn path_based_workspace_api_cannot_bind_a_same_uid_swap_after_final_identity_check() {
+    let release = verified_release();
+    let (cache, path, artifact) = cached_update(&release, true);
+
+    // This closure is the path-based NSWorkspace call site, after the final
+    // descriptor/path identity check. A hostile concurrent process running as
+    // the same UID can still swap the path in this final window. Holding the
+    // descriptor narrows the race but cannot cryptographically bind openURL.
+    assert_eq!(
+        verify_and_open_dmg_with(
+            cache.path(),
+            &release,
+            &artifact,
+            &path,
+            || Ok(()),
+            |workspace_path| {
+                fs::remove_file(workspace_path).unwrap();
+                fs::write(workspace_path, b"same-uid post-check replacement").unwrap();
+                true
+            },
+        ),
+        Ok(())
+    );
+    assert_eq!(fs::read(path).unwrap(), b"same-uid post-check replacement");
 }
