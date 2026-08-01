@@ -17,6 +17,7 @@ use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 use crate::hotkey::{AssignmentEpoch, HotkeyControl};
 use crate::preferences::{HoldThreshold, Preferences, TriggerKey};
 use crate::state::{AppStatus, PermissionKind};
+use crate::updater::{ArtifactKind, RetryAction, UpdaterState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolStyle {
@@ -30,6 +31,165 @@ pub struct MenuProjection {
     pub symbol: &'static str,
     pub pulse: bool,
     pub style: SymbolStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdaterMenuAction {
+    CheckForUpdates,
+    DownloadUpdate,
+    RetryUpdate,
+    OpenDownloadedUpdate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpdaterMenuProjection {
+    information_title: String,
+    information_visible: bool,
+    action_title: String,
+    action_visible: bool,
+    action_enabled: bool,
+    action: Option<UpdaterMenuAction>,
+}
+
+impl UpdaterMenuProjection {
+    fn hidden() -> Self {
+        Self {
+            information_title: String::new(),
+            information_visible: false,
+            action_title: String::new(),
+            action_visible: false,
+            action_enabled: false,
+            action: None,
+        }
+    }
+
+    fn information(title: String) -> Self {
+        Self {
+            information_title: title,
+            information_visible: true,
+            ..Self::hidden()
+        }
+    }
+
+    fn information_and_action(
+        information_title: String,
+        action_title: String,
+        action: UpdaterMenuAction,
+        action_enabled: bool,
+    ) -> Self {
+        Self {
+            information_title,
+            information_visible: true,
+            action_title,
+            action_visible: true,
+            action_enabled,
+            action: Some(action),
+        }
+    }
+
+    fn action(title: String, action: UpdaterMenuAction) -> Self {
+        Self {
+            action_title: title,
+            action_visible: true,
+            action_enabled: true,
+            action: Some(action),
+            ..Self::hidden()
+        }
+    }
+
+    fn from_state(state: Option<&UpdaterState>, open_enabled: bool) -> Self {
+        let Some(state) = state else {
+            return Self::hidden();
+        };
+        match state {
+            UpdaterState::Idle => Self::action(
+                "Проверить обновления…".to_owned(),
+                UpdaterMenuAction::CheckForUpdates,
+            ),
+            UpdaterState::Checking { .. } => Self::information("Проверка обновлений…".to_owned()),
+            UpdaterState::Current => Self::information_and_action(
+                "Установлена актуальная версия".to_owned(),
+                "Проверить снова…".to_owned(),
+                UpdaterMenuAction::CheckForUpdates,
+                true,
+            ),
+            UpdaterState::Available { release, artifact }
+            | UpdaterState::DivergedLocal { release, artifact } => {
+                let kind = match artifact.kind {
+                    ArtifactKind::Update => "без модели",
+                    ArtifactKind::Full => "полная версия",
+                };
+                Self::information_and_action(
+                    format!("Доступно обновление {} ({kind})", release.version),
+                    format!("Скачать обновление {}…", release.version),
+                    UpdaterMenuAction::DownloadUpdate,
+                    true,
+                )
+            }
+            UpdaterState::RepairRequired { release, .. } => Self::information_and_action(
+                format!(
+                    "Нужна полная версия {} для восстановления модели",
+                    release.version
+                ),
+                format!("Скачать полную версию {}…", release.version),
+                UpdaterMenuAction::DownloadUpdate,
+                true,
+            ),
+            UpdaterState::Incompatible {
+                release,
+                required_macos,
+            } => Self::information_and_action(
+                format!(
+                    "Обновление {} требует macOS {}",
+                    release.version, required_macos
+                ),
+                "Проверить снова…".to_owned(),
+                UpdaterMenuAction::CheckForUpdates,
+                true,
+            ),
+            UpdaterState::UnpublishedLocal => Self::information_and_action(
+                "Локальная версия новее опубликованной".to_owned(),
+                "Проверить снова…".to_owned(),
+                UpdaterMenuAction::CheckForUpdates,
+                true,
+            ),
+            UpdaterState::RecheckingModel { .. } => {
+                Self::information("Проверка модели…".to_owned())
+            }
+            UpdaterState::Downloading { release, .. } => {
+                Self::information(format!("Загрузка обновления {}…", release.version))
+            }
+            UpdaterState::ReadyToInstall { release, .. } => Self::information_and_action(
+                format!("Обновление {} загружено", release.version),
+                "Открыть DMG и выйти…".to_owned(),
+                UpdaterMenuAction::OpenDownloadedUpdate,
+                open_enabled,
+            ),
+            UpdaterState::Opening { release, .. } => {
+                Self::information(format!("Открытие обновления {}…", release.version))
+            }
+            UpdaterState::Failed { retry, .. } => match retry {
+                RetryAction::ManualCheck => Self::information_and_action(
+                    "Не удалось проверить обновления".to_owned(),
+                    "Повторить проверку".to_owned(),
+                    UpdaterMenuAction::RetryUpdate,
+                    true,
+                ),
+                RetryAction::Download => Self::information_and_action(
+                    "Не удалось загрузить обновление".to_owned(),
+                    "Повторить загрузку".to_owned(),
+                    UpdaterMenuAction::RetryUpdate,
+                    true,
+                ),
+                RetryAction::ModelRecheck => Self::information_and_action(
+                    "Не удалось проверить модель".to_owned(),
+                    "Повторить".to_owned(),
+                    UpdaterMenuAction::RetryUpdate,
+                    true,
+                ),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +312,8 @@ const fn permission_title(permission: PermissionKind) -> &'static str {
 pub enum MenuEntry {
     Status,
     Version,
+    UpdaterInfo,
+    UpdaterAction,
     PermissionSettings,
     Trigger,
     Threshold,
@@ -160,9 +322,11 @@ pub enum MenuEntry {
     Quit,
 }
 
-pub const MENU_DESCRIPTOR: [MenuEntry; 8] = [
+pub const MENU_DESCRIPTOR: [MenuEntry; 10] = [
     MenuEntry::Status,
     MenuEntry::Version,
+    MenuEntry::UpdaterInfo,
+    MenuEntry::UpdaterAction,
     MenuEntry::PermissionSettings,
     MenuEntry::Trigger,
     MenuEntry::Threshold,
@@ -233,7 +397,9 @@ fn symbol_style(projection: &MenuProjection) -> SymbolStyle {
 struct MenuTargetIvars {
     publisher: MenuCommandPublisher,
     action_sender: Sender<MenuAction>,
+    updater_action_sender: Sender<UpdaterMenuAction>,
     status_action: Cell<Option<StatusActionKind>>,
+    updater_action: Cell<Option<UpdaterMenuAction>>,
     append_space: Cell<bool>,
 }
 
@@ -329,6 +495,14 @@ declare_class!(
             let _ = self.ivars().action_sender.send(action);
         }
 
+        #[method(performUpdaterAction:)]
+        fn perform_updater_action(&self, _sender: &AnyObject) {
+            let Some(action) = self.ivars().updater_action.get() else {
+                return;
+            };
+            let _ = self.ivars().updater_action_sender.send(action);
+        }
+
         #[method(assignTrigger:)]
         fn assign_trigger(&self, _sender: &AnyObject) {
             self.ivars().publisher.begin_assignment();
@@ -370,12 +544,15 @@ impl MenuTarget {
         hotkey: HotkeyControl,
         readiness: MenuReadiness,
         action_sender: Sender<MenuAction>,
+        updater_action_sender: Sender<UpdaterMenuAction>,
         append_space: bool,
     ) -> Retained<Self> {
         let this = mtm.alloc().set_ivars(MenuTargetIvars {
             publisher: MenuCommandPublisher::new(sender, hotkey, readiness),
             action_sender,
+            updater_action_sender,
             status_action: Cell::new(None),
+            updater_action: Cell::new(None),
             append_space: Cell::new(append_space),
         });
         unsafe { msg_send_id![super(this), init] }
@@ -390,12 +567,15 @@ pub struct MenuBar {
     _menu: Retained<NSMenu>,
     status_row: Retained<NSMenuItem>,
     status_action_row: Retained<NSMenuItem>,
+    updater_info_row: Retained<NSMenuItem>,
+    updater_action_row: Retained<NSMenuItem>,
     current_trigger_row: Retained<NSMenuItem>,
     threshold_rows: [Retained<NSMenuItem>; 3],
     trailing_space_row: Retained<NSMenuItem>,
     button: Retained<NSStatusBarButton>,
     _target: Retained<MenuTarget>,
     action_receiver: Receiver<MenuAction>,
+    updater_action_receiver: Receiver<UpdaterMenuAction>,
     pulse_active: bool,
 }
 
@@ -415,12 +595,23 @@ impl MenuBar {
     ) -> Self {
         let mtm = main_thread_marker();
         let (action_sender, action_receiver) = mpsc::channel();
-        let target = MenuTarget::new(mtm, sender, hotkey, readiness, action_sender, append_space);
+        let (updater_action_sender, updater_action_receiver) = mpsc::channel();
+        let target = MenuTarget::new(
+            mtm,
+            sender,
+            hotkey,
+            readiness,
+            action_sender,
+            updater_action_sender,
+            append_space,
+        );
         let menu = unsafe { NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("PTT2me")) };
         unsafe { menu.setAutoenablesItems(false) };
 
         let mut status_row = None;
         let mut status_action_row = None;
+        let mut updater_info_row = None;
+        let mut updater_action_row = None;
         let mut current_trigger_row = None;
         let mut threshold_rows = Vec::with_capacity(HoldThreshold::OPTIONS.len());
         let mut trailing_space_row = None;
@@ -436,6 +627,25 @@ impl MenuBar {
                     let item = menu_item(mtm, concat!("PTT2me ", env!("CARGO_PKG_VERSION")), None);
                     unsafe { item.setEnabled(false) };
                     menu.addItem(&item);
+                }
+                MenuEntry::UpdaterInfo => {
+                    let item = menu_item(mtm, "", None);
+                    unsafe {
+                        item.setEnabled(false);
+                        item.setHidden(true);
+                    }
+                    menu.addItem(&item);
+                    updater_info_row = Some(item);
+                }
+                MenuEntry::UpdaterAction => {
+                    let item = menu_item(mtm, "", Some(sel!(performUpdaterAction:)));
+                    unsafe {
+                        item.setTarget(Some(&target));
+                        item.setEnabled(false);
+                        item.setHidden(true);
+                    }
+                    menu.addItem(&item);
+                    updater_action_row = Some(item);
                 }
                 MenuEntry::PermissionSettings => {
                     let item =
@@ -542,6 +752,10 @@ impl MenuBar {
             status_row: status_row.expect("menu descriptor must contain the status row"),
             status_action_row: status_action_row
                 .expect("menu descriptor must contain the status action row"),
+            updater_info_row: updater_info_row
+                .expect("menu descriptor must contain the updater information row"),
+            updater_action_row: updater_action_row
+                .expect("menu descriptor must contain the updater action row"),
             current_trigger_row: current_trigger_row
                 .expect("menu descriptor must contain the current trigger row"),
             threshold_rows: threshold_rows
@@ -552,9 +766,11 @@ impl MenuBar {
             button,
             _target: target,
             action_receiver,
+            updater_action_receiver,
             pulse_active: false,
         };
         menu_bar.render(&AppStatus::PreparingModel);
+        menu_bar.render_updater(None, false);
         menu_bar.render_preferences(preferences);
         menu_bar.render_append_space(append_space);
         menu_bar
@@ -597,6 +813,23 @@ impl MenuBar {
         }
     }
 
+    pub(crate) fn render_updater(&self, state: Option<&UpdaterState>, open_enabled: bool) {
+        let projection = UpdaterMenuProjection::from_state(state, open_enabled);
+        unsafe {
+            self.updater_info_row
+                .setTitle(&NSString::from_str(&projection.information_title));
+            self.updater_info_row
+                .setHidden(!projection.information_visible);
+            self.updater_action_row
+                .setTitle(&NSString::from_str(&projection.action_title));
+            self.updater_action_row
+                .setHidden(!projection.action_visible);
+            self.updater_action_row
+                .setEnabled(projection.action_enabled);
+        }
+        self._target.ivars().updater_action.set(projection.action);
+    }
+
     pub fn render_preferences(&mut self, preferences: Preferences) {
         let _mtm = main_thread_marker();
         let projection = PreferenceProjection::from(preferences);
@@ -631,6 +864,10 @@ impl MenuBar {
 
     pub(crate) fn take_action(&self) -> Option<MenuAction> {
         self.action_receiver.try_recv().ok()
+    }
+
+    pub(crate) fn take_updater_action(&self) -> Option<UpdaterMenuAction> {
+        self.updater_action_receiver.try_recv().ok()
     }
 }
 
@@ -739,6 +976,51 @@ mod tests {
     use crate::hotkey::{HotkeyControl, HotkeySignal, KeyboardObservation, ObservationKind};
     use crate::preferences::{HoldThreshold, Preferences, TriggerKey};
     use crate::state::PermissionKind;
+    use crate::update_manifest::{
+        ArtifactDescriptor, MacOsVersion, RequiredModel, VerifiedRelease,
+    };
+    use crate::updater::{
+        ArtifactKind, CheckReason, OfferDisposition, OperationId, RetryAction, SelectedArtifact,
+        UpdateFailure, UpdaterState,
+    };
+
+    fn updater_release() -> Box<VerifiedRelease> {
+        Box::new(VerifiedRelease {
+            version: semver::Version::parse("1.0.6").unwrap(),
+            build: 202608011200,
+            source_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            minimum_macos: MacOsVersion::parse("13.0").unwrap(),
+            required_model: RequiredModel {
+                id: "gigaam-v3-rnnt-v1".to_owned(),
+                manifest_sha256:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_owned(),
+            },
+            fresh_install: ArtifactDescriptor {
+                url: "https://github.com/Torin2023/PTT2me/releases/download/v1.0.6/PTT2me-1.0.6-full-macos-arm64.dmg".to_owned(),
+                sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_owned(),
+                size: 200,
+            },
+            application_update: ArtifactDescriptor {
+                url: "https://github.com/Torin2023/PTT2me/releases/download/v1.0.6/PTT2me-1.0.6-update-macos-arm64.dmg".to_owned(),
+                sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_owned(),
+                size: 20,
+            },
+            published_at: "2026-08-01T12:00:00Z".to_owned(),
+        })
+    }
+
+    fn selected(kind: ArtifactKind, release: &VerifiedRelease) -> SelectedArtifact {
+        SelectedArtifact {
+            kind,
+            descriptor: match kind {
+                ArtifactKind::Full => release.fresh_install.clone(),
+                ArtifactKind::Update => release.application_update.clone(),
+            },
+        }
+    }
 
     #[test]
     fn ready_recording_and_recognition_have_exact_presentations() {
@@ -769,6 +1051,120 @@ mod tests {
                 style: SymbolStyle::Template,
             }
         );
+    }
+
+    #[test]
+    fn unavailable_updater_is_hidden_while_idle_exposes_only_manual_check() {
+        assert_eq!(
+            UpdaterMenuProjection::from_state(None, true),
+            UpdaterMenuProjection::hidden()
+        );
+
+        let idle = UpdaterMenuProjection::from_state(Some(&UpdaterState::Idle), true);
+        assert!(!idle.information_visible);
+        assert_eq!(idle.action_title, "Проверить обновления…");
+        assert!(idle.action_visible);
+        assert!(idle.action_enabled);
+        assert_eq!(idle.action, Some(UpdaterMenuAction::CheckForUpdates));
+    }
+
+    #[test]
+    fn updater_offer_projection_names_update_full_and_current_model_repair() {
+        let release = updater_release();
+        for (kind, expected) in [
+            (
+                ArtifactKind::Update,
+                "Доступно обновление 1.0.6 (без модели)",
+            ),
+            (
+                ArtifactKind::Full,
+                "Доступно обновление 1.0.6 (полная версия)",
+            ),
+        ] {
+            let projection = UpdaterMenuProjection::from_state(
+                Some(&UpdaterState::Available {
+                    release: release.clone(),
+                    artifact: selected(kind, &release),
+                }),
+                true,
+            );
+            assert_eq!(projection.information_title, expected);
+            assert_eq!(projection.action_title, "Скачать обновление 1.0.6…");
+            assert_eq!(projection.action, Some(UpdaterMenuAction::DownloadUpdate));
+        }
+
+        let repair = UpdaterMenuProjection::from_state(
+            Some(&UpdaterState::RepairRequired {
+                release: release.clone(),
+                artifact: selected(ArtifactKind::Full, &release),
+            }),
+            true,
+        );
+        assert_eq!(
+            repair.information_title,
+            "Нужна полная версия 1.0.6 для восстановления модели"
+        );
+        assert_eq!(repair.action, Some(UpdaterMenuAction::DownloadUpdate));
+    }
+
+    #[test]
+    fn updater_busy_and_ready_projection_never_exposes_the_wrong_action() {
+        let release = updater_release();
+        let checking = UpdaterMenuProjection::from_state(
+            Some(&UpdaterState::Checking {
+                reason: CheckReason::Manual,
+                operation_id: OperationId(7),
+            }),
+            true,
+        );
+        assert_eq!(checking.information_title, "Проверка обновлений…");
+        assert!(!checking.action_visible);
+
+        let downloading = UpdaterMenuProjection::from_state(
+            Some(&UpdaterState::Downloading {
+                release: release.clone(),
+                artifact: selected(ArtifactKind::Update, &release),
+                disposition: OfferDisposition::Available,
+                operation_id: OperationId(8),
+            }),
+            true,
+        );
+        assert_eq!(downloading.information_title, "Загрузка обновления 1.0.6…");
+        assert!(!downloading.action_visible);
+
+        let ready_state = UpdaterState::ReadyToInstall {
+            release: release.clone(),
+            artifact: selected(ArtifactKind::Update, &release),
+            disposition: OfferDisposition::Available,
+            path: "/tmp/PTT2me.dmg".into(),
+        };
+        let blocked = UpdaterMenuProjection::from_state(Some(&ready_state), false);
+        assert_eq!(blocked.information_title, "Обновление 1.0.6 загружено");
+        assert_eq!(blocked.action_title, "Открыть DMG и выйти…");
+        assert_eq!(
+            blocked.action,
+            Some(UpdaterMenuAction::OpenDownloadedUpdate)
+        );
+        assert!(!blocked.action_enabled);
+
+        let allowed = UpdaterMenuProjection::from_state(Some(&ready_state), true);
+        assert!(allowed.action_enabled);
+    }
+
+    #[test]
+    fn updater_manual_failure_is_retryable_without_changing_voice_status() {
+        let failure = UpdaterMenuProjection::from_state(
+            Some(&UpdaterState::Failed {
+                failure: UpdateFailure::Network,
+                retry: RetryAction::ManualCheck,
+                context: None,
+            }),
+            true,
+        );
+        assert_eq!(failure.information_title, "Не удалось проверить обновления");
+        assert_eq!(failure.action_title, "Повторить проверку");
+        assert_eq!(failure.action, Some(UpdaterMenuAction::RetryUpdate));
+        assert!(failure.action_enabled);
     }
 
     #[test]
@@ -873,6 +1269,8 @@ mod tests {
             [
                 MenuEntry::Status,
                 MenuEntry::Version,
+                MenuEntry::UpdaterInfo,
+                MenuEntry::UpdaterAction,
                 MenuEntry::PermissionSettings,
                 MenuEntry::Trigger,
                 MenuEntry::Threshold,

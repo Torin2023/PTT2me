@@ -103,6 +103,52 @@ mod tests {
             assert_eq!(raw.threshold, Some(750));
         }
     }
+
+    #[derive(Default)]
+    struct MemoryUpdateScheduleStore {
+        last_attempt: Option<u64>,
+        fail_writes: bool,
+    }
+
+    impl RawUpdateScheduleStore for MemoryUpdateScheduleStore {
+        fn last_network_check_attempt(&self) -> Option<u64> {
+            self.last_attempt
+        }
+
+        fn set_last_network_check_attempt(
+            &mut self,
+            value: u64,
+        ) -> Result<(), UpdateScheduleError> {
+            if self.fail_writes {
+                Err(UpdateScheduleError::WriteFailed)
+            } else {
+                self.last_attempt = Some(value);
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn update_schedule_repository_stores_only_the_last_network_attempt() {
+        let mut repository = UpdateScheduleRepository::new(MemoryUpdateScheduleStore::default());
+        assert_eq!(repository.load_last_attempt(), None);
+        assert_eq!(repository.persist_last_attempt(1_234_567), Ok(()));
+        assert_eq!(repository.load_last_attempt(), Some(1_234_567));
+    }
+
+    #[test]
+    fn update_schedule_repository_surfaces_persistence_failure() {
+        let mut repository = UpdateScheduleRepository::new(MemoryUpdateScheduleStore {
+            last_attempt: Some(900),
+            fail_writes: true,
+        });
+
+        assert_eq!(
+            repository.persist_last_attempt(1_000),
+            Err(UpdateScheduleError::WriteFailed)
+        );
+        assert_eq!(repository.load_last_attempt(), Some(900));
+    }
 }
 
 use core_graphics::event::KeyCode;
@@ -257,6 +303,35 @@ pub enum PreferenceError {
     ValueOutOfRange,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateScheduleError {
+    WriteFailed,
+    ValueOutOfRange,
+}
+
+pub trait RawUpdateScheduleStore {
+    fn last_network_check_attempt(&self) -> Option<u64>;
+    fn set_last_network_check_attempt(&mut self, value: u64) -> Result<(), UpdateScheduleError>;
+}
+
+pub struct UpdateScheduleRepository<R: RawUpdateScheduleStore> {
+    raw: R,
+}
+
+impl<R: RawUpdateScheduleStore> UpdateScheduleRepository<R> {
+    pub const fn new(raw: R) -> Self {
+        Self { raw }
+    }
+
+    pub fn load_last_attempt(&self) -> Option<u64> {
+        self.raw.last_network_check_attempt()
+    }
+
+    pub fn persist_last_attempt(&mut self, value: u64) -> Result<(), UpdateScheduleError> {
+        self.raw.set_last_network_check_attempt(value)
+    }
+}
+
 pub trait RawPreferenceStore {
     fn trigger_value(&self) -> Option<String>;
     fn threshold_value(&self) -> Option<u64>;
@@ -295,6 +370,48 @@ impl<R: RawPreferenceStore> PreferenceRepository<R> {
 
 pub struct SystemPreferenceStore {
     defaults: Retained<NSUserDefaults>,
+}
+
+pub struct SystemUpdateScheduleStore {
+    defaults: Retained<NSUserDefaults>,
+}
+
+impl SystemUpdateScheduleStore {
+    const LAST_ATTEMPT_KEY: &'static str = "ptt2me.last-network-check-attempt";
+
+    pub fn standard() -> Self {
+        Self {
+            defaults: unsafe { NSUserDefaults::standardUserDefaults() },
+        }
+    }
+}
+
+impl Default for SystemUpdateScheduleStore {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
+
+impl RawUpdateScheduleStore for SystemUpdateScheduleStore {
+    fn last_network_check_attempt(&self) -> Option<u64> {
+        let key = NSString::from_str(Self::LAST_ATTEMPT_KEY);
+        unsafe {
+            self.defaults.objectForKey(&key)?;
+            u64::try_from(self.defaults.integerForKey(&key)).ok()
+        }
+    }
+
+    fn set_last_network_check_attempt(&mut self, value: u64) -> Result<(), UpdateScheduleError> {
+        let key = NSString::from_str(Self::LAST_ATTEMPT_KEY);
+        let value = isize::try_from(value).map_err(|_| UpdateScheduleError::ValueOutOfRange)?;
+        unsafe {
+            self.defaults.setInteger_forKey(value, &key);
+            self.defaults
+                .synchronize()
+                .then_some(())
+                .ok_or(UpdateScheduleError::WriteFailed)
+        }
+    }
 }
 
 impl SystemPreferenceStore {

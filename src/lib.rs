@@ -19,3 +19,4 @@ pub mod state;
 pub(crate) mod text_inserter;
 pub mod update_manifest;
 pub mod updater;
+pub(crate) mod updater_runtime;

@@ -177,8 +177,17 @@ pub enum UpdaterState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdaterCommand {
-    PersistLastAttempt(u64),
+    PersistLastAttempt {
+        operation_id: OperationId,
+        attempted_at: u64,
+    },
     ScheduleAutomaticCheck(u64),
+    LoadCachedManifest {
+        operation_id: OperationId,
+    },
+    StoreVerifiedManifest {
+        bytes: Vec<u8>,
+    },
     FetchManifest {
         operation_id: OperationId,
         reason: CheckReason,
@@ -215,6 +224,14 @@ pub enum UpdaterEvent {
     },
     ManualCheckRequested {
         now: u64,
+    },
+    CachedManifestReceived {
+        operation_id: OperationId,
+        bytes: Vec<u8>,
+        model: ModelAvailability,
+    },
+    LastAttemptPersistenceFailed {
+        operation_id: OperationId,
     },
     ManifestReceived {
         operation_id: OperationId,
@@ -258,6 +275,7 @@ pub struct Updater {
     next_operation_id: u64,
     active_operation: Option<OperationId>,
     automatic_check_at: Option<u64>,
+    pending_cache_operation: Option<OperationId>,
     last_open_failure: Option<UpdateFailure>,
 }
 
@@ -275,6 +293,7 @@ impl Updater {
             next_operation_id: 1,
             active_operation: None,
             automatic_check_at: None,
+            pending_cache_operation: None,
             last_open_failure: None,
         }
     }
@@ -296,7 +315,12 @@ impl Updater {
             } => {
                 let deadline = next_automatic_check_at(launch_at, now, last_attempt);
                 self.automatic_check_at = Some(deadline);
-                vec![UpdaterCommand::ScheduleAutomaticCheck(deadline)]
+                let operation_id = self.allocate_detached_operation();
+                self.pending_cache_operation = Some(operation_id);
+                vec![
+                    UpdaterCommand::ScheduleAutomaticCheck(deadline),
+                    UpdaterCommand::LoadCachedManifest { operation_id },
+                ]
             }
             UpdaterEvent::AutomaticCheckDue {
                 launch_at,
@@ -321,6 +345,14 @@ impl Updater {
                     return Vec::new();
                 }
                 self.start_check(CheckReason::Manual, now)
+            }
+            UpdaterEvent::CachedManifestReceived {
+                operation_id,
+                bytes,
+                model,
+            } => self.receive_cached_manifest(operation_id, &bytes, model),
+            UpdaterEvent::LastAttemptPersistenceFailed { operation_id } => {
+                self.last_attempt_persistence_failed(operation_id)
             }
             UpdaterEvent::ManifestReceived {
                 operation_id,
@@ -362,9 +394,14 @@ impl Updater {
     }
 
     fn allocate_operation(&mut self) -> OperationId {
+        let operation_id = self.allocate_detached_operation();
+        self.active_operation = Some(operation_id);
+        operation_id
+    }
+
+    fn allocate_detached_operation(&mut self) -> OperationId {
         let operation_id = OperationId(self.next_operation_id);
         self.next_operation_id = self.next_operation_id.wrapping_add(1).max(1);
-        self.active_operation = Some(operation_id);
         operation_id
     }
 
@@ -377,6 +414,7 @@ impl Updater {
     }
 
     fn start_check(&mut self, reason: CheckReason, now: u64) -> Vec<UpdaterCommand> {
+        self.pending_cache_operation = None;
         let operation_id = self.allocate_operation();
         let next_attempt = now.saturating_add(AUTOMATIC_CHECK_INTERVAL_SECONDS);
         self.automatic_check_at = Some(next_attempt);
@@ -385,13 +423,61 @@ impl Updater {
             operation_id,
         };
         vec![
-            UpdaterCommand::PersistLastAttempt(now),
             UpdaterCommand::ScheduleAutomaticCheck(next_attempt),
+            UpdaterCommand::PersistLastAttempt {
+                operation_id,
+                attempted_at: now,
+            },
             UpdaterCommand::FetchManifest {
                 operation_id,
                 reason,
             },
         ]
+    }
+
+    fn receive_cached_manifest(
+        &mut self,
+        operation_id: OperationId,
+        bytes: &[u8],
+        model: ModelAvailability,
+    ) -> Vec<UpdaterCommand> {
+        if self.pending_cache_operation != Some(operation_id)
+            || self.active_operation.is_some()
+            || self.state != UpdaterState::Idle
+        {
+            return Vec::new();
+        }
+        self.pending_cache_operation = None;
+        if let Ok(release) = verify_envelope(bytes, &self.public_key) {
+            self.project_release(release, model, CheckReason::Automatic);
+        }
+        Vec::new()
+    }
+
+    fn last_attempt_persistence_failed(
+        &mut self,
+        operation_id: OperationId,
+    ) -> Vec<UpdaterCommand> {
+        let UpdaterState::Checking {
+            reason,
+            operation_id: expected,
+        } = self.state
+        else {
+            return Vec::new();
+        };
+        if expected != operation_id || !self.finish_operation(operation_id) {
+            return Vec::new();
+        }
+        self.state = if reason == CheckReason::Manual {
+            UpdaterState::Failed {
+                failure: UpdateFailure::Storage,
+                retry: RetryAction::ManualCheck,
+                context: None,
+            }
+        } else {
+            UpdaterState::Idle
+        };
+        Vec::new()
     }
 
     fn receive_manifest(
@@ -411,7 +497,12 @@ impl Updater {
             return Vec::new();
         }
         match verify_envelope(bytes, &self.public_key) {
-            Ok(release) => self.project_release(release, model, reason),
+            Ok(release) => {
+                self.project_release(release, model, reason);
+                return vec![UpdaterCommand::StoreVerifiedManifest {
+                    bytes: bytes.to_vec(),
+                }];
+            }
             Err(_) => {
                 self.state = if reason == CheckReason::Manual {
                     UpdaterState::Failed {

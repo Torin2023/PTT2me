@@ -106,19 +106,23 @@ fn manual_manifest_result(
 ) -> OperationId {
     let commands = updater.handle(UpdaterEvent::ManualCheckRequested { now: 1_000 });
     let operation_id = match commands.as_slice() {
-        [UpdaterCommand::PersistLastAttempt(1_000), UpdaterCommand::ScheduleAutomaticCheck(87_400), UpdaterCommand::FetchManifest {
+        [UpdaterCommand::ScheduleAutomaticCheck(87_400), UpdaterCommand::PersistLastAttempt {
             operation_id,
+            attempted_at: 1_000,
+        }, UpdaterCommand::FetchManifest {
+            operation_id: fetch_id,
             reason: CheckReason::Manual,
-        }] => *operation_id,
+        }] if operation_id == fetch_id => *operation_id,
         unexpected => panic!("unexpected manual-check commands: {unexpected:?}"),
     };
-    assert!(updater
-        .handle(UpdaterEvent::ManifestReceived {
+    assert_eq!(
+        updater.handle(UpdaterEvent::ManifestReceived {
             operation_id,
-            bytes,
+            bytes: bytes.clone(),
             model,
-        })
-        .is_empty());
+        }),
+        vec![UpdaterCommand::StoreVerifiedManifest { bytes }]
+    );
     operation_id
 }
 
@@ -152,17 +156,197 @@ fn scheduler_applies_launch_floor_recent_attempt_and_future_clock_clamp() {
 }
 
 #[test]
+fn launch_cache_is_reverified_silently_without_recording_a_network_attempt() {
+    let mut updater = updater();
+    let (bytes, _) = manifest(
+        "1.0.6",
+        202608011200,
+        "0123456789abcdef0123456789abcdef01234567",
+        "13.0",
+    );
+
+    let commands = updater.handle(UpdaterEvent::Launched {
+        launch_at: 1_000,
+        now: 1_000,
+        last_attempt: None,
+    });
+    let cache_operation_id = match commands.as_slice() {
+        [UpdaterCommand::ScheduleAutomaticCheck(1_060), UpdaterCommand::LoadCachedManifest { operation_id }] => {
+            *operation_id
+        }
+        unexpected => panic!("unexpected launch commands: {unexpected:?}"),
+    };
+
+    assert!(updater
+        .handle(UpdaterEvent::CachedManifestReceived {
+            operation_id: cache_operation_id,
+            bytes,
+            model: ModelAvailability::Missing,
+        })
+        .is_empty());
+    assert!(matches!(updater.state(), UpdaterState::Available { .. }));
+}
+
+#[test]
+fn invalid_cached_envelope_stays_silent_and_late_cache_cannot_replace_manual_check() {
+    let mut invalid = updater();
+    let cache_id = match invalid
+        .handle(UpdaterEvent::Launched {
+            launch_at: 1_000,
+            now: 1_000,
+            last_attempt: None,
+        })
+        .as_slice()
+    {
+        [UpdaterCommand::ScheduleAutomaticCheck(1_060), UpdaterCommand::LoadCachedManifest { operation_id }] => {
+            *operation_id
+        }
+        unexpected => panic!("unexpected launch commands: {unexpected:?}"),
+    };
+    assert!(invalid
+        .handle(UpdaterEvent::CachedManifestReceived {
+            operation_id: cache_id,
+            bytes: b"not a signed envelope".to_vec(),
+            model: ModelAvailability::Missing,
+        })
+        .is_empty());
+    assert_eq!(invalid.state(), &UpdaterState::Idle);
+
+    let mut stale = updater();
+    let cache_id = match stale
+        .handle(UpdaterEvent::Launched {
+            launch_at: 1_000,
+            now: 1_000,
+            last_attempt: None,
+        })
+        .as_slice()
+    {
+        [_, UpdaterCommand::LoadCachedManifest { operation_id }] => *operation_id,
+        unexpected => panic!("unexpected launch commands: {unexpected:?}"),
+    };
+    stale.handle(UpdaterEvent::ManualCheckRequested { now: 1_010 });
+    let (bytes, _) = manifest(
+        "1.0.6",
+        202608011200,
+        "0123456789abcdef0123456789abcdef01234567",
+        "13.0",
+    );
+    assert!(stale
+        .handle(UpdaterEvent::CachedManifestReceived {
+            operation_id: cache_id,
+            bytes,
+            model: ModelAvailability::Missing,
+        })
+        .is_empty());
+    assert!(matches!(
+        stale.state(),
+        UpdaterState::Checking {
+            reason: CheckReason::Manual,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn verified_network_envelope_is_the_only_result_that_requests_cache_replacement() {
+    let mut updater = updater();
+    let commands = updater.handle(UpdaterEvent::ManualCheckRequested { now: 1_000 });
+    let operation_id = match commands.as_slice() {
+        [UpdaterCommand::ScheduleAutomaticCheck(87_400), UpdaterCommand::PersistLastAttempt {
+            operation_id,
+            attempted_at: 1_000,
+        }, UpdaterCommand::FetchManifest {
+            operation_id: fetch_id,
+            reason: CheckReason::Manual,
+        }] if operation_id == fetch_id => *operation_id,
+        unexpected => panic!("unexpected check commands: {unexpected:?}"),
+    };
+    let (bytes, _) = manifest(
+        "1.0.6",
+        202608011200,
+        "0123456789abcdef0123456789abcdef01234567",
+        "13.0",
+    );
+
+    assert_eq!(
+        updater.handle(UpdaterEvent::ManifestReceived {
+            operation_id,
+            bytes: bytes.clone(),
+            model: ModelAvailability::Missing,
+        }),
+        vec![UpdaterCommand::StoreVerifiedManifest { bytes }]
+    );
+}
+
+#[test]
+fn persistence_failure_cancels_fetch_and_is_manual_visible_automatic_silent() {
+    let mut manual = updater();
+    let commands = manual.handle(UpdaterEvent::ManualCheckRequested { now: 1_000 });
+    let manual_id = match commands.as_slice() {
+        [UpdaterCommand::ScheduleAutomaticCheck(87_400), UpdaterCommand::PersistLastAttempt {
+            operation_id,
+            attempted_at: 1_000,
+        }, UpdaterCommand::FetchManifest {
+            operation_id: fetch_id,
+            reason: CheckReason::Manual,
+        }] if operation_id == fetch_id => *operation_id,
+        unexpected => panic!("unexpected manual commands: {unexpected:?}"),
+    };
+    assert!(manual
+        .handle(UpdaterEvent::LastAttemptPersistenceFailed {
+            operation_id: manual_id,
+        })
+        .is_empty());
+    assert!(matches!(
+        manual.state(),
+        UpdaterState::Failed {
+            failure: UpdateFailure::Storage,
+            retry: RetryAction::ManualCheck,
+            ..
+        }
+    ));
+
+    let mut automatic = updater();
+    automatic.handle(UpdaterEvent::Launched {
+        launch_at: 1_000,
+        now: 1_000,
+        last_attempt: None,
+    });
+    let commands = automatic.handle(UpdaterEvent::AutomaticCheckDue {
+        launch_at: 1_000,
+        now: 1_060,
+        last_attempt: None,
+    });
+    let automatic_id = match commands.as_slice() {
+        [UpdaterCommand::ScheduleAutomaticCheck(87_460), UpdaterCommand::PersistLastAttempt { operation_id, .. }, UpdaterCommand::FetchManifest {
+            operation_id: fetch_id,
+            reason: CheckReason::Automatic,
+        }] if operation_id == fetch_id => *operation_id,
+        unexpected => panic!("unexpected automatic commands: {unexpected:?}"),
+    };
+    automatic.handle(UpdaterEvent::LastAttemptPersistenceFailed {
+        operation_id: automatic_id,
+    });
+    assert_eq!(automatic.state(), &UpdaterState::Idle);
+}
+
+#[test]
 fn launch_and_suppressed_automatic_check_only_schedule_the_due_time() {
     let mut updater = updater();
 
-    assert_eq!(
-        updater.handle(UpdaterEvent::Launched {
-            launch_at: 1_000,
-            now: 1_000,
-            last_attempt: Some(950),
-        }),
-        vec![UpdaterCommand::ScheduleAutomaticCheck(87_350)]
-    );
+    assert!(matches!(
+        updater
+            .handle(UpdaterEvent::Launched {
+                launch_at: 1_000,
+                now: 1_000,
+                last_attempt: Some(950),
+            })
+            .as_slice(),
+        [
+            UpdaterCommand::ScheduleAutomaticCheck(87_350),
+            UpdaterCommand::LoadCachedManifest { .. }
+        ]
+    ));
     assert_eq!(
         updater.handle(UpdaterEvent::AutomaticCheckDue {
             launch_at: 1_000,
@@ -177,14 +361,19 @@ fn launch_and_suppressed_automatic_check_only_schedule_the_due_time() {
 #[test]
 fn early_automatic_callback_rearms_the_authoritative_launch_floor() {
     let mut updater = updater();
-    assert_eq!(
-        updater.handle(UpdaterEvent::Launched {
-            launch_at: 1_000,
-            now: 1_000,
-            last_attempt: None,
-        }),
-        vec![UpdaterCommand::ScheduleAutomaticCheck(1_060)]
-    );
+    assert!(matches!(
+        updater
+            .handle(UpdaterEvent::Launched {
+                launch_at: 1_000,
+                now: 1_000,
+                last_attempt: None,
+            })
+            .as_slice(),
+        [
+            UpdaterCommand::ScheduleAutomaticCheck(1_060),
+            UpdaterCommand::LoadCachedManifest { .. }
+        ]
+    ));
 
     assert_eq!(
         updater.handle(UpdaterEvent::AutomaticCheckDue {
@@ -205,8 +394,11 @@ fn early_automatic_callback_rearms_the_authoritative_launch_floor() {
             })
             .as_slice(),
         [
-            UpdaterCommand::PersistLastAttempt(1_060),
             UpdaterCommand::ScheduleAutomaticCheck(87_460),
+            UpdaterCommand::PersistLastAttempt {
+                attempted_at: 1_060,
+                ..
+            },
             UpdaterCommand::FetchManifest {
                 reason: CheckReason::Automatic,
                 ..
@@ -248,8 +440,11 @@ fn busy_due_callback_rearms_and_the_retained_check_runs_after_completion() {
             })
             .as_slice(),
         [
-            UpdaterCommand::PersistLastAttempt(87_460),
             UpdaterCommand::ScheduleAutomaticCheck(173_860),
+            UpdaterCommand::PersistLastAttempt {
+                attempted_at: 87_460,
+                ..
+            },
             UpdaterCommand::FetchManifest {
                 reason: CheckReason::Automatic,
                 ..
@@ -261,14 +456,19 @@ fn busy_due_callback_rearms_and_the_retained_check_runs_after_completion() {
 #[test]
 fn backward_clock_normalization_does_not_postpone_the_same_deadline_twice() {
     let mut updater = updater();
-    assert_eq!(
-        updater.handle(UpdaterEvent::Launched {
-            launch_at: 1_000,
-            now: 1_000,
-            last_attempt: Some(2_000),
-        }),
-        vec![UpdaterCommand::ScheduleAutomaticCheck(87_400)]
-    );
+    assert!(matches!(
+        updater
+            .handle(UpdaterEvent::Launched {
+                launch_at: 1_000,
+                now: 1_000,
+                last_attempt: Some(2_000),
+            })
+            .as_slice(),
+        [
+            UpdaterCommand::ScheduleAutomaticCheck(87_400),
+            UpdaterCommand::LoadCachedManifest { .. }
+        ]
+    ));
 
     assert!(matches!(
         updater
@@ -279,8 +479,11 @@ fn backward_clock_normalization_does_not_postpone_the_same_deadline_twice() {
             })
             .as_slice(),
         [
-            UpdaterCommand::PersistLastAttempt(87_400),
             UpdaterCommand::ScheduleAutomaticCheck(173_800),
+            UpdaterCommand::PersistLastAttempt {
+                attempted_at: 87_400,
+                ..
+            },
             UpdaterCommand::FetchManifest {
                 reason: CheckReason::Automatic,
                 ..
@@ -292,21 +495,29 @@ fn backward_clock_normalization_does_not_postpone_the_same_deadline_twice() {
 #[test]
 fn accepted_manual_check_persists_immediately_and_replaces_the_automatic_deadline() {
     let mut updater = updater();
-    assert_eq!(
-        updater.handle(UpdaterEvent::Launched {
-            launch_at: 1_000,
-            now: 1_000,
-            last_attempt: None,
-        }),
-        vec![UpdaterCommand::ScheduleAutomaticCheck(1_060)]
-    );
+    assert!(matches!(
+        updater
+            .handle(UpdaterEvent::Launched {
+                launch_at: 1_000,
+                now: 1_000,
+                last_attempt: None,
+            })
+            .as_slice(),
+        [
+            UpdaterCommand::ScheduleAutomaticCheck(1_060),
+            UpdaterCommand::LoadCachedManifest { .. }
+        ]
+    ));
 
     let commands = updater.handle(UpdaterEvent::ManualCheckRequested { now: 1_010 });
     assert!(matches!(
         commands.as_slice(),
         [
-            UpdaterCommand::PersistLastAttempt(1_010),
             UpdaterCommand::ScheduleAutomaticCheck(87_410),
+            UpdaterCommand::PersistLastAttempt {
+                attempted_at: 1_010,
+                ..
+            },
             UpdaterCommand::FetchManifest {
                 reason: CheckReason::Manual,
                 ..
@@ -334,8 +545,11 @@ fn automatic_and_manual_attempts_persist_before_fetch_and_reschedule() {
     assert!(matches!(
         commands.as_slice(),
         [
-            UpdaterCommand::PersistLastAttempt(1_060),
             UpdaterCommand::ScheduleAutomaticCheck(87_460),
+            UpdaterCommand::PersistLastAttempt {
+                attempted_at: 1_060,
+                ..
+            },
             UpdaterCommand::FetchManifest {
                 reason: CheckReason::Automatic,
                 ..
@@ -348,8 +562,11 @@ fn automatic_and_manual_attempts_persist_before_fetch_and_reschedule() {
     assert!(matches!(
         commands.as_slice(),
         [
-            UpdaterCommand::PersistLastAttempt(2_000),
             UpdaterCommand::ScheduleAutomaticCheck(88_400),
+            UpdaterCommand::PersistLastAttempt {
+                attempted_at: 2_000,
+                ..
+            },
             UpdaterCommand::FetchManifest {
                 reason: CheckReason::Manual,
                 ..
@@ -471,13 +688,16 @@ fn incompatible_automatic_check_stays_silent() {
         unexpected => panic!("expected automatic fetch, got {unexpected:?}"),
     };
 
-    assert!(updater
-        .handle(UpdaterEvent::ManifestReceived {
-            operation_id,
-            bytes,
-            model: ModelAvailability::Missing,
-        })
-        .is_empty());
+    assert!(matches!(
+        updater
+            .handle(UpdaterEvent::ManifestReceived {
+                operation_id,
+                bytes,
+                model: ModelAvailability::Missing,
+            })
+            .as_slice(),
+        [UpdaterCommand::StoreVerifiedManifest { .. }]
+    ));
     assert_eq!(updater.state(), &UpdaterState::Idle);
 }
 

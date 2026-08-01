@@ -12,6 +12,7 @@ use core_foundation::date::CFDate;
 use core_foundation::runloop::{
     kCFRunLoopCommonModes, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, CFRunLoopTimerRef,
 };
+use objc2_app_kit::NSApplication;
 use objc2_foundation::MainThreadMarker;
 
 use crate::asr::{spawn_asr_worker, AsrCommand, AsrEvent};
@@ -21,7 +22,7 @@ use crate::hotkey::{AssignmentEpoch, HotkeyControl, HotkeyListener, HotkeySignal
 use crate::inserter::{
     InsertError, PendingInsertion, PASTEBOARD_RESTORE_DELAY_MS, PASTEBOARD_SETTLE_DELAY_MS,
 };
-use crate::menu::MenuAction;
+use crate::menu::{MenuAction, UpdaterMenuAction};
 use crate::menu::{MenuBar, MenuCommand, MenuReadiness};
 use crate::model::{resources_dir_from_executable, ModelPaths};
 use crate::model_store::{
@@ -44,6 +45,11 @@ use crate::state::{
     AppController, AppEvent, AppStatus, Effect, ModelPreparationFailure, PermissionSnapshot,
 };
 use crate::text_inserter::{self, InsertMethod, InsertOutcome};
+use crate::updater::{RetryAction, SystemClock, UpdateClock, UpdaterState};
+use crate::updater_runtime::{
+    updater_open_allowed, OrderlyQuitGate, SystemUpdaterLane, UpdaterLaunchConfig,
+    UpdaterRuntimeEffect,
+};
 
 const EVENT_DRAIN_MS: u64 = 50;
 const PERMISSION_POLL_MS: u64 = 1_000;
@@ -354,6 +360,7 @@ const fn is_dictation_in_flight(status: &AppStatus) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimerKind {
     DrainEvents,
+    AutomaticUpdateCheck,
     PollPermissions,
     FinishCapture,
     CaptureLimit,
@@ -539,8 +546,11 @@ pub struct Runtime {
     asr_worker: Option<JoinHandle<()>>,
     asr_connected: bool,
     model_preparation: Option<ModelPreparationTask>,
+    updater: Option<SystemUpdaterLane>,
+    orderly_quit: OrderlyQuitGate,
     run_loop: CFRunLoop,
     drain_timer: Option<ScheduledTimer>,
+    updater_timer: Option<ScheduledTimer>,
     permission_timer: Option<ScheduledTimer>,
     finish_timer: Option<ScheduledTimer>,
     capture_limit_timer: Option<ScheduledTimer>,
@@ -557,7 +567,14 @@ pub struct Runtime {
 impl Runtime {
     /// Creates and starts the complete runtime. The returned box must remain
     /// alive until `NSApplication::run` returns.
-    pub fn start(_mtm: MainThreadMarker) -> Pin<Box<Self>> {
+    pub fn start(mtm: MainThreadMarker) -> Pin<Box<Self>> {
+        Self::start_with_updater_config(mtm, None)
+    }
+
+    pub(crate) fn start_with_updater_config(
+        _mtm: MainThreadMarker,
+        updater_config: Option<UpdaterLaunchConfig>,
+    ) -> Pin<Box<Self>> {
         let (hotkey_sender, hotkey_events) = mpsc::channel();
         let (menu_sender, menu_commands) = mpsc::channel();
         let (asr_commands, asr_command_receiver) = mpsc::channel();
@@ -574,6 +591,7 @@ impl Runtime {
         let append_space = output_preferences.current().append_space;
         let hotkey_control = HotkeyControl::new(preferences);
         let menu_readiness = MenuReadiness::new(false);
+        let updater = updater_config.map(SystemUpdaterLane::production);
 
         let mut runtime = Box::pin(Self {
             controller: AppController::new(),
@@ -599,8 +617,11 @@ impl Runtime {
             asr_worker: Some(asr_worker),
             asr_connected: true,
             model_preparation: Some(model_preparation),
+            updater,
+            orderly_quit: OrderlyQuitGate::default(),
             run_loop: CFRunLoop::get_main(),
             drain_timer: None,
+            updater_timer: None,
             permission_timer: None,
             finish_timer: None,
             capture_limit_timer: None,
@@ -619,6 +640,7 @@ impl Runtime {
         // retain this address until `Drop` removes them.
         let runtime_ref = unsafe { Pin::as_mut(&mut runtime).get_unchecked_mut() };
         runtime_ref.install_repeating_timers();
+        runtime_ref.initialize_updater();
         tracing::info!(
             lifecycle = "started",
             state = status_name(runtime_ref.controller.status())
@@ -635,6 +657,16 @@ impl Runtime {
             EVENT_DRAIN_MS,
             Some(EVENT_DRAIN_MS),
         ));
+    }
+
+    fn initialize_updater(&mut self) {
+        let effects = self
+            .updater
+            .as_mut()
+            .map(SystemUpdaterLane::launch)
+            .unwrap_or_default();
+        self.apply_updater_effects(effects);
+        self.render_updater_menu();
     }
 
     fn start_permission_setup(&mut self) {
@@ -655,6 +687,7 @@ impl Runtime {
     fn handle_timer(&mut self, kind: TimerKind) {
         match kind {
             TimerKind::DrainEvents => self.drain_events(),
+            TimerKind::AutomaticUpdateCheck => self.handle_automatic_update_timer(),
             TimerKind::PollPermissions => self.poll_permissions(),
             TimerKind::FinishCapture => self.finish_capture(),
             TimerKind::CaptureLimit => {
@@ -667,8 +700,47 @@ impl Runtime {
         }
     }
 
+    fn handle_automatic_update_timer(&mut self) {
+        cancel_timer(&self.run_loop, &mut self.updater_timer);
+        let effects = self
+            .updater
+            .as_mut()
+            .map(SystemUpdaterLane::automatic_check_due)
+            .unwrap_or_default();
+        self.apply_updater_effects(effects);
+        self.render_updater_menu();
+    }
+
+    fn apply_updater_effects(&mut self, effects: Vec<UpdaterRuntimeEffect>) {
+        for effect in effects {
+            match effect {
+                UpdaterRuntimeEffect::ScheduleAt(deadline) => {
+                    self.replace_updater_timer(deadline);
+                }
+                UpdaterRuntimeEffect::RequestOrderlyQuit => self.orderly_quit.request(),
+            }
+        }
+    }
+
+    fn replace_updater_timer(&mut self, deadline: u64) {
+        cancel_timer(&self.run_loop, &mut self.updater_timer);
+        let delay_ms = deadline
+            .saturating_sub(SystemClock.now())
+            .saturating_mul(1_000);
+        let runtime = self as *mut Self;
+        self.updater_timer = Some(ScheduledTimer::new(
+            &self.run_loop,
+            runtime,
+            TimerKind::AutomaticUpdateCheck,
+            delay_ms,
+            None,
+        ));
+    }
+
     fn drain_events(&mut self) {
         self.drain_menu_actions();
+        self.drain_updater_worker_results();
+        self.drain_updater_actions();
         self.drain_model_preparation();
         self.drain_microphone_permission_completions();
 
@@ -697,6 +769,7 @@ impl Runtime {
                 }
             }
         }
+        self.try_orderly_quit();
     }
 
     fn drain_model_preparation(&mut self) {
@@ -775,6 +848,96 @@ impl Runtime {
                 MenuAction::RetryModelPreparation => self.begin_model_preparation(),
             }
         }
+    }
+
+    fn drain_updater_worker_results(&mut self) {
+        let Some(updater) = self.updater.as_mut() else {
+            return;
+        };
+        let (effects, handled) = updater.drain_worker_results();
+        self.apply_updater_effects(effects);
+        if handled {
+            self.render_updater_menu();
+        }
+    }
+
+    fn drain_updater_actions(&mut self) {
+        while let Some(action) = self.menu.take_updater_action() {
+            if self.updater.is_none() {
+                continue;
+            }
+            let effects = match action {
+                UpdaterMenuAction::CheckForUpdates => self
+                    .updater
+                    .as_mut()
+                    .map(SystemUpdaterLane::manual_check)
+                    .unwrap_or_default(),
+                UpdaterMenuAction::DownloadUpdate => self
+                    .updater
+                    .as_mut()
+                    .map(SystemUpdaterLane::request_download)
+                    .unwrap_or_default(),
+                UpdaterMenuAction::RetryUpdate => {
+                    let retry_is_manual_check = matches!(
+                        self.updater.as_ref().map(SystemUpdaterLane::state),
+                        Some(UpdaterState::Failed {
+                            retry: RetryAction::ManualCheck,
+                            ..
+                        })
+                    );
+                    if retry_is_manual_check {
+                        self.updater
+                            .as_mut()
+                            .map(SystemUpdaterLane::manual_check)
+                            .unwrap_or_default()
+                    } else {
+                        self.updater
+                            .as_mut()
+                            .map(SystemUpdaterLane::retry)
+                            .unwrap_or_default()
+                    }
+                }
+                UpdaterMenuAction::OpenDownloadedUpdate => {
+                    if self.pending_insertion.is_none() {
+                        self.drain_hotkey_events();
+                    }
+                    if updater_open_allowed(
+                        self.controller.status(),
+                        self.pending_insertion.is_some(),
+                    ) {
+                        self.updater
+                            .as_mut()
+                            .map(SystemUpdaterLane::request_open)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                }
+            };
+            self.apply_updater_effects(effects);
+            self.render_updater_menu();
+        }
+    }
+
+    fn render_updater_menu(&self) {
+        let open_enabled =
+            updater_open_allowed(self.controller.status(), self.pending_insertion.is_some());
+        self.menu.render_updater(
+            self.updater.as_ref().map(SystemUpdaterLane::state),
+            open_enabled,
+        );
+    }
+
+    fn try_orderly_quit(&mut self) {
+        if !self
+            .orderly_quit
+            .take_if_ready(self.controller.status(), self.pending_insertion.is_some())
+        {
+            return;
+        }
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let application = NSApplication::sharedApplication(mtm);
+        unsafe { application.terminate(None) };
     }
 
     fn drain_microphone_permission_completions(&mut self) {
@@ -918,6 +1081,7 @@ impl Runtime {
         self.assignment
             .cancel_unless_ready(self.controller.status(), &self.hotkey_control);
         self.menu.render(self.controller.status());
+        self.render_updater_menu();
         tracing::debug!(state = status_name(self.controller.status()));
         for effect in effects {
             self.execute(effect);
@@ -1136,6 +1300,7 @@ impl PasteFlowBoundary for Runtime {
         self.dispatch(AppEvent::PasteFinished(result));
         self.drain_menu_commands();
         self.drain_hotkey_events();
+        self.try_orderly_quit();
     }
 }
 
@@ -1149,6 +1314,7 @@ pub(crate) fn capture_result_event(result: Result<Option<Vec<f32>>, AudioError>)
 impl Drop for Runtime {
     fn drop(&mut self) {
         cancel_timer(&self.run_loop, &mut self.drain_timer);
+        cancel_timer(&self.run_loop, &mut self.updater_timer);
         cancel_timer(&self.run_loop, &mut self.permission_timer);
         cancel_timer(&self.run_loop, &mut self.finish_timer);
         cancel_timer(&self.run_loop, &mut self.capture_limit_timer);
@@ -1166,6 +1332,7 @@ impl Drop for Runtime {
             let _ = worker.join();
         }
         self.model_preparation.take();
+        self.updater.take();
         tracing::info!(lifecycle = "terminated");
     }
 }
