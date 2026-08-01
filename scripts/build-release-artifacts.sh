@@ -173,9 +173,11 @@ PUBLISHED_PATHS=()
 BUILD_SUCCEEDED=false
 cleanup() {
     if [[ "$BUILD_SUCCEEDED" != true ]]; then
-        for path in "${PUBLISHED_PATHS[@]}"; do
-            rm -f "$path"
-        done
+        if (( ${#PUBLISHED_PATHS[@]} > 0 )); then
+            for path in "${PUBLISHED_PATHS[@]}"; do
+                rm -f "$path"
+            done
+        fi
     fi
     rm -rf "$TEMP_ROOT"
 }
@@ -209,8 +211,9 @@ for relative in \
     "Contents/MacOS/$PRODUCT" \
     "Contents/Frameworks/libsherpa-onnx-c-api.dylib" \
     "Contents/Frameworks/libonnxruntime.1.17.1.dylib"; do
-    cmp -s "$FULL_APP/$relative" "$UPDATE_APP/$relative" ||
-        fail "Full and Update payloads differ: $relative"
+    "$SCRIPT_DIR/compare-macho-payload.sh" \
+        "$FULL_APP/$relative" "$UPDATE_APP/$relative" ||
+        fail "Full and Update unsigned payloads differ: $relative"
 done
 for key in \
     CFBundleIdentifier CFBundleShortVersionString CFBundleVersion \
