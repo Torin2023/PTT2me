@@ -25,6 +25,8 @@ pub const MODEL_FILENAMES: [&str; 4] = [
 ];
 pub const EMBEDDED_MODEL_MANIFEST_BYTES: &[u8] =
     include_bytes!("../models/manifests/gigaam-v3-rnnt-v1.json");
+pub const PRODUCTION_MODEL_MANIFEST_SHA256: &str =
+    "d012004c0706adafdcfa05677f0c10679ef844810e2ebc297f9dc9689150b239";
 pub const MODEL_STORE_SPACE_RESERVE: u64 = 64 * 1024 * 1024;
 
 const MODELS_DIRECTORY: &str = "models";
@@ -148,6 +150,10 @@ pub enum ModelManifestError {
     InvalidFileSet,
     InvalidSize(String),
     InvalidSha256(String),
+    ProductionDigestMismatch {
+        expected: &'static str,
+        actual: String,
+    },
     TotalSizeOverflow,
 }
 
@@ -162,6 +168,10 @@ impl fmt::Display for ModelManifestError {
             Self::InvalidFileSet => formatter.write_str("invalid model manifest file set"),
             Self::InvalidSize(name) => write!(formatter, "invalid model file size: {name}"),
             Self::InvalidSha256(name) => write!(formatter, "invalid model file SHA-256: {name}"),
+            Self::ProductionDigestMismatch { expected, actual } => write!(
+                formatter,
+                "production model manifest digest mismatch: expected {expected}, got {actual}"
+            ),
             Self::TotalSizeOverflow => formatter.write_str("model manifest total size overflow"),
         }
     }
@@ -186,7 +196,20 @@ struct RawModelFile {
 }
 
 pub fn embedded_model_manifest() -> Result<ModelManifest, ModelManifestError> {
-    ModelManifest::from_bytes(EMBEDDED_MODEL_MANIFEST_BYTES)
+    validate_production_model_manifest(EMBEDDED_MODEL_MANIFEST_BYTES)
+}
+
+pub fn validate_production_model_manifest(
+    bytes: &[u8],
+) -> Result<ModelManifest, ModelManifestError> {
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if actual != PRODUCTION_MODEL_MANIFEST_SHA256 {
+        return Err(ModelManifestError::ProductionDigestMismatch {
+            expected: PRODUCTION_MODEL_MANIFEST_SHA256,
+            actual,
+        });
+    }
+    ModelManifest::from_bytes(bytes)
 }
 
 #[derive(Debug, Clone)]
@@ -536,6 +559,10 @@ pub enum ModelStoreError {
     UnsafeIncoming {
         path: PathBuf,
     },
+    UncontrolledPath {
+        path: PathBuf,
+        reason: String,
+    },
     BackupCollision {
         path: PathBuf,
     },
@@ -567,6 +594,11 @@ impl fmt::Display for ModelStoreError {
             Self::UnsafeIncoming { path } => write!(
                 formatter,
                 "unsafe incoming model directory requires manual repair: {}",
+                path.display()
+            ),
+            Self::UncontrolledPath { path, reason } => write!(
+                formatter,
+                "uncontrolled external model path {}: {reason}",
                 path.display()
             ),
             Self::BackupCollision { path } => {
@@ -649,6 +681,7 @@ impl ModelStoreBoundary for SystemModelStoreBoundary {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         let mut destination_file = options.open(destination)?;
+        destination_file.set_permissions(fs::Permissions::from_mode(0o600))?;
         let copied = io::copy(
             &mut (&mut source_file).take(expected_size.saturating_add(1)),
             &mut destination_file,
@@ -753,14 +786,23 @@ pub fn resolve_model_with_boundary<B: ModelStoreBoundary>(
     manifest: &ModelManifest,
     boundary: &B,
 ) -> Result<VerifiedModel, ModelStoreError> {
+    validate_existing_controlled_directory(application_support_root)?;
+    let models_root = model_store_root(application_support_root);
+    validate_existing_controlled_directory(&models_root)?;
+
     let final_directory = model_directory(application_support_root);
+    validate_existing_external_model(&final_directory)?;
     if let Ok(verified) = verify_model_directory(&final_directory, manifest) {
         return Ok(verified);
     }
 
-    let models_root = model_store_root(application_support_root);
     let incoming_directory = incoming_model_directory(application_support_root);
     if path_exists_nofollow(&incoming_directory)? {
+        let incoming_metadata = fs::symlink_metadata(&incoming_directory)
+            .map_err(|error| storage("inspect incoming model", &incoming_directory, error))?;
+        if incoming_metadata.file_type().is_dir() && !incoming_metadata.file_type().is_symlink() {
+            validate_existing_external_model(&incoming_directory)?;
+        }
         match verify_model_directory(&incoming_directory, manifest) {
             Ok(_) => {
                 ensure_models_root(&models_root)?;
@@ -773,6 +815,12 @@ pub fn resolve_model_with_boundary<B: ModelStoreBoundary>(
                 );
             }
             Err(_) if incoming_is_safe_to_remove(&incoming_directory) => {
+                revalidate_transaction_directory(&models_root, &incoming_directory)?;
+                if !incoming_is_safe_to_remove(&incoming_directory) {
+                    return Err(ModelStoreError::UnsafeIncoming {
+                        path: incoming_directory,
+                    });
+                }
                 boundary
                     .remove_directory(&incoming_directory)
                     .map_err(|error| {
@@ -797,6 +845,7 @@ pub fn resolve_model_with_boundary<B: ModelStoreBoundary>(
     verify_model_directory(bundled_directory, manifest).map_err(ModelStoreError::InvalidBundle)?;
 
     ensure_models_root(&models_root)?;
+    revalidate_controlled_store(&models_root)?;
     let required = manifest
         .total_size()?
         .checked_add(MODEL_STORE_SPACE_RESERVE)
@@ -842,24 +891,33 @@ fn model_store_root(application_support_root: &Path) -> PathBuf {
 }
 
 fn ensure_models_root(models_root: &Path) -> Result<(), ModelStoreError> {
-    if path_exists_nofollow(models_root)? {
-        let metadata = fs::symlink_metadata(models_root)
-            .map_err(|error| storage("inspect model store", models_root, error))?;
-        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-            return Ok(());
-        }
-        return Err(storage(
-            "inspect model store",
+    let application_support_root = models_root.parent().ok_or_else(|| {
+        storage(
+            "locate application support root",
             models_root,
-            io::Error::new(io::ErrorKind::InvalidData, "not a real directory"),
-        ));
-    }
+            io::Error::new(io::ErrorKind::InvalidInput, "model store has no parent"),
+        )
+    })?;
+    ensure_controlled_directory(application_support_root, "create application support root")?;
+    ensure_controlled_directory(models_root, "create model store")
+}
 
+fn ensure_controlled_directory(
+    path: &Path,
+    operation: &'static str,
+) -> Result<(), ModelStoreError> {
+    if validate_existing_controlled_directory(path)? {
+        return Ok(());
+    }
     let mut builder = fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
+    builder.mode(0o700);
     builder
-        .create(models_root)
-        .map_err(|error| storage("create model store", models_root, error))
+        .create(path)
+        .map_err(|error| storage(operation, path, error))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| storage("set controlled directory mode", path, error))?;
+    validate_existing_controlled_directory(path)?;
+    Ok(())
 }
 
 fn create_staging_directory(path: &Path) -> Result<(), ModelStoreError> {
@@ -867,7 +925,11 @@ fn create_staging_directory(path: &Path) -> Result<(), ModelStoreError> {
     builder.mode(0o700);
     builder
         .create(path)
-        .map_err(|error| storage("create staging directory", path, error))
+        .map_err(|error| storage("create staging directory", path, error))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| storage("set staging directory mode", path, error))?;
+    validate_existing_controlled_directory(path)?;
+    Ok(())
 }
 
 fn promote_incoming<B: ModelStoreBoundary>(
@@ -878,6 +940,8 @@ fn promote_incoming<B: ModelStoreBoundary>(
     boundary: &B,
 ) -> Result<VerifiedModel, ModelStoreError> {
     let backup = if path_exists_nofollow(final_directory)? {
+        revalidate_transaction_directory(models_root, final_directory)?;
+        revalidate_transaction_directory(models_root, incoming_directory)?;
         let backup = models_root.join(format!(
             "{MODEL_ID}{INVALID_MARKER}{}",
             boundary.unique_suffix()
@@ -885,6 +949,7 @@ fn promote_incoming<B: ModelStoreBoundary>(
         if path_exists_nofollow(&backup)? {
             return Err(ModelStoreError::BackupCollision { path: backup });
         }
+        revalidate_transaction_directory(models_root, final_directory)?;
         boundary
             .rename(final_directory, &backup)
             .map_err(|error| storage("quarantine invalid model", final_directory, error))?;
@@ -896,16 +961,19 @@ fn promote_incoming<B: ModelStoreBoundary>(
         None
     };
 
+    revalidate_transaction_directory(models_root, incoming_directory)?;
     boundary
         .rename(incoming_directory, final_directory)
         .map_err(|error| storage("promote staged model", incoming_directory, error))?;
     boundary
         .sync_directory(models_root)
         .map_err(|error| storage("sync model store", models_root, error))?;
+    revalidate_transaction_directory(models_root, final_directory)?;
     let verified =
         verify_model_directory(final_directory, manifest).map_err(ModelStoreError::InvalidFinal)?;
 
     if let Some(backup) = backup {
+        revalidate_transaction_directory(models_root, &backup)?;
         boundary
             .remove_directory(&backup)
             .map_err(|error| storage("remove invalid backup", &backup, error))?;
@@ -915,6 +983,96 @@ fn promote_incoming<B: ModelStoreBoundary>(
     }
 
     Ok(verified)
+}
+
+fn validate_existing_controlled_directory(path: &Path) -> Result<bool, ModelStoreError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(storage("inspect controlled directory", path, error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(uncontrolled(path, "expected a real directory"));
+    }
+    validate_controlled_metadata(path, &metadata)?;
+    Ok(true)
+}
+
+fn validate_existing_external_model(path: &Path) -> Result<(), ModelStoreError> {
+    if !validate_existing_controlled_directory(path)? {
+        return Ok(());
+    }
+    for name in MODEL_FILENAMES {
+        let file = path.join(name);
+        let metadata = match fs::symlink_metadata(&file) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(storage("inspect controlled model file", &file, error)),
+        };
+        if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+            validate_controlled_metadata(&file, &metadata)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_controlled_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ModelStoreError> {
+    // SAFETY: `geteuid` has no preconditions and does not mutate process state.
+    let current_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != current_uid {
+        return Err(uncontrolled(
+            path,
+            format!(
+                "owner uid {} does not match current uid {current_uid}",
+                metadata.uid()
+            ),
+        ));
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(uncontrolled(path, "group or world writable"));
+    }
+    Ok(())
+}
+
+fn revalidate_controlled_store(models_root: &Path) -> Result<(), ModelStoreError> {
+    let application_support_root = models_root.parent().ok_or_else(|| {
+        storage(
+            "locate application support root",
+            models_root,
+            io::Error::new(io::ErrorKind::InvalidInput, "model store has no parent"),
+        )
+    })?;
+    if !validate_existing_controlled_directory(application_support_root)? {
+        return Err(uncontrolled(
+            application_support_root,
+            "application support root disappeared",
+        ));
+    }
+    if !validate_existing_controlled_directory(models_root)? {
+        return Err(uncontrolled(models_root, "model store disappeared"));
+    }
+    Ok(())
+}
+
+fn revalidate_transaction_directory(
+    models_root: &Path,
+    directory: &Path,
+) -> Result<(), ModelStoreError> {
+    revalidate_controlled_store(models_root)?;
+    if !validate_existing_controlled_directory(directory)? {
+        return Err(uncontrolled(directory, "transaction directory disappeared"));
+    }
+    validate_existing_external_model(directory)
+}
+
+fn uncontrolled(path: &Path, reason: impl Into<String>) -> ModelStoreError {
+    ModelStoreError::UncontrolledPath {
+        path: path.to_owned(),
+        reason: reason.into(),
+    }
 }
 
 fn incoming_is_safe_to_remove(path: &Path) -> bool {

@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 use ptt2me::model_store::{
     application_support_root_from_home, embedded_model_manifest, incoming_model_directory,
     model_directory, provision_bundled_model, resolve_model_paths, resolve_model_with_boundary,
-    verify_model_directory, ModelManifest, ModelManifestError, ModelStoreBoundary, ModelStoreError,
-    ModelVerificationError, SystemModelStoreBoundary, MODEL_ID, MODEL_STORE_SPACE_RESERVE,
+    validate_production_model_manifest, verify_model_directory, ModelManifest, ModelManifestError,
+    ModelStoreBoundary, ModelStoreError, ModelVerificationError, SystemModelStoreBoundary,
+    EMBEDDED_MODEL_MANIFEST_BYTES, MODEL_ID, MODEL_STORE_SPACE_RESERVE,
+    PRODUCTION_MODEL_MANIFEST_SHA256,
 };
 use ptt2me::update_manifest::ModelAvailability;
 use tempfile::TempDir;
@@ -55,6 +57,12 @@ fn write_valid_model(directory: &std::path::Path) {
     fs::write(directory.join("decoder.onnx"), DECODER).unwrap();
     fs::write(directory.join("joiner.onnx"), JOINER).unwrap();
     fs::write(directory.join("tokens.txt"), TOKENS).unwrap();
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    let mut permissions = fs::symlink_metadata(path).unwrap().permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions).unwrap();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +197,23 @@ fn embedded_manifest_matches_the_committed_production_contract() {
         files[3].sha256(),
         "39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7"
     );
+}
+
+#[test]
+fn production_manifest_exact_byte_gate_rejects_whitespace_only_mutation() {
+    assert_eq!(
+        PRODUCTION_MODEL_MANIFEST_SHA256,
+        "d012004c0706adafdcfa05677f0c10679ef844810e2ebc297f9dc9689150b239"
+    );
+    assert!(validate_production_model_manifest(EMBEDDED_MODEL_MANIFEST_BYTES).is_ok());
+
+    let mut whitespace_mutation = EMBEDDED_MODEL_MANIFEST_BYTES.to_vec();
+    whitespace_mutation.push(b' ');
+    assert!(ModelManifest::from_bytes(&whitespace_mutation).is_ok());
+    assert!(matches!(
+        validate_production_model_manifest(&whitespace_mutation),
+        Err(ModelManifestError::ProductionDigestMismatch { .. })
+    ));
 }
 
 #[test]
@@ -404,6 +429,112 @@ fn valid_external_model_wins_without_bundle_or_space_access() {
     assert_eq!(verified.directory(), external);
     assert_eq!(boundary.available_calls.get(), 0);
     assert_eq!(boundary.copy_calls.get(), 0);
+}
+
+#[test]
+fn external_model_rejects_group_or_world_writable_files() {
+    let temp = TempDir::new().unwrap();
+    let app_support = temp.path().join("app-support");
+    let external = model_directory(&app_support);
+    write_valid_model(&external);
+    let writable_file = external.join("tokens.txt");
+    set_mode(&writable_file, 0o666);
+    let boundary = RecordingBoundary::new(0);
+
+    let result = resolve_model_with_boundary(&app_support, None, &fixture_manifest(), &boundary);
+
+    assert!(matches!(
+        result,
+        Err(ModelStoreError::UncontrolledPath { path, .. }) if path == writable_file
+    ));
+    assert_eq!(boundary.available_calls.get(), 0);
+    assert_eq!(boundary.copy_calls.get(), 0);
+}
+
+#[test]
+fn external_model_rejects_writable_final_directory_without_chmod() {
+    let temp = TempDir::new().unwrap();
+    let app_support = temp.path().join("app-support");
+    let external = model_directory(&app_support);
+    write_valid_model(&external);
+    set_mode(&external, 0o777);
+
+    let result = resolve_model_with_boundary(
+        &app_support,
+        None,
+        &fixture_manifest(),
+        &RecordingBoundary::new(0),
+    );
+
+    assert!(matches!(
+        result,
+        Err(ModelStoreError::UncontrolledPath { path, .. }) if path == external
+    ));
+    assert_eq!(
+        fs::symlink_metadata(&external)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o777,
+        "uncontrolled final directory was chmodded instead of rejected"
+    );
+}
+
+#[test]
+fn symlinked_ptt2me_root_cannot_redirect_transaction_mutations() {
+    let temp = TempDir::new().unwrap();
+    let outside = temp.path().join("outside-ptt2me");
+    let outside_final = model_directory(&outside);
+    fs::create_dir_all(&outside_final).unwrap();
+    let sentinel = outside_final.join("sentinel");
+    fs::write(&sentinel, b"must remain").unwrap();
+    let app_support = temp.path().join("app-support-link");
+    symlink(&outside, &app_support).unwrap();
+    let bundle = temp.path().join("bundle");
+    write_valid_model(&bundle);
+    let boundary = RecordingBoundary::new(u64::MAX);
+
+    let result =
+        resolve_model_with_boundary(&app_support, Some(&bundle), &fixture_manifest(), &boundary);
+
+    assert!(matches!(
+        result,
+        Err(ModelStoreError::UncontrolledPath { path, .. }) if path == app_support
+    ));
+    assert_eq!(fs::read(&sentinel).unwrap(), b"must remain");
+    assert!(!incoming_model_directory(&outside).exists());
+    assert_eq!(boundary.copy_calls.get(), 0);
+    assert!(boundary.rename_calls.borrow().is_empty());
+}
+
+#[test]
+fn symlinked_models_root_cannot_redirect_transaction_mutations() {
+    let temp = TempDir::new().unwrap();
+    let app_support = temp.path().join("app-support");
+    fs::create_dir_all(&app_support).unwrap();
+    let outside_models = temp.path().join("outside-models");
+    let outside_final = outside_models.join(MODEL_ID);
+    fs::create_dir_all(&outside_final).unwrap();
+    let sentinel = outside_final.join("sentinel");
+    fs::write(&sentinel, b"must remain").unwrap();
+    let models_link = app_support.join("models");
+    symlink(&outside_models, &models_link).unwrap();
+    let bundle = temp.path().join("bundle");
+    write_valid_model(&bundle);
+    let boundary = RecordingBoundary::new(u64::MAX);
+
+    let result =
+        resolve_model_with_boundary(&app_support, Some(&bundle), &fixture_manifest(), &boundary);
+
+    assert!(matches!(
+        result,
+        Err(ModelStoreError::UncontrolledPath { path, .. }) if path == models_link
+    ));
+    assert_eq!(fs::read(&sentinel).unwrap(), b"must remain");
+    assert!(!outside_models.join(format!("{MODEL_ID}.incoming")).exists());
+    assert_eq!(boundary.copy_calls.get(), 0);
+    assert!(boundary.rename_calls.borrow().is_empty());
 }
 
 #[test]

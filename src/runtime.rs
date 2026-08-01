@@ -96,6 +96,37 @@ fn spawn_model_preparation_worker() -> (
     spawn_model_preparation_worker_with(prepare_runtime_model)
 }
 
+/// Owns one preparation attempt. Dropping an unfinished task deliberately
+/// detaches its `JoinHandle`; the transactional model store is restart-safe,
+/// and AppKit teardown must never wait for model I/O.
+struct ModelPreparationTask {
+    events: Receiver<Result<VerifiedModel, ModelStoreError>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ModelPreparationTask {
+    fn new(
+        events: Receiver<Result<VerifiedModel, ModelStoreError>>,
+        worker: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            events,
+            worker: Some(worker),
+        }
+    }
+
+    fn try_recv(&self) -> Result<Result<VerifiedModel, ModelStoreError>, TryRecvError> {
+        self.events.try_recv()
+    }
+
+    fn join_completed(mut self) -> thread::Result<()> {
+        self.worker
+            .take()
+            .expect("model preparation task must own its worker")
+            .join()
+    }
+}
+
 fn prepare_runtime_model() -> Result<VerifiedModel, ModelStoreError> {
     let application_support = application_support_root()?;
     let executable =
@@ -507,8 +538,7 @@ pub struct Runtime {
     asr_events: Receiver<AsrEvent>,
     asr_worker: Option<JoinHandle<()>>,
     asr_connected: bool,
-    model_preparation_events: Option<Receiver<Result<VerifiedModel, ModelStoreError>>>,
-    model_preparation_worker: Option<JoinHandle<()>>,
+    model_preparation: Option<ModelPreparationTask>,
     run_loop: CFRunLoop,
     drain_timer: Option<ScheduledTimer>,
     permission_timer: Option<ScheduledTimer>,
@@ -534,6 +564,8 @@ impl Runtime {
         let (asr_event_sender, asr_events) = mpsc::channel();
         let asr_worker = spawn_asr_worker(asr_command_receiver, asr_event_sender);
         let (model_preparation_events, model_preparation_worker) = spawn_model_preparation_worker();
+        let model_preparation =
+            ModelPreparationTask::new(model_preparation_events, model_preparation_worker);
         let preference_repository = PreferenceRepository::new(SystemPreferenceStore::new());
         let preferences = preference_repository.load();
         let output_preferences = OutputPreferenceController::load(OutputPreferenceRepository::new(
@@ -566,8 +598,7 @@ impl Runtime {
             asr_events,
             asr_worker: Some(asr_worker),
             asr_connected: true,
-            model_preparation_events: Some(model_preparation_events),
-            model_preparation_worker: Some(model_preparation_worker),
+            model_preparation: Some(model_preparation),
             run_loop: CFRunLoop::get_main(),
             drain_timer: None,
             permission_timer: None,
@@ -670,9 +701,9 @@ impl Runtime {
 
     fn drain_model_preparation(&mut self) {
         let received = self
-            .model_preparation_events
+            .model_preparation
             .as_ref()
-            .map(Receiver::try_recv);
+            .map(ModelPreparationTask::try_recv);
         let result = match received {
             Some(Ok(result)) => Some(result),
             Some(Err(TryRecvError::Disconnected)) => Some(Err(ModelStoreError::Environment(
@@ -684,9 +715,8 @@ impl Runtime {
             return;
         };
 
-        self.model_preparation_events = None;
-        if let Some(worker) = self.model_preparation_worker.take() {
-            if worker.join().is_err() {
+        if let Some(task) = self.model_preparation.take() {
+            if task.join_completed().is_err() {
                 tracing::error!(error_category = "model_preparation_worker_panic");
             }
         }
@@ -712,13 +742,12 @@ impl Runtime {
     }
 
     fn begin_model_preparation(&mut self) {
-        if self.model_preparation_events.is_some() {
+        if self.model_preparation.is_some() {
             return;
         }
         self.dispatch(AppEvent::ModelPreparationStarted);
         let (events, worker) = spawn_model_preparation_worker();
-        self.model_preparation_events = Some(events);
-        self.model_preparation_worker = Some(worker);
+        self.model_preparation = Some(ModelPreparationTask::new(events, worker));
     }
 
     fn drain_hotkey_events(&mut self) {
@@ -1136,10 +1165,7 @@ impl Drop for Runtime {
         if let Some(worker) = self.asr_worker.take() {
             let _ = worker.join();
         }
-        self.model_preparation_events = None;
-        if let Some(worker) = self.model_preparation_worker.take() {
-            let _ = worker.join();
-        }
+        self.model_preparation.take();
         tracing::info!(lifecycle = "terminated");
     }
 }
@@ -1244,13 +1270,14 @@ mod tests {
     use std::fs;
     use std::rc::Rc;
     use std::thread;
+    use std::time::Duration;
 
     use super::{
         apply_output_menu_command, capture_start_result_event, milliseconds_to_seconds,
         model_preparation_plan, reset_hotkey_before_drop, spawn_model_preparation_worker_with,
         status_name, wait_for_smoke_child, AssignmentTracker, DeferredTapState,
-        MicrophonePermissionRuntime, ModelPreparationPlan, PasteFlow, PasteFlowBoundary,
-        PasteInsertion, RuntimePreferences, TapState, TimerKind, EVENT_DRAIN_MS,
+        MicrophonePermissionRuntime, ModelPreparationPlan, ModelPreparationTask, PasteFlow,
+        PasteFlowBoundary, PasteInsertion, RuntimePreferences, TapState, TimerKind, EVENT_DRAIN_MS,
         PERMISSION_POLL_MS,
     };
     use crate::audio::AudioError;
@@ -1317,6 +1344,40 @@ mod tests {
             Err(ModelStoreError::RepairRequired)
         ));
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_model_preparation_task_does_not_wait_for_blocked_worker() {
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let (events, worker) = spawn_model_preparation_worker_with(move || {
+            started_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            finished_sender.send(()).unwrap();
+            Err(ModelStoreError::RepairRequired)
+        });
+        started_receiver.recv().unwrap();
+        let task = ModelPreparationTask::new(events, worker);
+        let (dropped_sender, dropped_receiver) = std::sync::mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(task);
+            dropped_sender.send(()).unwrap();
+        });
+
+        let returned_before_release = dropped_receiver
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok();
+        release_sender.send(()).unwrap();
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        dropper.join().unwrap();
+
+        assert!(
+            returned_before_release,
+            "dropping a blocked model preparation task waited for its worker"
+        );
     }
 
     impl MicrophonePermissionBoundary for RecordingMicrophoneBoundary {

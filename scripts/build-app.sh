@@ -50,6 +50,7 @@ fi
 COMMITTED_MODEL_MANIFEST="$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
 [[ -f "$MODEL_MANIFEST" && ! -L "$MODEL_MANIFEST" ]] ||
     fail "model manifest is not a real file: $MODEL_MANIFEST"
+"$SCRIPT_DIR/check-production-model-manifest.sh" "$MODEL_MANIFEST"
 cmp -s "$COMMITTED_MODEL_MANIFEST" "$MODEL_MANIFEST" ||
     fail "--model-manifest must match the committed exact bytes"
 if [[ "$VARIANT" == "full" ]]; then

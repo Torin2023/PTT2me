@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 CHECK_MODEL_VARIANT="$REPO_ROOT/scripts/check-model-variant.sh"
+CHECK_PRODUCTION_MANIFEST="$REPO_ROOT/scripts/check-production-model-manifest.sh"
 
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ptt2me-model-variants.XXXXXX")"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
@@ -45,6 +46,31 @@ expect_failure_containing() {
         exit 1
     }
 }
+
+"$CHECK_PRODUCTION_MANIFEST" \
+    "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
+WHITESPACE_MUTATION="$TEMP_ROOT/production-manifest-whitespace.json"
+cp "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json" "$WHITESPACE_MUTATION"
+printf ' ' >>"$WHITESPACE_MUTATION"
+expect_failure_containing "production manifest SHA-256 mismatch" \
+    "$CHECK_PRODUCTION_MANIFEST" "$WHITESPACE_MUTATION"
+FAKE_APP="$TEMP_ROOT/fake.app"
+mkdir "$FAKE_APP"
+expect_failure_containing "production manifest SHA-256 mismatch" \
+    "$REPO_ROOT/scripts/build-app.sh" \
+    --variant update \
+    --model-manifest "$WHITESPACE_MUTATION"
+expect_failure_containing "production manifest SHA-256 mismatch" \
+    "$REPO_ROOT/scripts/check-bundle.sh" \
+    --variant update \
+    --model-manifest "$WHITESPACE_MUTATION" \
+    "$FAKE_APP"
+expect_failure_containing "production manifest SHA-256 mismatch" \
+    "$REPO_ROOT/scripts/build-dmg.sh" \
+    --variant update \
+    --model-manifest "$WHITESPACE_MUTATION" \
+    --app "$FAKE_APP" \
+    --output "$TEMP_ROOT/fake.dmg"
 
 "$CHECK_MODEL_VARIANT" \
     --variant full \
@@ -100,6 +126,60 @@ expect_failure_containing "model entry is not a real file" \
     --resources "$FULL_RESOURCES"
 rm "$MODEL_DIRECTORY/tokens.txt"
 mv "$TEMP_ROOT/real-tokens.txt" "$MODEL_DIRECTORY/tokens.txt"
+
+PRODUCTION_MANIFEST="$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
+OUTPUT_DIRECTORY="$TEMP_ROOT/existing-output.dmg"
+mkdir "$OUTPUT_DIRECTORY"
+expect_failure_containing "output path already exists" \
+    "$REPO_ROOT/scripts/build-dmg.sh" \
+    --variant update \
+    --model-manifest "$PRODUCTION_MANIFEST" \
+    --app "$FAKE_APP" \
+    --output "$OUTPUT_DIRECTORY"
+
+CHECKSUM_DIRECTORY_OUTPUT="$TEMP_ROOT/checksum-directory.dmg"
+mkdir "$CHECKSUM_DIRECTORY_OUTPUT.sha256"
+expect_failure_containing "checksum path already exists" \
+    "$REPO_ROOT/scripts/build-dmg.sh" \
+    --variant update \
+    --model-manifest "$PRODUCTION_MANIFEST" \
+    --app "$FAKE_APP" \
+    --output "$CHECKSUM_DIRECTORY_OUTPUT"
+
+CHECKSUM_SYMLINK_OUTPUT="$TEMP_ROOT/checksum-symlink.dmg"
+ln -s "$TEMP_ROOT/missing-checksum-target" "$CHECKSUM_SYMLINK_OUTPUT.sha256"
+expect_failure_containing "checksum path already exists" \
+    "$REPO_ROOT/scripts/build-dmg.sh" \
+    --variant update \
+    --model-manifest "$PRODUCTION_MANIFEST" \
+    --app "$FAKE_APP" \
+    --output "$CHECKSUM_SYMLINK_OUTPUT"
+
+expect_failure_containing "output must not be inside the supplied app" \
+    "$REPO_ROOT/scripts/build-dmg.sh" \
+    --variant update \
+    --model-manifest "$PRODUCTION_MANIFEST" \
+    --app "$FAKE_APP" \
+    --output "$FAKE_APP/inside.dmg"
+
+grep -Fq 'mktemp -d "$DMG_OUTPUT_DIR/.$DMG_NAME.work.XXXXXX"' \
+    "$REPO_ROOT/scripts/build-dmg.sh" || {
+    echo "build-dmg.sh must use a unique private workspace on the output filesystem" >&2
+    exit 1
+}
+grep -Fq 'ln "$TEMP_CHECKSUM" "$CHECKSUM_PATH"' \
+    "$REPO_ROOT/scripts/build-dmg.sh" || {
+    echo "build-dmg.sh must publish the checksum through a no-overwrite hard link" >&2
+    exit 1
+}
+grep -Fq 'ln "$TEMP_DMG" "$DMG_PATH"' "$REPO_ROOT/scripts/build-dmg.sh" || {
+    echo "build-dmg.sh must publish the DMG through a no-overwrite hard link" >&2
+    exit 1
+}
+if grep -Fq 'mv -f' "$REPO_ROOT/scripts/build-dmg.sh"; then
+    echo "build-dmg.sh must not overwrite concurrent outputs" >&2
+    exit 1
+fi
 
 expect_failure_containing "update variant does not accept --model-source" \
     "$REPO_ROOT/scripts/build-app.sh" \
