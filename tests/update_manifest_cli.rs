@@ -62,14 +62,14 @@ fn temporary_key_signing_and_cli_validation_cover_all_release_inputs() {
     )
     .unwrap();
     fs::set_permissions(&private_key, fs::Permissions::from_mode(0o600)).unwrap();
-    fs::write(
-        &public_key,
-        format!(
-            "{}\n",
-            STANDARD.encode(signing_key.verifying_key().to_bytes())
-        ),
-    )
-    .unwrap();
+    let signer = env!("CARGO_BIN_EXE_ptt2me-update-signer");
+    let derivation = Command::new(signer)
+        .arg("--derive-public-key")
+        .arg(&private_key)
+        .arg(&public_key)
+        .output()
+        .expect("derive public key from temporary private key");
+    assert_success(derivation, "public-key derivation");
     fs::write(&full_dmg, FULL_BYTES).unwrap();
     fs::write(&update_dmg, UPDATE_BYTES).unwrap();
     fs::write(&model_manifest, MODEL_MANIFEST_BYTES).unwrap();
@@ -95,7 +95,6 @@ fn temporary_key_signing_and_cli_validation_cover_all_release_inputs() {
     )
     .unwrap();
 
-    let signer = env!("CARGO_BIN_EXE_ptt2me-update-signer");
     let verifier = env!("CARGO_BIN_EXE_ptt2me");
     let signing = Command::new(repository.join("scripts/sign-update-manifest.sh"))
         .env("PTT2ME_MANIFEST_SIGNER", signer)
