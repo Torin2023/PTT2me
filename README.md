@@ -38,7 +38,8 @@ The menu contains the trigger controls:
 
 ```text
 <status>
-PTT2me 1.0.5
+PTT2me 1.1.0
+Проверить обновления…
 Открыть настройки…   (only while a required permission is missing)
 Клавиша активации
   <selected key>
@@ -53,9 +54,8 @@ PTT2me 1.0.5
 Выйти
 ```
 
-This menu snapshot describes the currently published Preview 1.0.5. The
-updater rows described below ship only with PTT2me 1.1.0 after that release is
-published.
+This menu snapshot describes the currently published Preview 1.1.0. The
+updater action changes when a signed release is available or downloaded.
 
 The status and version rows are informational. While a permission is missing,
 `Открыть настройки…` opens its exact Privacy & Security pane and can be used
@@ -79,12 +79,12 @@ punctuation is never added, removed, or rewritten by PTT2me.
 
 ## Published release
 
-The public download remains Preview 1.0.5:
-[PTT2me-1.0.5-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.0.5/PTT2me-1.0.5-macos-arm64.dmg)
-(182 MB, SHA-256
-`d89a1767edfb2c010ba98ffc59f6c35f8e346958c492b3ed33b4596f303a7c8c`).
-Preview 1.0.5 does not check for updates. No 1.1.0 download URL, size,
-checksum, or release page is published yet.
+The current public download is the Preview 1.1.0 Full DMG:
+[PTT2me-1.1.0-full-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.1.0/PTT2me-1.1.0-full-macos-arm64.dmg)
+(183 MB, SHA-256
+`f8cc1cfc92634aceaf35e1c887d86d6194a4f1f5dc16ebd47b0654725f38b0d0`).
+See the [v1.1.0 release page](https://github.com/Torin2023/PTT2me/releases/tag/v1.1.0)
+for the model-free Update DMG and checksum files.
 
 ## Build
 
@@ -150,14 +150,13 @@ use Full only. Update is selected only inside an already installed PTT2me.
 The release coordinator requires an explicit stable version, 12-digit UTC
 build, exact clean `HEAD`, model source, committed model manifest, publication
 timestamp, and matching key pair. The private signing key must remain outside
-Git. The package version stays 1.0.5 during development and is changed once to
-exactly 1.1.0 at the final release gate.
+Git. The published package version is exactly 1.1.0.
 
-## Updating (PTT2me 1.1.0 after publication)
+## Updating (PTT2me 1.1.0)
 
-This behavior starts only after PTT2me 1.1.0 is published. Preview 1.0.5
-cannot discover that release and must be replaced once with the published
-1.1.0 Full DMG.
+Preview 1.0.5 cannot discover this release and must be replaced once with the
+published 1.1.0 Full DMG. Starting with 1.1.0, PTT2me checks the signed stable
+channel described below.
 
 - The first automatic manifest request starts no earlier than 60 seconds after
   launch. Later automatic requests run no more than once per 24 hours.
