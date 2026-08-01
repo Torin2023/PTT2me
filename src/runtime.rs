@@ -12,6 +12,7 @@ use core_foundation::date::CFDate;
 use core_foundation::runloop::{
     kCFRunLoopCommonModes, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, CFRunLoopTimerRef,
 };
+use objc2_app_kit::NSApplication;
 use objc2_foundation::MainThreadMarker;
 
 use crate::asr::{spawn_asr_worker, AsrCommand, AsrEvent};
@@ -21,12 +22,20 @@ use crate::hotkey::{AssignmentEpoch, HotkeyControl, HotkeyListener, HotkeySignal
 use crate::inserter::{
     InsertError, PendingInsertion, PASTEBOARD_RESTORE_DELAY_MS, PASTEBOARD_SETTLE_DELAY_MS,
 };
-use crate::menu::MenuAction;
+use crate::menu::{MenuAction, UpdaterMenuAction};
 use crate::menu::{MenuBar, MenuCommand, MenuReadiness};
 use crate::model::{resources_dir_from_executable, ModelPaths};
+use crate::model_store::{
+    application_support_root, bundled_model_directory, embedded_model_manifest, resolve_model,
+    verify_model_directory, ModelStoreError, VerifiedModel,
+};
 use crate::output_preferences::{
     OutputPreferenceController, OutputPreferenceError, OutputPreferenceRepository,
     RawOutputPreferenceStore, SystemOutputPreferenceStore,
+};
+use crate::permission_migration::{
+    persist_setup_completion_if_granted, run_system_permission_migration, BuildIdentity,
+    PermissionMigrationRunError, PermissionMigrationSuccess, SystemPermissionMigrationStore,
 };
 use crate::permissions::{
     self, MicrophoneAuthorization, MicrophonePermissionBoundary, MicrophonePermissionFlow,
@@ -36,14 +45,160 @@ use crate::preferences::{
     PreferenceError, PreferenceRepository, Preferences, RawPreferenceStore, SystemPreferenceStore,
     TriggerKey,
 };
-use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
+use crate::state::{
+    AppController, AppEvent, AppStatus, Effect, ModelPreparationFailure, PermissionSnapshot,
+};
 use crate::text_inserter::{self, InsertMethod, InsertOutcome};
+use crate::updater::{RetryAction, SystemClock, UpdateClock, UpdaterState};
+use crate::updater_runtime::{
+    load_production_updater_config, updater_open_allowed, OrderlyQuitGate, SystemUpdaterLane,
+    UpdaterLaunchConfig, UpdaterRuntimeEffect,
+};
 
 const EVENT_DRAIN_MS: u64 = 50;
 const PERMISSION_POLL_MS: u64 = 1_000;
 const SMOKE_MODEL_TIMEOUT: Duration = Duration::from_secs(180);
 const SMOKE_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SMOKE_TIMEOUT_EXIT_CODE: i32 = 124;
+
+#[derive(Debug)]
+enum ModelPreparationPlan {
+    BeginPermissionMigration(ModelPaths),
+    Failed(ModelPreparationFailure),
+}
+
+impl ModelPreparationPlan {
+    const fn starts_permission_migration(&self) -> bool {
+        matches!(self, Self::BeginPermissionMigration(_))
+    }
+}
+
+fn model_preparation_plan(result: Result<VerifiedModel, ModelStoreError>) -> ModelPreparationPlan {
+    match result {
+        Ok(verified) => ModelPreparationPlan::BeginPermissionMigration(verified.into_paths()),
+        Err(ModelStoreError::RepairRequired) => {
+            ModelPreparationPlan::Failed(ModelPreparationFailure::RepairRequired)
+        }
+        Err(_) => ModelPreparationPlan::Failed(ModelPreparationFailure::Storage),
+    }
+}
+
+fn spawn_model_preparation_worker_with<F>(
+    prepare: F,
+) -> (
+    Receiver<Result<VerifiedModel, ModelStoreError>>,
+    JoinHandle<()>,
+)
+where
+    F: FnOnce() -> Result<VerifiedModel, ModelStoreError> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let _ = sender.send(prepare());
+    });
+    (receiver, worker)
+}
+
+fn spawn_model_preparation_worker() -> (
+    Receiver<Result<VerifiedModel, ModelStoreError>>,
+    JoinHandle<()>,
+) {
+    spawn_model_preparation_worker_with(prepare_runtime_model)
+}
+
+/// Owns one preparation attempt. Dropping an unfinished task deliberately
+/// detaches its `JoinHandle`; the transactional model store is restart-safe,
+/// and AppKit teardown must never wait for model I/O.
+struct ModelPreparationTask {
+    events: Receiver<Result<VerifiedModel, ModelStoreError>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ModelPreparationTask {
+    fn new(
+        events: Receiver<Result<VerifiedModel, ModelStoreError>>,
+        worker: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            events,
+            worker: Some(worker),
+        }
+    }
+
+    fn try_recv(&self) -> Result<Result<VerifiedModel, ModelStoreError>, TryRecvError> {
+        self.events.try_recv()
+    }
+
+    fn join_completed(mut self) -> thread::Result<()> {
+        self.worker
+            .take()
+            .expect("model preparation task must own its worker")
+            .join()
+    }
+}
+
+struct PermissionMigrationWorkerResult {
+    paths: ModelPaths,
+    migration: Result<PermissionMigrationSuccess, PermissionMigrationRunError>,
+}
+
+fn spawn_permission_migration_worker_with<F>(
+    paths: ModelPaths,
+    migrate: F,
+) -> (Receiver<PermissionMigrationWorkerResult>, JoinHandle<()>)
+where
+    F: FnOnce() -> Result<PermissionMigrationSuccess, PermissionMigrationRunError> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let migration = migrate();
+        let _ = sender.send(PermissionMigrationWorkerResult { paths, migration });
+    });
+    (receiver, worker)
+}
+
+fn spawn_permission_migration_worker(
+    paths: ModelPaths,
+) -> (Receiver<PermissionMigrationWorkerResult>, JoinHandle<()>) {
+    spawn_permission_migration_worker_with(paths, run_system_permission_migration)
+}
+
+/// Owns one permission migration attempt. Dropping an unfinished task
+/// deliberately detaches its worker so AppKit teardown never waits for TCC.
+struct PermissionMigrationTask {
+    events: Receiver<PermissionMigrationWorkerResult>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl PermissionMigrationTask {
+    fn new(events: Receiver<PermissionMigrationWorkerResult>, worker: JoinHandle<()>) -> Self {
+        Self {
+            events,
+            worker: Some(worker),
+        }
+    }
+
+    fn try_recv(&self) -> Result<PermissionMigrationWorkerResult, TryRecvError> {
+        self.events.try_recv()
+    }
+
+    fn join_completed(mut self) -> thread::Result<()> {
+        self.worker
+            .take()
+            .expect("permission migration task must own its worker")
+            .join()
+    }
+}
+
+fn prepare_runtime_model() -> Result<VerifiedModel, ModelStoreError> {
+    let application_support = application_support_root()?;
+    let executable =
+        std::env::current_exe().map_err(|error| ModelStoreError::Environment(error.to_string()))?;
+    let resources =
+        resources_dir_from_executable(&executable).map_err(ModelStoreError::Environment)?;
+    let bundled = bundled_model_directory(&resources);
+    resolve_model(&application_support, Some(&bundled))
+}
 
 struct RuntimePreferences<R: RawPreferenceStore> {
     current: Preferences,
@@ -262,6 +417,7 @@ const fn is_dictation_in_flight(status: &AppStatus) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimerKind {
     DrainEvents,
+    AutomaticUpdateCheck,
     PollPermissions,
     FinishCapture,
     CaptureLimit,
@@ -446,8 +602,15 @@ pub struct Runtime {
     asr_events: Receiver<AsrEvent>,
     asr_worker: Option<JoinHandle<()>>,
     asr_connected: bool,
+    model_preparation: Option<ModelPreparationTask>,
+    permission_migration: Option<PermissionMigrationTask>,
+    prepared_model_paths: Option<ModelPaths>,
+    permission_build_identity: Option<BuildIdentity>,
+    updater: Option<SystemUpdaterLane>,
+    orderly_quit: OrderlyQuitGate,
     run_loop: CFRunLoop,
     drain_timer: Option<ScheduledTimer>,
+    updater_timer: Option<ScheduledTimer>,
     permission_timer: Option<ScheduledTimer>,
     finish_timer: Option<ScheduledTimer>,
     capture_limit_timer: Option<ScheduledTimer>,
@@ -464,12 +627,32 @@ pub struct Runtime {
 impl Runtime {
     /// Creates and starts the complete runtime. The returned box must remain
     /// alive until `NSApplication::run` returns.
-    pub fn start(_mtm: MainThreadMarker) -> Pin<Box<Self>> {
+    pub fn start(mtm: MainThreadMarker) -> Pin<Box<Self>> {
+        let updater_config = match load_production_updater_config() {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::error!(
+                    error_category = "updater_production_config",
+                    error = %error
+                );
+                None
+            }
+        };
+        Self::start_with_updater_config(mtm, updater_config)
+    }
+
+    pub(crate) fn start_with_updater_config(
+        _mtm: MainThreadMarker,
+        updater_config: Option<UpdaterLaunchConfig>,
+    ) -> Pin<Box<Self>> {
         let (hotkey_sender, hotkey_events) = mpsc::channel();
         let (menu_sender, menu_commands) = mpsc::channel();
         let (asr_commands, asr_command_receiver) = mpsc::channel();
         let (asr_event_sender, asr_events) = mpsc::channel();
         let asr_worker = spawn_asr_worker(asr_command_receiver, asr_event_sender);
+        let (model_preparation_events, model_preparation_worker) = spawn_model_preparation_worker();
+        let model_preparation =
+            ModelPreparationTask::new(model_preparation_events, model_preparation_worker);
         let preference_repository = PreferenceRepository::new(SystemPreferenceStore::new());
         let preferences = preference_repository.load();
         let output_preferences = OutputPreferenceController::load(OutputPreferenceRepository::new(
@@ -478,6 +661,7 @@ impl Runtime {
         let append_space = output_preferences.current().append_space;
         let hotkey_control = HotkeyControl::new(preferences);
         let menu_readiness = MenuReadiness::new(false);
+        let updater = updater_config.map(SystemUpdaterLane::production);
 
         let mut runtime = Box::pin(Self {
             controller: AppController::new(),
@@ -502,8 +686,15 @@ impl Runtime {
             asr_events,
             asr_worker: Some(asr_worker),
             asr_connected: true,
+            model_preparation: Some(model_preparation),
+            permission_migration: None,
+            prepared_model_paths: None,
+            permission_build_identity: None,
+            updater,
+            orderly_quit: OrderlyQuitGate::default(),
             run_loop: CFRunLoop::get_main(),
             drain_timer: None,
+            updater_timer: None,
             permission_timer: None,
             finish_timer: None,
             capture_limit_timer: None,
@@ -522,8 +713,7 @@ impl Runtime {
         // retain this address until `Drop` removes them.
         let runtime_ref = unsafe { Pin::as_mut(&mut runtime).get_unchecked_mut() };
         runtime_ref.install_repeating_timers();
-        runtime_ref.begin_model_load();
-        runtime_ref.poll_permissions();
+        runtime_ref.initialize_updater();
         tracing::info!(
             lifecycle = "started",
             state = status_name(runtime_ref.controller.status())
@@ -540,6 +730,23 @@ impl Runtime {
             EVENT_DRAIN_MS,
             Some(EVENT_DRAIN_MS),
         ));
+    }
+
+    fn initialize_updater(&mut self) {
+        let effects = self
+            .updater
+            .as_mut()
+            .map(SystemUpdaterLane::launch)
+            .unwrap_or_default();
+        self.apply_updater_effects(effects);
+        self.render_updater_menu();
+    }
+
+    fn start_permission_setup(&mut self) {
+        if self.permission_timer.is_some() {
+            return;
+        }
+        let runtime = self as *mut Self;
         self.permission_timer = Some(ScheduledTimer::new(
             &self.run_loop,
             runtime,
@@ -547,29 +754,13 @@ impl Runtime {
             PERMISSION_POLL_MS,
             Some(PERMISSION_POLL_MS),
         ));
-    }
-
-    fn begin_model_load(&mut self) {
-        let paths = std::env::current_exe()
-            .map_err(|_| "current executable unavailable".to_owned())
-            .and_then(|executable| resources_dir_from_executable(&executable))
-            .and_then(|resources| ModelPaths::from_resources(&resources));
-
-        match paths {
-            Ok(paths) => {
-                if self.asr_commands.send(AsrCommand::Load(paths)).is_err() {
-                    self.dispatch(AppEvent::ModelLoaded(Err(
-                        "ASR worker unavailable".to_owned()
-                    )));
-                }
-            }
-            Err(error) => self.dispatch(AppEvent::ModelLoaded(Err(error))),
-        }
+        self.poll_permissions();
     }
 
     fn handle_timer(&mut self, kind: TimerKind) {
         match kind {
             TimerKind::DrainEvents => self.drain_events(),
+            TimerKind::AutomaticUpdateCheck => self.handle_automatic_update_timer(),
             TimerKind::PollPermissions => self.poll_permissions(),
             TimerKind::FinishCapture => self.finish_capture(),
             TimerKind::CaptureLimit => {
@@ -582,8 +773,49 @@ impl Runtime {
         }
     }
 
+    fn handle_automatic_update_timer(&mut self) {
+        cancel_timer(&self.run_loop, &mut self.updater_timer);
+        let effects = self
+            .updater
+            .as_mut()
+            .map(SystemUpdaterLane::automatic_check_due)
+            .unwrap_or_default();
+        self.apply_updater_effects(effects);
+        self.render_updater_menu();
+    }
+
+    fn apply_updater_effects(&mut self, effects: Vec<UpdaterRuntimeEffect>) {
+        for effect in effects {
+            match effect {
+                UpdaterRuntimeEffect::ScheduleAt(deadline) => {
+                    self.replace_updater_timer(deadline);
+                }
+                UpdaterRuntimeEffect::RequestOrderlyQuit => self.orderly_quit.request(),
+            }
+        }
+    }
+
+    fn replace_updater_timer(&mut self, deadline: u64) {
+        cancel_timer(&self.run_loop, &mut self.updater_timer);
+        let delay_ms = deadline
+            .saturating_sub(SystemClock.now())
+            .saturating_mul(1_000);
+        let runtime = self as *mut Self;
+        self.updater_timer = Some(ScheduledTimer::new(
+            &self.run_loop,
+            runtime,
+            TimerKind::AutomaticUpdateCheck,
+            delay_ms,
+            None,
+        ));
+    }
+
     fn drain_events(&mut self) {
         self.drain_menu_actions();
+        self.drain_updater_worker_results();
+        self.drain_updater_actions();
+        self.drain_model_preparation();
+        self.drain_permission_migration();
         self.drain_microphone_permission_completions();
 
         self.drain_menu_commands();
@@ -611,6 +843,125 @@ impl Runtime {
                 }
             }
         }
+        self.try_orderly_quit();
+    }
+
+    fn drain_model_preparation(&mut self) {
+        let received = self
+            .model_preparation
+            .as_ref()
+            .map(ModelPreparationTask::try_recv);
+        let result = match received {
+            Some(Ok(result)) => Some(result),
+            Some(Err(TryRecvError::Disconnected)) => Some(Err(ModelStoreError::Environment(
+                "model preparation worker disconnected".to_owned(),
+            ))),
+            Some(Err(TryRecvError::Empty)) | None => None,
+        };
+        let Some(result) = result else {
+            return;
+        };
+
+        if let Some(task) = self.model_preparation.take() {
+            if task.join_completed().is_err() {
+                tracing::error!(error_category = "model_preparation_worker_panic");
+            }
+        }
+
+        let plan = model_preparation_plan(result);
+        debug_assert_eq!(
+            plan.starts_permission_migration(),
+            matches!(&plan, ModelPreparationPlan::BeginPermissionMigration(_))
+        );
+        match plan {
+            ModelPreparationPlan::BeginPermissionMigration(paths) => {
+                self.begin_permission_migration(paths);
+            }
+            ModelPreparationPlan::Failed(failure) => {
+                self.dispatch(AppEvent::ModelPreparationFailed(failure));
+            }
+        }
+    }
+
+    fn begin_permission_migration(&mut self, paths: ModelPaths) {
+        if self.permission_migration.is_some() {
+            return;
+        }
+        self.dispatch(AppEvent::PermissionMigrationStarted);
+        self.prepared_model_paths = Some(paths.clone());
+        let (events, worker) = spawn_permission_migration_worker(paths);
+        self.permission_migration = Some(PermissionMigrationTask::new(events, worker));
+    }
+
+    fn retry_permission_migration(&mut self) {
+        if self.permission_migration.is_some() {
+            return;
+        }
+        let Some(paths) = self.prepared_model_paths.take() else {
+            return;
+        };
+        self.begin_permission_migration(paths);
+    }
+
+    fn drain_permission_migration(&mut self) {
+        let received = self
+            .permission_migration
+            .as_ref()
+            .map(PermissionMigrationTask::try_recv);
+        let completed = match received {
+            Some(Ok(result)) => Some(Some(result)),
+            Some(Err(TryRecvError::Disconnected)) => Some(None),
+            Some(Err(TryRecvError::Empty)) | None => None,
+        };
+        let Some(completed) = completed else {
+            return;
+        };
+
+        if let Some(task) = self.permission_migration.take() {
+            if task.join_completed().is_err() {
+                tracing::error!(error_category = "permission_migration_worker_panic");
+            }
+        }
+
+        let Some(result) = completed else {
+            tracing::error!(error_category = "permission_migration_worker_disconnected");
+            self.dispatch(AppEvent::PermissionMigrationFailed);
+            return;
+        };
+        match result.migration {
+            Ok(success) => {
+                self.prepared_model_paths = None;
+                self.permission_build_identity = match success {
+                    PermissionMigrationSuccess::Release(identity) => Some(identity),
+                    PermissionMigrationSuccess::DevelopmentBypass => None,
+                };
+                self.dispatch(AppEvent::PermissionMigrationCompleted);
+                self.start_permission_setup();
+                if self
+                    .asr_commands
+                    .send(AsrCommand::Load(result.paths))
+                    .is_err()
+                {
+                    self.dispatch(AppEvent::ModelLoaded(Err(
+                        "ASR worker unavailable".to_owned()
+                    )));
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = ?error, error_category = "permission_migration");
+                self.prepared_model_paths = Some(result.paths);
+                self.dispatch(AppEvent::PermissionMigrationFailed);
+            }
+        }
+    }
+
+    fn begin_model_preparation(&mut self) {
+        if self.model_preparation.is_some() {
+            return;
+        }
+        self.dispatch(AppEvent::ModelPreparationStarted);
+        let (events, worker) = spawn_model_preparation_worker();
+        self.model_preparation = Some(ModelPreparationTask::new(events, worker));
     }
 
     fn drain_hotkey_events(&mut self) {
@@ -635,8 +986,100 @@ impl Runtime {
                         tracing::warn!(error_category = "open_permission_settings");
                     }
                 }
+                MenuAction::RetryModelPreparation => self.begin_model_preparation(),
+                MenuAction::RetryPermissionMigration => self.retry_permission_migration(),
             }
         }
+    }
+
+    fn drain_updater_worker_results(&mut self) {
+        let Some(updater) = self.updater.as_mut() else {
+            return;
+        };
+        let (effects, handled) = updater.drain_worker_results();
+        self.apply_updater_effects(effects);
+        if handled {
+            self.render_updater_menu();
+        }
+    }
+
+    fn drain_updater_actions(&mut self) {
+        while let Some(action) = self.menu.take_updater_action() {
+            if self.updater.is_none() {
+                continue;
+            }
+            let effects = match action {
+                UpdaterMenuAction::CheckForUpdates => self
+                    .updater
+                    .as_mut()
+                    .map(SystemUpdaterLane::manual_check)
+                    .unwrap_or_default(),
+                UpdaterMenuAction::DownloadUpdate => self
+                    .updater
+                    .as_mut()
+                    .map(SystemUpdaterLane::request_download)
+                    .unwrap_or_default(),
+                UpdaterMenuAction::RetryUpdate => {
+                    let retry_is_manual_check = matches!(
+                        self.updater.as_ref().map(SystemUpdaterLane::state),
+                        Some(UpdaterState::Failed {
+                            retry: RetryAction::ManualCheck,
+                            ..
+                        })
+                    );
+                    if retry_is_manual_check {
+                        self.updater
+                            .as_mut()
+                            .map(SystemUpdaterLane::manual_check)
+                            .unwrap_or_default()
+                    } else {
+                        self.updater
+                            .as_mut()
+                            .map(SystemUpdaterLane::retry)
+                            .unwrap_or_default()
+                    }
+                }
+                UpdaterMenuAction::OpenDownloadedUpdate => {
+                    if self.pending_insertion.is_none() {
+                        self.drain_hotkey_events();
+                    }
+                    if updater_open_allowed(
+                        self.controller.status(),
+                        self.pending_insertion.is_some(),
+                    ) {
+                        self.updater
+                            .as_mut()
+                            .map(SystemUpdaterLane::request_open)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                }
+            };
+            self.apply_updater_effects(effects);
+            self.render_updater_menu();
+        }
+    }
+
+    fn render_updater_menu(&self) {
+        let open_enabled =
+            updater_open_allowed(self.controller.status(), self.pending_insertion.is_some());
+        self.menu.render_updater(
+            self.updater.as_ref().map(SystemUpdaterLane::state),
+            open_enabled,
+        );
+    }
+
+    fn try_orderly_quit(&mut self) {
+        if !self
+            .orderly_quit
+            .take_if_ready(self.controller.status(), self.pending_insertion.is_some())
+        {
+            return;
+        }
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let application = NSApplication::sharedApplication(mtm);
+        unsafe { application.terminate(None) };
     }
 
     fn drain_microphone_permission_completions(&mut self) {
@@ -731,6 +1174,14 @@ impl Runtime {
 
     fn poll_permissions(&mut self) {
         let permissions = SystemPermissionProbe::check();
+        if let Some(identity) = self.permission_build_identity.as_ref() {
+            let mut marker_store = SystemPermissionMigrationStore::standard();
+            if persist_setup_completion_if_granted(identity, permissions, &mut marker_store)
+                .is_err()
+            {
+                tracing::warn!(error_category = "permission_setup_marker_persistence");
+            }
+        }
         if permissions.microphone {
             let mut boundary = SystemMicrophonePermissionBoundary {
                 completion_sender: self.microphone_permissions.completion_sender(),
@@ -780,6 +1231,7 @@ impl Runtime {
         self.assignment
             .cancel_unless_ready(self.controller.status(), &self.hotkey_control);
         self.menu.render(self.controller.status());
+        self.render_updater_menu();
         tracing::debug!(state = status_name(self.controller.status()));
         for effect in effects {
             self.execute(effect);
@@ -998,6 +1450,7 @@ impl PasteFlowBoundary for Runtime {
         self.dispatch(AppEvent::PasteFinished(result));
         self.drain_menu_commands();
         self.drain_hotkey_events();
+        self.try_orderly_quit();
     }
 }
 
@@ -1011,6 +1464,7 @@ pub(crate) fn capture_result_event(result: Result<Option<Vec<f32>>, AudioError>)
 impl Drop for Runtime {
     fn drop(&mut self) {
         cancel_timer(&self.run_loop, &mut self.drain_timer);
+        cancel_timer(&self.run_loop, &mut self.updater_timer);
         cancel_timer(&self.run_loop, &mut self.permission_timer);
         cancel_timer(&self.run_loop, &mut self.finish_timer);
         cancel_timer(&self.run_loop, &mut self.capture_limit_timer);
@@ -1027,6 +1481,9 @@ impl Drop for Runtime {
         if let Some(worker) = self.asr_worker.take() {
             let _ = worker.join();
         }
+        self.model_preparation.take();
+        self.permission_migration.take();
+        self.updater.take();
         tracing::info!(lifecycle = "terminated");
     }
 }
@@ -1039,7 +1496,11 @@ fn cancel_timer(run_loop: &CFRunLoop, slot: &mut Option<ScheduledTimer>) {
 
 const fn status_name(status: &AppStatus) -> &'static str {
     match status {
-        AppStatus::Starting => "starting",
+        AppStatus::PreparingModel => "preparing_model",
+        AppStatus::ModelRepairRequired => "model_repair_required",
+        AppStatus::ModelPreparationFailed => "model_preparation_failed",
+        AppStatus::ResettingPermissions => "resetting_permissions",
+        AppStatus::PermissionResetFailed => "permission_reset_failed",
         AppStatus::PermissionBlocked(_) => "permission_blocked",
         AppStatus::Ready => "ready",
         AppStatus::Recording => "recording",
@@ -1056,7 +1517,11 @@ pub fn bundled_model_paths() -> Result<ModelPaths, String> {
 
 fn bundled_model_paths_from_executable(executable: PathBuf) -> Result<ModelPaths, String> {
     let resources = resources_dir_from_executable(&executable)?;
-    ModelPaths::from_resources(&resources)
+    let bundled = bundled_model_directory(&resources);
+    let manifest = embedded_model_manifest().map_err(|error| error.to_string())?;
+    verify_model_directory(&bundled, &manifest)
+        .map(VerifiedModel::into_paths)
+        .map_err(|error| error.to_string())
 }
 
 /// Starts a bounded child process that initializes the embedded model.
@@ -1122,13 +1587,18 @@ fn wait_for_smoke_child(child: &mut Child, timeout: Duration) -> i32 {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::fs;
     use std::rc::Rc;
+    use std::thread;
+    use std::time::Duration;
 
     use super::{
         apply_output_menu_command, capture_start_result_event, milliseconds_to_seconds,
-        reset_hotkey_before_drop, status_name, wait_for_smoke_child, AssignmentTracker,
-        DeferredTapState, MicrophonePermissionRuntime, PasteFlow, PasteFlowBoundary,
-        PasteInsertion, RuntimePreferences, TapState, TimerKind, EVENT_DRAIN_MS,
+        model_preparation_plan, reset_hotkey_before_drop, spawn_model_preparation_worker_with,
+        spawn_permission_migration_worker_with, status_name, wait_for_smoke_child,
+        AssignmentTracker, DeferredTapState, MicrophonePermissionRuntime, ModelPreparationPlan,
+        ModelPreparationTask, PasteFlow, PasteFlowBoundary, PasteInsertion,
+        PermissionMigrationTask, RuntimePreferences, TapState, TimerKind, EVENT_DRAIN_MS,
         PERMISSION_POLL_MS,
     };
     use crate::audio::AudioError;
@@ -1136,9 +1606,14 @@ mod tests {
     use crate::hotkey::{HotkeyControl, HotkeySignal, KeyboardObservation, ObservationKind};
     use crate::inserter::InsertError;
     use crate::menu::MenuCommand;
+    use crate::model_store::{verify_model_directory, ModelManifest, ModelStoreError, MODEL_ID};
     use crate::output_preferences::{
         OutputPreferenceController, OutputPreferenceError, OutputPreferenceRepository,
         RawOutputPreferenceStore,
+    };
+    use crate::permission_migration::{
+        PermissionMigrationError, PermissionMigrationRunError, PermissionMigrationSuccess,
+        TccService,
     };
     use crate::permissions::{MicrophoneAuthorization, MicrophonePermissionBoundary};
     use crate::preferences::{
@@ -1149,6 +1624,145 @@ mod tests {
 
     struct RecordingMicrophoneBoundary {
         events: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    fn verified_model_fixture() -> (tempfile::TempDir, crate::model_store::VerifiedModel) {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join(MODEL_ID);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("encoder.int8.onnx"), b"enc").unwrap();
+        fs::write(directory.join("decoder.onnx"), b"dec").unwrap();
+        fs::write(directory.join("joiner.onnx"), b"join").unwrap();
+        fs::write(directory.join("tokens.txt"), b"tok").unwrap();
+        let manifest = ModelManifest::from_bytes(
+            br#"{"schema":1,"id":"gigaam-v3-rnnt-v1","files":[{"name":"encoder.int8.onnx","size":3,"sha256":"5fb2ab76ed9bda034b192c48c7069359252fccda168d925acc0ae7d316c0b53e"},{"name":"decoder.onnx","size":3,"sha256":"e7502c799b8f76fbed077ff2cd55c906ab144d5b88ef09a71abc70b5fad601f1"},{"name":"joiner.onnx","size":4,"sha256":"58393216032be6257784ac0c6a73efb2a084e27b4cfff1e6acee7b7e6ab93b10"},{"name":"tokens.txt","size":3,"sha256":"1a7674eb4ee78df7e1ac439a93c3fa8e3c945784d4dec9fd8e3011738b2f1d62"}]}"#,
+        )
+        .unwrap();
+        let verified = verify_model_directory(&directory, &manifest).unwrap();
+        (temp, verified)
+    }
+
+    #[test]
+    fn model_preparation_success_only_starts_permission_migration() {
+        let failed = model_preparation_plan(Err(ModelStoreError::RepairRequired));
+        assert!(matches!(failed, ModelPreparationPlan::Failed(_)));
+        assert!(!failed.starts_permission_migration());
+
+        let (_temp, verified) = verified_model_fixture();
+        let ready = model_preparation_plan(Ok(verified));
+        assert!(matches!(
+            ready,
+            ModelPreparationPlan::BeginPermissionMigration(_)
+        ));
+        assert!(ready.starts_permission_migration());
+    }
+
+    #[test]
+    fn model_preparation_worker_runs_away_from_the_appkit_caller_thread() {
+        let caller = thread::current().id();
+        let (thread_sender, thread_receiver) = std::sync::mpsc::channel();
+        let (results, worker) = spawn_model_preparation_worker_with(move || {
+            thread_sender.send(thread::current().id()).unwrap();
+            Err(ModelStoreError::RepairRequired)
+        });
+
+        assert_ne!(thread_receiver.recv().unwrap(), caller);
+        assert!(matches!(
+            results.recv().unwrap(),
+            Err(ModelStoreError::RepairRequired)
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_model_preparation_task_does_not_wait_for_blocked_worker() {
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let (events, worker) = spawn_model_preparation_worker_with(move || {
+            started_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            finished_sender.send(()).unwrap();
+            Err(ModelStoreError::RepairRequired)
+        });
+        started_receiver.recv().unwrap();
+        let task = ModelPreparationTask::new(events, worker);
+        let (dropped_sender, dropped_receiver) = std::sync::mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(task);
+            dropped_sender.send(()).unwrap();
+        });
+
+        let returned_before_release = dropped_receiver
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok();
+        release_sender.send(()).unwrap();
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        dropper.join().unwrap();
+
+        assert!(
+            returned_before_release,
+            "dropping a blocked model preparation task waited for its worker"
+        );
+    }
+
+    #[test]
+    fn permission_migration_worker_runs_off_appkit_and_returns_paths_on_failure() {
+        let caller = thread::current().id();
+        let (_temp, verified) = verified_model_fixture();
+        let expected_encoder = verified.paths().encoder().to_owned();
+        let (thread_sender, thread_receiver) = std::sync::mpsc::channel();
+        let (events, worker) =
+            spawn_permission_migration_worker_with(verified.into_paths(), move || {
+                thread_sender.send(thread::current().id()).unwrap();
+                Err(PermissionMigrationRunError::Migration(
+                    PermissionMigrationError::ResetFailed(TccService::ListenEvent),
+                ))
+            });
+
+        assert_ne!(thread_receiver.recv().unwrap(), caller);
+        let result = events.recv().unwrap();
+        assert_eq!(result.paths.encoder(), expected_encoder);
+        assert!(result.migration.is_err());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_permission_migration_task_does_not_wait_for_blocked_worker() {
+        let (_temp, verified) = verified_model_fixture();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let (events, worker) =
+            spawn_permission_migration_worker_with(verified.into_paths(), move || {
+                started_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                finished_sender.send(()).unwrap();
+                Ok(PermissionMigrationSuccess::DevelopmentBypass)
+            });
+        started_receiver.recv().unwrap();
+        let task = PermissionMigrationTask::new(events, worker);
+        let (dropped_sender, dropped_receiver) = std::sync::mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(task);
+            dropped_sender.send(()).unwrap();
+        });
+
+        let returned_before_release = dropped_receiver
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok();
+        release_sender.send(()).unwrap();
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        dropper.join().unwrap();
+
+        assert!(
+            returned_before_release,
+            "dropping a blocked permission migration task waited for its worker"
+        );
     }
 
     impl MicrophonePermissionBoundary for RecordingMicrophoneBoundary {

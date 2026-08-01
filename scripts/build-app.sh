@@ -1,7 +1,88 @@
 #!/bin/bash
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+cd -- "$REPO_ROOT"
+
+fail() {
+    echo "PTT2me app build failed: $*" >&2
+    exit 1
+}
+
+usage() {
+    fail "usage: $0 --variant full|update --model-manifest PATH [--model-source PATH] [--version X.Y.Z --build YYYYMMDDHHMM --source-commit COMMIT --output APP_PATH]"
+}
+
+VARIANT=""
+MODEL_MANIFEST=""
+MODEL_SOURCE=""
+EXPLICIT_VERSION=""
+EXPLICIT_BUILD=""
+EXPLICIT_SOURCE_COMMIT=""
+OUTPUT_APP=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --variant)
+            [[ $# -ge 2 ]] || usage
+            VARIANT="$2"
+            shift 2
+            ;;
+        --model-manifest)
+            [[ $# -ge 2 ]] || usage
+            MODEL_MANIFEST="$2"
+            shift 2
+            ;;
+        --model-source)
+            [[ $# -ge 2 ]] || usage
+            MODEL_SOURCE="$2"
+            shift 2
+            ;;
+        --version)
+            [[ $# -ge 2 ]] || usage
+            EXPLICIT_VERSION="$2"
+            shift 2
+            ;;
+        --build)
+            [[ $# -ge 2 ]] || usage
+            EXPLICIT_BUILD="$2"
+            shift 2
+            ;;
+        --source-commit)
+            [[ $# -ge 2 ]] || usage
+            EXPLICIT_SOURCE_COMMIT="$2"
+            shift 2
+            ;;
+        --output)
+            [[ $# -ge 2 ]] || usage
+            OUTPUT_APP="$2"
+            shift 2
+            ;;
+        *) usage ;;
+    esac
+done
+
+[[ "$VARIANT" == "full" || "$VARIANT" == "update" ]] || usage
+[[ -n "$MODEL_MANIFEST" ]] || usage
+if [[ "$VARIANT" == "full" && -z "$MODEL_SOURCE" ]]; then
+    fail "full variant requires --model-source"
+fi
+if [[ "$VARIANT" == "update" && -n "$MODEL_SOURCE" ]]; then
+    fail "update variant does not accept --model-source"
+fi
+
+COMMITTED_MODEL_MANIFEST="$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
+[[ -f "$MODEL_MANIFEST" && ! -L "$MODEL_MANIFEST" ]] ||
+    fail "model manifest is not a real file: $MODEL_MANIFEST"
+"$SCRIPT_DIR/check-production-model-manifest.sh" "$MODEL_MANIFEST"
+cmp -s "$COMMITTED_MODEL_MANIFEST" "$MODEL_MANIFEST" ||
+    fail "--model-manifest must match the committed exact bytes"
+if [[ "$VARIANT" == "full" ]]; then
+    "$SCRIPT_DIR/check-model-variant.sh" \
+        --variant full \
+        --model-manifest "$MODEL_MANIFEST" \
+        --model-source "$MODEL_SOURCE"
+fi
 
 if [[ "$(uname -m)" != "arm64" ]]; then
     echo "PTT2me build requires an Apple Silicon (arm64) Mac." >&2
@@ -10,13 +91,19 @@ fi
 
 TARGET="aarch64-apple-darwin"
 PRODUCT="PTT2me"
-APP="dist/$PRODUCT.app"
+if [[ -n "$OUTPUT_APP" ]]; then
+    [[ "$OUTPUT_APP" == *.app ]] || fail "--output must end in .app"
+    OUTPUT_PARENT="$(cd -- "$(dirname -- "$OUTPUT_APP")" 2>/dev/null && pwd -P)" ||
+        fail "output parent does not exist: $(dirname -- "$OUTPUT_APP")"
+    APP="$OUTPUT_PARENT/$(basename -- "$OUTPUT_APP")"
+else
+    APP="$REPO_ROOT/dist/$PRODUCT.app"
+fi
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 FRAMEWORKS="$CONTENTS/Frameworks"
-MODEL_SOURCE="vendor/models/gigaam-v3-rnnt"
-MODEL_DESTINATION="$RESOURCES/models/gigaam-v3-rnnt"
+MODEL_DESTINATION="$RESOURCES/models/gigaam-v3-rnnt-v1"
 LICENSE_SOURCE="licenses"
 LICENSE_DESTINATION="$RESOURCES/licenses"
 RELEASE_DIR="target/$TARGET/release"
@@ -30,9 +117,6 @@ require_nonempty_file() {
     }
 }
 
-for model_file in encoder.int8.onnx decoder.onnx joiner.onnx tokens.txt; do
-    require_nonempty_file "$MODEL_SOURCE/$model_file"
-done
 for license_file in \
     GIGAAM-MIT.txt \
     RTRB-MIT.txt \
@@ -43,12 +127,34 @@ for license_file in \
     require_nonempty_file "$LICENSE_SOURCE/$license_file"
 done
 
-VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
-[[ -n "$VERSION" ]] || {
+CARGO_VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+[[ -n "$CARGO_VERSION" ]] || {
     echo "Could not read package version from Cargo.toml" >&2
     exit 1
 }
-BUILD_VERSION="$(date -u +%Y%m%d%H%M)"
+VERSION="${EXPLICIT_VERSION:-$CARGO_VERSION}"
+[[ "$VERSION" == "$CARGO_VERSION" ]] ||
+    fail "explicit version must match Cargo.toml ($CARGO_VERSION)"
+
+if [[ -n "$EXPLICIT_BUILD" ]]; then
+    [[ "$EXPLICIT_BUILD" =~ ^[0-9]{12}$ ]] ||
+        fail "explicit build must be a valid 12-digit UTC calendar minute"
+    PARSED_BUILD="$(/bin/date -u -j -f '%Y%m%d%H%M' "$EXPLICIT_BUILD" '+%Y%m%d%H%M' 2>/dev/null)" ||
+        fail "explicit build must be a valid 12-digit UTC calendar minute"
+    [[ "$PARSED_BUILD" == "$EXPLICIT_BUILD" ]] ||
+        fail "explicit build must be a valid 12-digit UTC calendar minute"
+    BUILD_VERSION="$EXPLICIT_BUILD"
+else
+    BUILD_VERSION="$(date -u +%Y%m%d%H%M)"
+fi
+
+HEAD_COMMIT="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
+    fail "could not resolve exact git HEAD"
+SOURCE_COMMIT="${EXPLICIT_SOURCE_COMMIT:-$HEAD_COMMIT}"
+[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+    fail "git HEAD must be exactly 40 lowercase hexadecimal characters"
+[[ "$SOURCE_COMMIT" == "$HEAD_COMMIT" ]] ||
+    fail "explicit source commit must match exact git HEAD"
 
 export MACOSX_DEPLOYMENT_TARGET=13.0
 cargo build --release --target "$TARGET"
@@ -58,13 +164,22 @@ require_nonempty_file "$EXECUTABLE_SOURCE"
 require_nonempty_file "$RELEASE_DIR/$SHERPA_DYLIB"
 require_nonempty_file "$RELEASE_DIR/$ONNX_DYLIB"
 
-rm -rf "$APP"
-mkdir -p "$MACOS" "$MODEL_DESTINATION" "$LICENSE_DESTINATION" "$FRAMEWORKS"
+if [[ -e "$APP" || -L "$APP" ]]; then
+    [[ -z "$OUTPUT_APP" ]] || fail "explicit output path already exists"
+    [[ -d "$APP" && ! -L "$APP" ]] || fail "output app path is not a real directory"
+    rm -rf "$APP"
+fi
+mkdir -p "$MACOS" "$LICENSE_DESTINATION" "$FRAMEWORKS"
+if [[ "$VARIANT" == "full" ]]; then
+    mkdir -p "$MODEL_DESTINATION"
+fi
 
 install -m 755 "$EXECUTABLE_SOURCE" "$MACOS/$PRODUCT"
-for model_file in encoder.int8.onnx decoder.onnx joiner.onnx tokens.txt; do
-    install -m 644 "$MODEL_SOURCE/$model_file" "$MODEL_DESTINATION/$model_file"
-done
+if [[ "$VARIANT" == "full" ]]; then
+    for model_file in encoder.int8.onnx decoder.onnx joiner.onnx tokens.txt; do
+        install -m 644 "$MODEL_SOURCE/$model_file" "$MODEL_DESTINATION/$model_file"
+    done
+fi
 for license_file in \
     GIGAAM-MIT.txt \
     RTRB-MIT.txt \
@@ -121,6 +236,8 @@ plutil -create xml1 "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD_VERSION" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :PTT2meSourceCommit string $SOURCE_COMMIT" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :PTT2meDistributionVariant string $VARIANT" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 13.0" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PLIST"
 /usr/libexec/PlistBuddy -c \
@@ -132,5 +249,8 @@ codesign --force --sign - "$FRAMEWORKS/$SHERPA_DYLIB"
 codesign --force --sign - "$MACOS/$PRODUCT"
 codesign --force --sign - "$APP"
 
-scripts/check-bundle.sh "$APP"
-echo "Built $APP"
+scripts/check-bundle.sh \
+    --variant "$VARIANT" \
+    --model-manifest "$MODEL_MANIFEST" \
+    "$APP"
+echo "Built $APP ($VARIANT)"

@@ -72,7 +72,25 @@ if [[ ! -d "$APP_PATH" ]]; then
     exit 1
 fi
 
-"$SCRIPT_DIR/check-bundle.sh" "$APP_PATH"
+BUNDLE_VARIANT=$(
+    /usr/libexec/PlistBuddy -c "Print :PTT2meDistributionVariant" "$PLIST_PATH" 2>/dev/null
+) || {
+    echo "Could not read PTT2meDistributionVariant from $PLIST_PATH." >&2
+    echo "Rebuild the app with an explicit Full or Update variant." >&2
+    exit 1
+}
+case "$BUNDLE_VARIANT" in
+    full | update) ;;
+    *)
+        echo "Invalid PTT2meDistributionVariant in $PLIST_PATH: $BUNDLE_VARIANT" >&2
+        exit 1
+        ;;
+esac
+readonly BUNDLE_VARIANT
+"$SCRIPT_DIR/check-bundle.sh" \
+    --variant "$BUNDLE_VARIANT" \
+    --model-manifest "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json" \
+    "$APP_PATH"
 
 CARGO_VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
 if [[ -z "$CARGO_VERSION" ]]; then

@@ -40,10 +40,10 @@ impl RecognizerBackend for SherpaRecognizerBackend {
     fn load(&mut self, paths: ModelPaths) -> Result<(), String> {
         self.recognizer = None;
         let config = TransducerConfig {
-            encoder: paths.encoder.to_string_lossy().into_owned(),
-            decoder: paths.decoder.to_string_lossy().into_owned(),
-            joiner: paths.joiner.to_string_lossy().into_owned(),
-            tokens: paths.tokens.to_string_lossy().into_owned(),
+            encoder: paths.encoder().to_string_lossy().into_owned(),
+            decoder: paths.decoder().to_string_lossy().into_owned(),
+            joiner: paths.joiner().to_string_lossy().into_owned(),
+            tokens: paths.tokens().to_string_lossy().into_owned(),
             model_type: "nemo_transducer".into(),
             num_threads: 2,
             sample_rate: 16_000,
@@ -138,12 +138,12 @@ mod tests {
     }
 
     fn model_paths() -> ModelPaths {
-        ModelPaths {
-            encoder: PathBuf::from("encoder.int8.onnx"),
-            decoder: PathBuf::from("decoder.onnx"),
-            joiner: PathBuf::from("joiner.onnx"),
-            tokens: PathBuf::from("tokens.txt"),
-        }
+        ModelPaths::for_test(
+            PathBuf::from("encoder.int8.onnx"),
+            PathBuf::from("decoder.onnx"),
+            PathBuf::from("joiner.onnx"),
+            PathBuf::from("tokens.txt"),
+        )
     }
 
     fn run_worker(

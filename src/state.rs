@@ -40,7 +40,11 @@ impl PermissionSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppStatus {
-    Starting,
+    PreparingModel,
+    ModelRepairRequired,
+    ModelPreparationFailed,
+    ResettingPermissions,
+    PermissionResetFailed,
     PermissionBlocked(PermissionKind),
     Ready,
     Recording,
@@ -51,8 +55,19 @@ pub enum AppStatus {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelPreparationFailure {
+    RepairRequired,
+    Storage,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppEvent {
+    ModelPreparationStarted,
+    ModelPreparationFailed(ModelPreparationFailure),
+    PermissionMigrationStarted,
+    PermissionMigrationCompleted,
+    PermissionMigrationFailed,
     ModelLoaded(Result<(), String>),
     PermissionsChanged(PermissionSnapshot),
     TriggerPressed,
@@ -89,7 +104,7 @@ pub struct AppController {
 impl AppController {
     pub fn new() -> Self {
         Self {
-            status: AppStatus::Starting,
+            status: AppStatus::PreparingModel,
             model_ready: false,
             permissions: PermissionSnapshot::default(),
             opened_permission_panes: BTreeSet::new(),
@@ -102,6 +117,35 @@ impl AppController {
 
     pub fn handle(&mut self, event: AppEvent) -> Vec<Effect> {
         match event {
+            AppEvent::ModelPreparationStarted => {
+                self.model_ready = false;
+                self.status = AppStatus::PreparingModel;
+                Vec::new()
+            }
+            AppEvent::ModelPreparationFailed(ModelPreparationFailure::RepairRequired) => {
+                self.model_ready = false;
+                self.status = AppStatus::ModelRepairRequired;
+                Vec::new()
+            }
+            AppEvent::ModelPreparationFailed(ModelPreparationFailure::Storage) => {
+                self.model_ready = false;
+                self.status = AppStatus::ModelPreparationFailed;
+                Vec::new()
+            }
+            AppEvent::PermissionMigrationStarted => {
+                self.model_ready = false;
+                self.status = AppStatus::ResettingPermissions;
+                Vec::new()
+            }
+            AppEvent::PermissionMigrationCompleted => {
+                self.status = AppStatus::PreparingModel;
+                Vec::new()
+            }
+            AppEvent::PermissionMigrationFailed => {
+                self.model_ready = false;
+                self.status = AppStatus::PermissionResetFailed;
+                Vec::new()
+            }
             AppEvent::ModelLoaded(Ok(())) => {
                 self.model_ready = true;
                 self.enter_idle_state()
@@ -184,10 +228,14 @@ impl AppController {
             AppEvent::EventTapLost
                 if !matches!(
                     self.status,
-                    AppStatus::Error {
-                        recoverable: false,
-                        ..
-                    }
+                    AppStatus::ModelRepairRequired
+                        | AppStatus::ModelPreparationFailed
+                        | AppStatus::ResettingPermissions
+                        | AppStatus::PermissionResetFailed
+                        | AppStatus::Error {
+                            recoverable: false,
+                            ..
+                        }
                 ) =>
             {
                 self.show_recoverable_error("Глобальная клавиша недоступна")
@@ -199,7 +247,7 @@ impl AppController {
 
     fn enter_idle_state(&mut self) -> Vec<Effect> {
         if !self.model_ready {
-            self.status = AppStatus::Starting;
+            self.status = AppStatus::PreparingModel;
             return Vec::new();
         }
 
@@ -285,6 +333,46 @@ impl Default for AppController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_preparation_failure_is_targeted_and_retryable() {
+        let mut controller = AppController::new();
+        assert_eq!(controller.status(), &AppStatus::PreparingModel);
+
+        controller.handle(AppEvent::ModelPreparationFailed(
+            ModelPreparationFailure::RepairRequired,
+        ));
+        assert_eq!(controller.status(), &AppStatus::ModelRepairRequired);
+
+        controller.handle(AppEvent::ModelPreparationStarted);
+        assert_eq!(controller.status(), &AppStatus::PreparingModel);
+
+        controller.handle(AppEvent::ModelPreparationFailed(
+            ModelPreparationFailure::Storage,
+        ));
+        assert_eq!(controller.status(), &AppStatus::ModelPreparationFailed);
+    }
+
+    #[test]
+    fn permission_reset_failure_stays_blocked_until_targeted_retry() {
+        let mut controller = AppController::new();
+
+        controller.handle(AppEvent::PermissionMigrationStarted);
+        assert_eq!(controller.status(), &AppStatus::ResettingPermissions);
+        controller.handle(AppEvent::PermissionMigrationFailed);
+        assert_eq!(controller.status(), &AppStatus::PermissionResetFailed);
+
+        assert!(controller
+            .handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()))
+            .is_empty());
+        assert!(controller.handle(AppEvent::TriggerPressed).is_empty());
+        assert_eq!(controller.status(), &AppStatus::PermissionResetFailed);
+
+        controller.handle(AppEvent::PermissionMigrationStarted);
+        assert_eq!(controller.status(), &AppStatus::ResettingPermissions);
+        controller.handle(AppEvent::PermissionMigrationCompleted);
+        assert_eq!(controller.status(), &AppStatus::PreparingModel);
+    }
 
     #[test]
     fn trigger_press_starts_capture_immediately() {
