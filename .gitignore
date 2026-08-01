@@ -1,6 +1,10 @@
 .worktrees/
 .superpowers/
 .DS_Store
+/.codex-log/
+/.env
+/.env.*
+!/.env.example
 /target
 /dist
 /vendor/models/**/*.onnx

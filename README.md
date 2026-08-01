@@ -13,6 +13,40 @@ previous pasteboard whenever compatibility requires Command-V fallback.
 - Apple Silicon (`arm64`) Mac
 - macOS 13 Ventura or newer
 
+## Cloud development without Codespaces
+
+Repository work can be delegated to Codex Cloud from a browser or mobile
+device without a running local computer. Connect `Torin2023/PTT2me` in
+[Codex Cloud](https://chatgpt.com/codex), create an environment for the
+repository, and set its setup command to:
+
+```bash
+bash scripts/cloud-setup.sh
+```
+
+The setup uses the exact Rust version in `rust-toolchain.toml`, installs the
+repository's formatting, lint, audit, and cross-target tools, and fetches only
+dependencies locked by `Cargo.lock`. It also refreshes the RustSec advisory
+database and audits `Cargo.lock` while setup internet is available; later
+checks use that snapshot with `cargo audit --no-fetch --deny warnings`. The
+environment needs no repository or application secrets. Agent internet access
+can remain disabled after setup.
+
+PTT2me intentionally does not use GitHub Codespaces. Codex Cloud is a Linux
+editing environment, while PTT2me is a macOS-only application. The development
+workflow therefore separates responsibilities:
+
+| Environment | Supported work |
+| --- | --- |
+| Codex Cloud | Inspect and edit files, format, cross-target check, audit, create a branch and Pull Request |
+| GitHub Actions on macOS | Compile, run all unit and integration tests, run Clippy, audit dependencies |
+| Controlled Apple Silicon Mac | Launch PTT2me, verify TCC and PTT behavior, build and validate release DMGs |
+
+Every task follows one Issue or prompt → one `codex/<task>` branch → one Pull
+Request. Direct changes to `main` are prohibited. A Pull Request is merged only
+after the required `Format, test, lint, and audit` check succeeds. Repository
+rules and agent-specific constraints are documented in `AGENTS.md`.
+
 PTT2me verifies and prepares its fixed model at startup. When the status
 becomes `Готово`, hold Fn/Globe while speaking and release it. Fn/Globe and a
 500 ms hold threshold are the default settings. Recording begins immediately
@@ -124,7 +158,7 @@ Rust dependencies:
 cargo fmt --all -- --check
 cargo test --all-targets --features test-support -- --test-threads=1
 cargo clippy --all-targets --features test-support -- -D warnings
-cargo audit --deny warnings
+cargo audit --no-fetch --deny warnings
 ```
 
 These checks compile and test the program; they do not download or substitute
