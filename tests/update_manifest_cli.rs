@@ -1,6 +1,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use base64::engine::general_purpose::STANDARD;
@@ -41,6 +41,81 @@ fn run_verifier(
         .arg(model_manifest)
         .output()
         .expect("run hidden update-manifest verifier")
+}
+
+fn create_signed_fixture_app(
+    root: &Path,
+    directory: &str,
+    executable_source: &Path,
+    resource_marker: &str,
+) -> PathBuf {
+    let app = root.join(directory).join("Fixture.app");
+    let macos = app.join("Contents/MacOS");
+    let resources = app.join("Contents/Resources");
+    fs::create_dir_all(&macos).unwrap();
+    fs::create_dir_all(&resources).unwrap();
+    let executable = macos.join("Fixture");
+    fs::copy(executable_source, &executable).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(resources.join("variant.txt"), resource_marker).unwrap();
+    fs::write(
+        app.join("Contents/Info.plist"),
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" ",
+            "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
+            "<plist version=\"1.0\"><dict>",
+            "<key>CFBundleExecutable</key><string>Fixture</string>",
+            "<key>CFBundleIdentifier</key><string>com.ptt2me.fixture</string>",
+            "<key>CFBundlePackageType</key><string>APPL</string>",
+            "</dict></plist>\n"
+        ),
+    )
+    .unwrap();
+    let signing = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(&app)
+        .output()
+        .expect("ad-hoc sign fixture app");
+    assert_success(signing, "fixture app signing");
+    app
+}
+
+#[test]
+fn release_payload_comparison_ignores_only_adhoc_signature_bytes() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().unwrap();
+    let common_executable = Path::new(env!("CARGO_BIN_EXE_ptt2me-update-signer"));
+    let full_app = create_signed_fixture_app(temp.path(), "full", common_executable, "full");
+    let update_app = create_signed_fixture_app(temp.path(), "update", common_executable, "update");
+    let full_executable = full_app.join("Contents/MacOS/Fixture");
+    let update_executable = update_app.join("Contents/MacOS/Fixture");
+
+    assert_ne!(
+        fs::read(&full_executable).unwrap(),
+        fs::read(&update_executable).unwrap(),
+        "different bundle resources must produce different ad-hoc signature bytes"
+    );
+
+    let comparison = Command::new(repository.join("scripts/compare-macho-payload.sh"))
+        .arg(&full_executable)
+        .arg(&update_executable)
+        .output()
+        .expect("run release payload comparison");
+    assert_success(comparison, "same unsigned Mach-O payload comparison");
+
+    let different_app = create_signed_fixture_app(
+        temp.path(),
+        "different",
+        Path::new(env!("CARGO_BIN_EXE_ptt2me")),
+        "update",
+    );
+    let rejected = Command::new(repository.join("scripts/compare-macho-payload.sh"))
+        .arg(&full_executable)
+        .arg(different_app.join("Contents/MacOS/Fixture"))
+        .output()
+        .expect("run mismatched release payload comparison");
+    assert!(!rejected.status.success());
 }
 
 #[test]
