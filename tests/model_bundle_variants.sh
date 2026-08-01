@@ -277,4 +277,16 @@ grep -Fq -- '--variant "$BUNDLE_VARIANT"' "$REPO_ROOT/scripts/grant-and-run.sh" 
     exit 1
 }
 
+PAGES_WORKFLOW="$REPO_ROOT/.github/workflows/pages.yml"
+IMMUTABILITY_GATE_LINE="$(grep -n 'git diff --name-status' "$PAGES_WORKFLOW" | cut -d: -f1)"
+NO_STABLE_SKIP_LINE="$(grep -n 'if \[\[ ! -e "\$stable" \]\]' "$PAGES_WORKFLOW" | cut -d: -f1)"
+[[ -n "$IMMUTABILITY_GATE_LINE" && -n "$NO_STABLE_SKIP_LINE" ]] || {
+    echo "Pages workflow must contain immutability and no-stable gates" >&2
+    exit 1
+}
+[[ "$IMMUTABILITY_GATE_LINE" -lt "$NO_STABLE_SKIP_LINE" ]] || {
+    echo "Pages workflow must enforce immutable records before skipping absent stable" >&2
+    exit 1
+}
+
 echo "Model bundle variant checks passed"
