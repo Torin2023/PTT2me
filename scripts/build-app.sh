@@ -11,12 +11,16 @@ fail() {
 }
 
 usage() {
-    fail "usage: $0 --variant full|update --model-manifest PATH [--model-source PATH]"
+    fail "usage: $0 --variant full|update --model-manifest PATH [--model-source PATH] [--version X.Y.Z --build YYYYMMDDHHMM --source-commit COMMIT --output APP_PATH]"
 }
 
 VARIANT=""
 MODEL_MANIFEST=""
 MODEL_SOURCE=""
+EXPLICIT_VERSION=""
+EXPLICIT_BUILD=""
+EXPLICIT_SOURCE_COMMIT=""
+OUTPUT_APP=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --variant)
@@ -32,6 +36,26 @@ while [[ $# -gt 0 ]]; do
         --model-source)
             [[ $# -ge 2 ]] || usage
             MODEL_SOURCE="$2"
+            shift 2
+            ;;
+        --version)
+            [[ $# -ge 2 ]] || usage
+            EXPLICIT_VERSION="$2"
+            shift 2
+            ;;
+        --build)
+            [[ $# -ge 2 ]] || usage
+            EXPLICIT_BUILD="$2"
+            shift 2
+            ;;
+        --source-commit)
+            [[ $# -ge 2 ]] || usage
+            EXPLICIT_SOURCE_COMMIT="$2"
+            shift 2
+            ;;
+        --output)
+            [[ $# -ge 2 ]] || usage
+            OUTPUT_APP="$2"
             shift 2
             ;;
         *) usage ;;
@@ -67,7 +91,14 @@ fi
 
 TARGET="aarch64-apple-darwin"
 PRODUCT="PTT2me"
-APP="dist/$PRODUCT.app"
+if [[ -n "$OUTPUT_APP" ]]; then
+    [[ "$OUTPUT_APP" == *.app ]] || fail "--output must end in .app"
+    OUTPUT_PARENT="$(cd -- "$(dirname -- "$OUTPUT_APP")" 2>/dev/null && pwd -P)" ||
+        fail "output parent does not exist: $(dirname -- "$OUTPUT_APP")"
+    APP="$OUTPUT_PARENT/$(basename -- "$OUTPUT_APP")"
+else
+    APP="$REPO_ROOT/dist/$PRODUCT.app"
+fi
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
@@ -96,16 +127,34 @@ for license_file in \
     require_nonempty_file "$LICENSE_SOURCE/$license_file"
 done
 
-VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
-[[ -n "$VERSION" ]] || {
+CARGO_VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+[[ -n "$CARGO_VERSION" ]] || {
     echo "Could not read package version from Cargo.toml" >&2
     exit 1
 }
-BUILD_VERSION="$(date -u +%Y%m%d%H%M)"
-SOURCE_COMMIT="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
+VERSION="${EXPLICIT_VERSION:-$CARGO_VERSION}"
+[[ "$VERSION" == "$CARGO_VERSION" ]] ||
+    fail "explicit version must match Cargo.toml ($CARGO_VERSION)"
+
+if [[ -n "$EXPLICIT_BUILD" ]]; then
+    [[ "$EXPLICIT_BUILD" =~ ^[0-9]{12}$ ]] ||
+        fail "explicit build must be a valid 12-digit UTC calendar minute"
+    PARSED_BUILD="$(/bin/date -u -j -f '%Y%m%d%H%M' "$EXPLICIT_BUILD" '+%Y%m%d%H%M' 2>/dev/null)" ||
+        fail "explicit build must be a valid 12-digit UTC calendar minute"
+    [[ "$PARSED_BUILD" == "$EXPLICIT_BUILD" ]] ||
+        fail "explicit build must be a valid 12-digit UTC calendar minute"
+    BUILD_VERSION="$EXPLICIT_BUILD"
+else
+    BUILD_VERSION="$(date -u +%Y%m%d%H%M)"
+fi
+
+HEAD_COMMIT="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
     fail "could not resolve exact git HEAD"
+SOURCE_COMMIT="${EXPLICIT_SOURCE_COMMIT:-$HEAD_COMMIT}"
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
     fail "git HEAD must be exactly 40 lowercase hexadecimal characters"
+[[ "$SOURCE_COMMIT" == "$HEAD_COMMIT" ]] ||
+    fail "explicit source commit must match exact git HEAD"
 
 export MACOSX_DEPLOYMENT_TARGET=13.0
 cargo build --release --target "$TARGET"
@@ -115,7 +164,11 @@ require_nonempty_file "$EXECUTABLE_SOURCE"
 require_nonempty_file "$RELEASE_DIR/$SHERPA_DYLIB"
 require_nonempty_file "$RELEASE_DIR/$ONNX_DYLIB"
 
-rm -rf "$APP"
+if [[ -e "$APP" || -L "$APP" ]]; then
+    [[ -z "$OUTPUT_APP" ]] || fail "explicit output path already exists"
+    [[ -d "$APP" && ! -L "$APP" ]] || fail "output app path is not a real directory"
+    rm -rf "$APP"
+fi
 mkdir -p "$MACOS" "$LICENSE_DESTINATION" "$FRAMEWORKS"
 if [[ "$VARIANT" == "full" ]]; then
     mkdir -p "$MODEL_DESTINATION"

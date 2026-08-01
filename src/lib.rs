@@ -14,6 +14,7 @@ pub mod output_preferences;
 pub mod permission_migration;
 pub mod permissions;
 pub mod preferences;
+pub mod release_manifest;
 pub mod runtime;
 pub mod single_instance;
 pub mod state;

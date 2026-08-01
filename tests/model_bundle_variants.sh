@@ -99,6 +99,13 @@ expect_failure_containing "git HEAD must be exactly 40 lowercase hexadecimal cha
     --variant update \
     --model-manifest "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
 
+expect_failure_containing "explicit build must be a valid 12-digit UTC calendar minute" \
+    env PATH="$FAKE_TOOLS:$PATH" \
+    "$REPO_ROOT/scripts/build-app.sh" \
+    --variant update \
+    --model-manifest "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json" \
+    --build invalid
+
 INVALID_IDENTITY_APP="$TEMP_ROOT/invalid-identity.app"
 mkdir -p \
     "$INVALID_IDENTITY_APP/Contents/MacOS" \

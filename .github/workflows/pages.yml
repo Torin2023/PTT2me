@@ -1,0 +1,153 @@
+name: Update manifest Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - updates/**
+      - models/manifests/**
+      - scripts/validate-update-manifest.sh
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: update-manifest-pages
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Check publishable update records
+    runs-on: macos-15
+    outputs:
+      publish: ${{ steps.records.outputs.publish }}
+      version: ${{ steps.records.outputs.version }}
+    steps:
+      - name: Check out full repository history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Require a complete immutable stable record
+        id: records
+        shell: bash
+        run: |
+          set -euo pipefail
+          stable="updates/channels/stable.json"
+          if [[ ! -e "$stable" ]]; then
+            echo "No stable update manifest is committed; Pages publication is skipped."
+            echo "publish=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ -f "$stable" && ! -L "$stable" && -s "$stable" ]]
+          [[ -f updates/public-key.txt && ! -L updates/public-key.txt && -s updates/public-key.txt ]]
+          [[ -d updates/releases && ! -L updates/releases ]]
+
+          shopt -s nullglob
+          matches=()
+          for release in updates/releases/*.json; do
+            [[ -f "$release" && ! -L "$release" ]] || exit 1
+            if cmp -s "$stable" "$release"; then
+              matches+=("$release")
+            fi
+          done
+          [[ ${#matches[@]} -eq 1 ]]
+          version="$(basename -- "${matches[0]}" .json)"
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+            while IFS=$'\t' read -r status path; do
+              [[ -z "$status" ]] && continue
+              case "$path" in
+                updates/releases/* | models/manifests/*)
+                  [[ "$status" == A* ]] || {
+                    echo "Immutable release/model record changed: $status $path" >&2
+                    exit 1
+                  }
+                  ;;
+              esac
+            done < <(git diff --name-status "${{ github.event.before }}" HEAD -- updates/releases models/manifests)
+          fi
+
+          echo "publish=true" >>"$GITHUB_OUTPUT"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate signed record and immutable assets
+    needs: gate
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Select repository Rust toolchain
+        run: rustup show
+
+      - name: Download the exact release assets
+        shell: bash
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p validation-assets
+          base="https://github.com/Torin2023/PTT2me/releases/download/v$VERSION"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "validation-assets/PTT2me-$VERSION-full-macos-arm64.dmg" \
+            "$base/PTT2me-$VERSION-full-macos-arm64.dmg"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "validation-assets/PTT2me-$VERSION-update-macos-arm64.dmg" \
+            "$base/PTT2me-$VERSION-update-macos-arm64.dmg"
+
+      - name: Verify signature, artifacts, and required model manifest
+        shell: bash
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          validation_output="$(scripts/validate-update-manifest.sh \
+            updates/public-key.txt \
+            updates/channels/stable.json \
+            "validation-assets/PTT2me-$VERSION-full-macos-arm64.dmg" \
+            "validation-assets/PTT2me-$VERSION-update-macos-arm64.dmg" \
+            models/manifests/gigaam-v3-rnnt-v1.json)"
+          printf '%s\n' "$validation_output"
+          [[ "$(printf '%s\n' "$validation_output" | grep -c '^version=')" == 1 ]]
+          [[ "$(printf '%s\n' "$validation_output" | grep -c '^source_commit=')" == 1 ]]
+          signed_version="$(printf '%s\n' "$validation_output" | awk -F= '$1 == "version" { print $2 }')"
+          signed_source="$(printf '%s\n' "$validation_output" | awk -F= '$1 == "source_commit" { print $2 }')"
+          [[ "$signed_version" == "$VERSION" ]]
+          [[ "$signed_source" =~ ^[0-9a-f]{40}$ ]]
+
+          tag_commit="$(git rev-parse --verify "refs/tags/v$VERSION^{commit}")"
+          [[ "$tag_commit" == "$signed_source" ]]
+          source_version="$(git show "$signed_source:Cargo.toml" | awk -F '"' '/^version = "/ { print $2; exit }')"
+          [[ "$source_version" == "$VERSION" ]]
+
+      - name: Upload only the updates tree
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: updates
+
+  deploy:
+    name: Deploy update manifests
+    needs:
+      - gate
+      - validate
+    if: github.event_name == 'push' && needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy validated Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,26 +1,61 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::MainThreadMarker;
 use ptt2me::permissions::prime_microphone_and_exit;
+use ptt2me::release_manifest::verify_release_files;
 use ptt2me::runtime::{smoke_bundled_model, smoke_bundled_model_child, Runtime};
 use ptt2me::single_instance::InstanceLock;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LaunchMode {
     App,
     PrimeMicrophone,
     SmokeModel,
     SmokeModelChild,
+    VerifyUpdateManifest {
+        public_key: PathBuf,
+        manifest: PathBuf,
+        full_dmg: PathBuf,
+        update_dmg: PathBuf,
+        model_manifest: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
-    ptt2me::logging::init();
-
     let mode = match parse_launch_mode(std::env::args_os().skip(1)) {
         Ok(mode) => mode,
         Err(()) => return ExitCode::from(2),
     };
+    if let LaunchMode::VerifyUpdateManifest {
+        public_key,
+        manifest,
+        full_dmg,
+        update_dmg,
+        model_manifest,
+    } = &mode
+    {
+        return match verify_release_files(
+            public_key,
+            manifest,
+            full_dmg,
+            update_dmg,
+            model_manifest,
+        ) {
+            Ok(release) => {
+                println!("version={}", release.version);
+                println!("source_commit={}", release.source_commit);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("PTT2me update manifest verification failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    ptt2me::logging::init();
     match mode {
         LaunchMode::PrimeMicrophone => {
             return ExitCode::from(prime_microphone_and_exit() as u8);
@@ -32,6 +67,7 @@ fn main() -> ExitCode {
             return ExitCode::from(smoke_bundled_model_child() as u8);
         }
         LaunchMode::App => {}
+        LaunchMode::VerifyUpdateManifest { .. } => unreachable!(),
     }
 
     let Ok(_instance_lock) = InstanceLock::acquire() else {
@@ -61,6 +97,17 @@ fn parse_launch_mode(
         [argument] if argument == "--prime-microphone-and-exit" => Ok(LaunchMode::PrimeMicrophone),
         [argument] if argument == "--smoke-model" => Ok(LaunchMode::SmokeModel),
         [argument] if argument == "--smoke-model-child" => Ok(LaunchMode::SmokeModelChild),
+        [mode, public_key, manifest, full_dmg, update_dmg, model_manifest]
+            if mode == "--verify-update-manifest" =>
+        {
+            Ok(LaunchMode::VerifyUpdateManifest {
+                public_key: PathBuf::from(public_key),
+                manifest: PathBuf::from(manifest),
+                full_dmg: PathBuf::from(full_dmg),
+                update_dmg: PathBuf::from(update_dmg),
+                model_manifest: PathBuf::from(model_manifest),
+            })
+        }
         _ => Err(()),
     }
 }
