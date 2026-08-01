@@ -24,6 +24,10 @@ use crate::inserter::{
 use crate::menu::MenuAction;
 use crate::menu::{MenuBar, MenuCommand, MenuReadiness};
 use crate::model::{resources_dir_from_executable, ModelPaths};
+use crate::model_store::{
+    application_support_root, bundled_model_directory, embedded_model_manifest, resolve_model,
+    verify_model_directory, ModelStoreError, VerifiedModel,
+};
 use crate::output_preferences::{
     OutputPreferenceController, OutputPreferenceError, OutputPreferenceRepository,
     RawOutputPreferenceStore, SystemOutputPreferenceStore,
@@ -36,7 +40,9 @@ use crate::preferences::{
     PreferenceError, PreferenceRepository, Preferences, RawPreferenceStore, SystemPreferenceStore,
     TriggerKey,
 };
-use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
+use crate::state::{
+    AppController, AppEvent, AppStatus, Effect, ModelPreparationFailure, PermissionSnapshot,
+};
 use crate::text_inserter::{self, InsertMethod, InsertOutcome};
 
 const EVENT_DRAIN_MS: u64 = 50;
@@ -44,6 +50,61 @@ const PERMISSION_POLL_MS: u64 = 1_000;
 const SMOKE_MODEL_TIMEOUT: Duration = Duration::from_secs(180);
 const SMOKE_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SMOKE_TIMEOUT_EXIT_CODE: i32 = 124;
+
+#[derive(Debug)]
+enum ModelPreparationPlan {
+    LoadVerified(ModelPaths),
+    Failed(ModelPreparationFailure),
+}
+
+impl ModelPreparationPlan {
+    const fn starts_permission_setup(&self) -> bool {
+        matches!(self, Self::LoadVerified(_))
+    }
+}
+
+fn model_preparation_plan(result: Result<VerifiedModel, ModelStoreError>) -> ModelPreparationPlan {
+    match result {
+        Ok(verified) => ModelPreparationPlan::LoadVerified(verified.into_paths()),
+        Err(ModelStoreError::RepairRequired) => {
+            ModelPreparationPlan::Failed(ModelPreparationFailure::RepairRequired)
+        }
+        Err(_) => ModelPreparationPlan::Failed(ModelPreparationFailure::Storage),
+    }
+}
+
+fn spawn_model_preparation_worker_with<F>(
+    prepare: F,
+) -> (
+    Receiver<Result<VerifiedModel, ModelStoreError>>,
+    JoinHandle<()>,
+)
+where
+    F: FnOnce() -> Result<VerifiedModel, ModelStoreError> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let _ = sender.send(prepare());
+    });
+    (receiver, worker)
+}
+
+fn spawn_model_preparation_worker() -> (
+    Receiver<Result<VerifiedModel, ModelStoreError>>,
+    JoinHandle<()>,
+) {
+    spawn_model_preparation_worker_with(prepare_runtime_model)
+}
+
+fn prepare_runtime_model() -> Result<VerifiedModel, ModelStoreError> {
+    let application_support = application_support_root()?;
+    let executable =
+        std::env::current_exe().map_err(|error| ModelStoreError::Environment(error.to_string()))?;
+    let resources =
+        resources_dir_from_executable(&executable).map_err(ModelStoreError::Environment)?;
+    let bundled = bundled_model_directory(&resources);
+    resolve_model(&application_support, Some(&bundled))
+}
 
 struct RuntimePreferences<R: RawPreferenceStore> {
     current: Preferences,
@@ -446,6 +507,8 @@ pub struct Runtime {
     asr_events: Receiver<AsrEvent>,
     asr_worker: Option<JoinHandle<()>>,
     asr_connected: bool,
+    model_preparation_events: Option<Receiver<Result<VerifiedModel, ModelStoreError>>>,
+    model_preparation_worker: Option<JoinHandle<()>>,
     run_loop: CFRunLoop,
     drain_timer: Option<ScheduledTimer>,
     permission_timer: Option<ScheduledTimer>,
@@ -470,6 +533,7 @@ impl Runtime {
         let (asr_commands, asr_command_receiver) = mpsc::channel();
         let (asr_event_sender, asr_events) = mpsc::channel();
         let asr_worker = spawn_asr_worker(asr_command_receiver, asr_event_sender);
+        let (model_preparation_events, model_preparation_worker) = spawn_model_preparation_worker();
         let preference_repository = PreferenceRepository::new(SystemPreferenceStore::new());
         let preferences = preference_repository.load();
         let output_preferences = OutputPreferenceController::load(OutputPreferenceRepository::new(
@@ -502,6 +566,8 @@ impl Runtime {
             asr_events,
             asr_worker: Some(asr_worker),
             asr_connected: true,
+            model_preparation_events: Some(model_preparation_events),
+            model_preparation_worker: Some(model_preparation_worker),
             run_loop: CFRunLoop::get_main(),
             drain_timer: None,
             permission_timer: None,
@@ -522,8 +588,6 @@ impl Runtime {
         // retain this address until `Drop` removes them.
         let runtime_ref = unsafe { Pin::as_mut(&mut runtime).get_unchecked_mut() };
         runtime_ref.install_repeating_timers();
-        runtime_ref.begin_model_load();
-        runtime_ref.poll_permissions();
         tracing::info!(
             lifecycle = "started",
             state = status_name(runtime_ref.controller.status())
@@ -540,6 +604,13 @@ impl Runtime {
             EVENT_DRAIN_MS,
             Some(EVENT_DRAIN_MS),
         ));
+    }
+
+    fn start_permission_setup(&mut self) {
+        if self.permission_timer.is_some() {
+            return;
+        }
+        let runtime = self as *mut Self;
         self.permission_timer = Some(ScheduledTimer::new(
             &self.run_loop,
             runtime,
@@ -547,24 +618,7 @@ impl Runtime {
             PERMISSION_POLL_MS,
             Some(PERMISSION_POLL_MS),
         ));
-    }
-
-    fn begin_model_load(&mut self) {
-        let paths = std::env::current_exe()
-            .map_err(|_| "current executable unavailable".to_owned())
-            .and_then(|executable| resources_dir_from_executable(&executable))
-            .and_then(|resources| ModelPaths::from_resources(&resources));
-
-        match paths {
-            Ok(paths) => {
-                if self.asr_commands.send(AsrCommand::Load(paths)).is_err() {
-                    self.dispatch(AppEvent::ModelLoaded(Err(
-                        "ASR worker unavailable".to_owned()
-                    )));
-                }
-            }
-            Err(error) => self.dispatch(AppEvent::ModelLoaded(Err(error))),
-        }
+        self.poll_permissions();
     }
 
     fn handle_timer(&mut self, kind: TimerKind) {
@@ -584,6 +638,7 @@ impl Runtime {
 
     fn drain_events(&mut self) {
         self.drain_menu_actions();
+        self.drain_model_preparation();
         self.drain_microphone_permission_completions();
 
         self.drain_menu_commands();
@@ -613,6 +668,59 @@ impl Runtime {
         }
     }
 
+    fn drain_model_preparation(&mut self) {
+        let received = self
+            .model_preparation_events
+            .as_ref()
+            .map(Receiver::try_recv);
+        let result = match received {
+            Some(Ok(result)) => Some(result),
+            Some(Err(TryRecvError::Disconnected)) => Some(Err(ModelStoreError::Environment(
+                "model preparation worker disconnected".to_owned(),
+            ))),
+            Some(Err(TryRecvError::Empty)) | None => None,
+        };
+        let Some(result) = result else {
+            return;
+        };
+
+        self.model_preparation_events = None;
+        if let Some(worker) = self.model_preparation_worker.take() {
+            if worker.join().is_err() {
+                tracing::error!(error_category = "model_preparation_worker_panic");
+            }
+        }
+
+        let plan = model_preparation_plan(result);
+        debug_assert_eq!(
+            plan.starts_permission_setup(),
+            matches!(&plan, ModelPreparationPlan::LoadVerified(_))
+        );
+        match plan {
+            ModelPreparationPlan::LoadVerified(paths) => {
+                if self.asr_commands.send(AsrCommand::Load(paths)).is_err() {
+                    self.dispatch(AppEvent::ModelLoaded(Err(
+                        "ASR worker unavailable".to_owned()
+                    )));
+                }
+                self.start_permission_setup();
+            }
+            ModelPreparationPlan::Failed(failure) => {
+                self.dispatch(AppEvent::ModelPreparationFailed(failure));
+            }
+        }
+    }
+
+    fn begin_model_preparation(&mut self) {
+        if self.model_preparation_events.is_some() {
+            return;
+        }
+        self.dispatch(AppEvent::ModelPreparationStarted);
+        let (events, worker) = spawn_model_preparation_worker();
+        self.model_preparation_events = Some(events);
+        self.model_preparation_worker = Some(worker);
+    }
+
     fn drain_hotkey_events(&mut self) {
         let hotkey_events: Vec<_> = self.hotkey_events.try_iter().collect();
         for signal in hotkey_events {
@@ -635,6 +743,7 @@ impl Runtime {
                         tracing::warn!(error_category = "open_permission_settings");
                     }
                 }
+                MenuAction::RetryModelPreparation => self.begin_model_preparation(),
             }
         }
     }
@@ -1027,6 +1136,10 @@ impl Drop for Runtime {
         if let Some(worker) = self.asr_worker.take() {
             let _ = worker.join();
         }
+        self.model_preparation_events = None;
+        if let Some(worker) = self.model_preparation_worker.take() {
+            let _ = worker.join();
+        }
         tracing::info!(lifecycle = "terminated");
     }
 }
@@ -1039,7 +1152,9 @@ fn cancel_timer(run_loop: &CFRunLoop, slot: &mut Option<ScheduledTimer>) {
 
 const fn status_name(status: &AppStatus) -> &'static str {
     match status {
-        AppStatus::Starting => "starting",
+        AppStatus::PreparingModel => "preparing_model",
+        AppStatus::ModelRepairRequired => "model_repair_required",
+        AppStatus::ModelPreparationFailed => "model_preparation_failed",
         AppStatus::PermissionBlocked(_) => "permission_blocked",
         AppStatus::Ready => "ready",
         AppStatus::Recording => "recording",
@@ -1056,7 +1171,11 @@ pub fn bundled_model_paths() -> Result<ModelPaths, String> {
 
 fn bundled_model_paths_from_executable(executable: PathBuf) -> Result<ModelPaths, String> {
     let resources = resources_dir_from_executable(&executable)?;
-    ModelPaths::from_resources(&resources)
+    let bundled = bundled_model_directory(&resources);
+    let manifest = embedded_model_manifest().map_err(|error| error.to_string())?;
+    verify_model_directory(&bundled, &manifest)
+        .map(VerifiedModel::into_paths)
+        .map_err(|error| error.to_string())
 }
 
 /// Starts a bounded child process that initializes the embedded model.
@@ -1122,12 +1241,15 @@ fn wait_for_smoke_child(child: &mut Child, timeout: Duration) -> i32 {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::fs;
     use std::rc::Rc;
+    use std::thread;
 
     use super::{
         apply_output_menu_command, capture_start_result_event, milliseconds_to_seconds,
-        reset_hotkey_before_drop, status_name, wait_for_smoke_child, AssignmentTracker,
-        DeferredTapState, MicrophonePermissionRuntime, PasteFlow, PasteFlowBoundary,
+        model_preparation_plan, reset_hotkey_before_drop, spawn_model_preparation_worker_with,
+        status_name, wait_for_smoke_child, AssignmentTracker, DeferredTapState,
+        MicrophonePermissionRuntime, ModelPreparationPlan, PasteFlow, PasteFlowBoundary,
         PasteInsertion, RuntimePreferences, TapState, TimerKind, EVENT_DRAIN_MS,
         PERMISSION_POLL_MS,
     };
@@ -1136,6 +1258,7 @@ mod tests {
     use crate::hotkey::{HotkeyControl, HotkeySignal, KeyboardObservation, ObservationKind};
     use crate::inserter::InsertError;
     use crate::menu::MenuCommand;
+    use crate::model_store::{verify_model_directory, ModelManifest, ModelStoreError, MODEL_ID};
     use crate::output_preferences::{
         OutputPreferenceController, OutputPreferenceError, OutputPreferenceRepository,
         RawOutputPreferenceStore,
@@ -1149,6 +1272,51 @@ mod tests {
 
     struct RecordingMicrophoneBoundary {
         events: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    fn verified_model_fixture() -> (tempfile::TempDir, crate::model_store::VerifiedModel) {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join(MODEL_ID);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("encoder.int8.onnx"), b"enc").unwrap();
+        fs::write(directory.join("decoder.onnx"), b"dec").unwrap();
+        fs::write(directory.join("joiner.onnx"), b"join").unwrap();
+        fs::write(directory.join("tokens.txt"), b"tok").unwrap();
+        let manifest = ModelManifest::from_bytes(
+            br#"{"schema":1,"id":"gigaam-v3-rnnt-v1","files":[{"name":"encoder.int8.onnx","size":3,"sha256":"5fb2ab76ed9bda034b192c48c7069359252fccda168d925acc0ae7d316c0b53e"},{"name":"decoder.onnx","size":3,"sha256":"e7502c799b8f76fbed077ff2cd55c906ab144d5b88ef09a71abc70b5fad601f1"},{"name":"joiner.onnx","size":4,"sha256":"58393216032be6257784ac0c6a73efb2a084e27b4cfff1e6acee7b7e6ab93b10"},{"name":"tokens.txt","size":3,"sha256":"1a7674eb4ee78df7e1ac439a93c3fa8e3c945784d4dec9fd8e3011738b2f1d62"}]}"#,
+        )
+        .unwrap();
+        let verified = verify_model_directory(&directory, &manifest).unwrap();
+        (temp, verified)
+    }
+
+    #[test]
+    fn model_preparation_plan_never_loads_asr_or_starts_permissions_on_failure() {
+        let failed = model_preparation_plan(Err(ModelStoreError::RepairRequired));
+        assert!(matches!(failed, ModelPreparationPlan::Failed(_)));
+        assert!(!failed.starts_permission_setup());
+
+        let (_temp, verified) = verified_model_fixture();
+        let ready = model_preparation_plan(Ok(verified));
+        assert!(matches!(ready, ModelPreparationPlan::LoadVerified(_)));
+        assert!(ready.starts_permission_setup());
+    }
+
+    #[test]
+    fn model_preparation_worker_runs_away_from_the_appkit_caller_thread() {
+        let caller = thread::current().id();
+        let (thread_sender, thread_receiver) = std::sync::mpsc::channel();
+        let (results, worker) = spawn_model_preparation_worker_with(move || {
+            thread_sender.send(thread::current().id()).unwrap();
+            Err(ModelStoreError::RepairRequired)
+        });
+
+        assert_ne!(thread_receiver.recv().unwrap(), caller);
+        assert!(matches!(
+            results.recv().unwrap(),
+            Err(ModelStoreError::RepairRequired)
+        ));
+        worker.join().unwrap();
     }
 
     impl MicrophonePermissionBoundary for RecordingMicrophoneBoundary {

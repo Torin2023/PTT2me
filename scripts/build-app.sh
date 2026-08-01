@@ -1,7 +1,63 @@
 #!/bin/bash
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+cd -- "$REPO_ROOT"
+
+fail() {
+    echo "PTT2me app build failed: $*" >&2
+    exit 1
+}
+
+usage() {
+    fail "usage: $0 --variant full|update --model-manifest PATH [--model-source PATH]"
+}
+
+VARIANT=""
+MODEL_MANIFEST=""
+MODEL_SOURCE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --variant)
+            [[ $# -ge 2 ]] || usage
+            VARIANT="$2"
+            shift 2
+            ;;
+        --model-manifest)
+            [[ $# -ge 2 ]] || usage
+            MODEL_MANIFEST="$2"
+            shift 2
+            ;;
+        --model-source)
+            [[ $# -ge 2 ]] || usage
+            MODEL_SOURCE="$2"
+            shift 2
+            ;;
+        *) usage ;;
+    esac
+done
+
+[[ "$VARIANT" == "full" || "$VARIANT" == "update" ]] || usage
+[[ -n "$MODEL_MANIFEST" ]] || usage
+if [[ "$VARIANT" == "full" && -z "$MODEL_SOURCE" ]]; then
+    fail "full variant requires --model-source"
+fi
+if [[ "$VARIANT" == "update" && -n "$MODEL_SOURCE" ]]; then
+    fail "update variant does not accept --model-source"
+fi
+
+COMMITTED_MODEL_MANIFEST="$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
+[[ -f "$MODEL_MANIFEST" && ! -L "$MODEL_MANIFEST" ]] ||
+    fail "model manifest is not a real file: $MODEL_MANIFEST"
+cmp -s "$COMMITTED_MODEL_MANIFEST" "$MODEL_MANIFEST" ||
+    fail "--model-manifest must match the committed exact bytes"
+if [[ "$VARIANT" == "full" ]]; then
+    "$SCRIPT_DIR/check-model-variant.sh" \
+        --variant full \
+        --model-manifest "$MODEL_MANIFEST" \
+        --model-source "$MODEL_SOURCE"
+fi
 
 if [[ "$(uname -m)" != "arm64" ]]; then
     echo "PTT2me build requires an Apple Silicon (arm64) Mac." >&2
@@ -15,8 +71,7 @@ CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 FRAMEWORKS="$CONTENTS/Frameworks"
-MODEL_SOURCE="vendor/models/gigaam-v3-rnnt"
-MODEL_DESTINATION="$RESOURCES/models/gigaam-v3-rnnt"
+MODEL_DESTINATION="$RESOURCES/models/gigaam-v3-rnnt-v1"
 LICENSE_SOURCE="licenses"
 LICENSE_DESTINATION="$RESOURCES/licenses"
 RELEASE_DIR="target/$TARGET/release"
@@ -30,9 +85,6 @@ require_nonempty_file() {
     }
 }
 
-for model_file in encoder.int8.onnx decoder.onnx joiner.onnx tokens.txt; do
-    require_nonempty_file "$MODEL_SOURCE/$model_file"
-done
 for license_file in \
     GIGAAM-MIT.txt \
     RTRB-MIT.txt \
@@ -59,12 +111,17 @@ require_nonempty_file "$RELEASE_DIR/$SHERPA_DYLIB"
 require_nonempty_file "$RELEASE_DIR/$ONNX_DYLIB"
 
 rm -rf "$APP"
-mkdir -p "$MACOS" "$MODEL_DESTINATION" "$LICENSE_DESTINATION" "$FRAMEWORKS"
+mkdir -p "$MACOS" "$LICENSE_DESTINATION" "$FRAMEWORKS"
+if [[ "$VARIANT" == "full" ]]; then
+    mkdir -p "$MODEL_DESTINATION"
+fi
 
 install -m 755 "$EXECUTABLE_SOURCE" "$MACOS/$PRODUCT"
-for model_file in encoder.int8.onnx decoder.onnx joiner.onnx tokens.txt; do
-    install -m 644 "$MODEL_SOURCE/$model_file" "$MODEL_DESTINATION/$model_file"
-done
+if [[ "$VARIANT" == "full" ]]; then
+    for model_file in encoder.int8.onnx decoder.onnx joiner.onnx tokens.txt; do
+        install -m 644 "$MODEL_SOURCE/$model_file" "$MODEL_DESTINATION/$model_file"
+    done
+fi
 for license_file in \
     GIGAAM-MIT.txt \
     RTRB-MIT.txt \
@@ -121,6 +178,7 @@ plutil -create xml1 "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD_VERSION" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :PTT2meDistributionVariant string $VARIANT" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 13.0" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PLIST"
 /usr/libexec/PlistBuddy -c \
@@ -132,5 +190,8 @@ codesign --force --sign - "$FRAMEWORKS/$SHERPA_DYLIB"
 codesign --force --sign - "$MACOS/$PRODUCT"
 codesign --force --sign - "$APP"
 
-scripts/check-bundle.sh "$APP"
-echo "Built $APP"
+scripts/check-bundle.sh \
+    --variant "$VARIANT" \
+    --model-manifest "$MODEL_MANIFEST" \
+    "$APP"
+echo "Built $APP ($VARIANT)"

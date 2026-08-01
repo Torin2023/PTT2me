@@ -1,30 +1,61 @@
 #!/bin/bash
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
-
-APP_PATH="${1:-dist/PTT2me.app}"
-CONTENTS="$APP_PATH/Contents"
-EXECUTABLE="$CONTENTS/MacOS/PTT2me"
-FRAMEWORKS="$CONTENTS/Frameworks"
-MODEL="$CONTENTS/Resources/models/gigaam-v3-rnnt"
-PLIST="$CONTENTS/Info.plist"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+cd -- "$REPO_ROOT"
 
 fail() {
     echo "PTT2me bundle check failed: $*" >&2
     exit 1
 }
 
+usage() {
+    fail "usage: $0 --variant full|update --model-manifest PATH APP_PATH"
+}
+
+VARIANT=""
+MODEL_MANIFEST=""
+APP_PATH=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --variant)
+            [[ $# -ge 2 ]] || usage
+            VARIANT="$2"
+            shift 2
+            ;;
+        --model-manifest)
+            [[ $# -ge 2 ]] || usage
+            MODEL_MANIFEST="$2"
+            shift 2
+            ;;
+        --*) usage ;;
+        *)
+            [[ -z "$APP_PATH" ]] || usage
+            APP_PATH="$1"
+            shift
+            ;;
+    esac
+done
+
+[[ "$VARIANT" == "full" || "$VARIANT" == "update" ]] || usage
+[[ -n "$MODEL_MANIFEST" && -n "$APP_PATH" ]] || usage
+COMMITTED_MODEL_MANIFEST="$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
+[[ -f "$MODEL_MANIFEST" && ! -L "$MODEL_MANIFEST" ]] ||
+    fail "model manifest is not a real file: $MODEL_MANIFEST"
+cmp -s "$COMMITTED_MODEL_MANIFEST" "$MODEL_MANIFEST" ||
+    fail "--model-manifest must match the committed exact bytes"
+
+CONTENTS="$APP_PATH/Contents"
+EXECUTABLE="$CONTENTS/MacOS/PTT2me"
+FRAMEWORKS="$CONTENTS/Frameworks"
+RESOURCES="$CONTENTS/Resources"
+PLIST="$CONTENTS/Info.plist"
+
 require_file() {
     local path="$1"
     local relative="${path#"$APP_PATH"/}"
     [[ -f "$path" ]] || fail "missing $relative"
-}
-
-require_nonempty_file() {
-    local path="$1"
-    local relative="${path#"$APP_PATH"/}"
-    [[ -s "$path" ]] || fail "missing or empty $relative"
 }
 
 require_arm64() {
@@ -160,13 +191,13 @@ require_exact_executable_rpath() {
         fail "${path#"$APP_PATH"/} runtime paths are not exactly @executable_path/../Frameworks"
 }
 
+"$SCRIPT_DIR/check-model-variant.sh" \
+    --variant "$VARIANT" \
+    --model-manifest "$MODEL_MANIFEST" \
+    --resources "$RESOURCES" || fail "$VARIANT model layout is invalid"
+
 require_file "$EXECUTABLE"
 require_arm64 "$EXECUTABLE"
-
-require_nonempty_file "$MODEL/encoder.int8.onnx"
-require_nonempty_file "$MODEL/decoder.onnx"
-require_nonempty_file "$MODEL/joiner.onnx"
-require_nonempty_file "$MODEL/tokens.txt"
 
 SHERPA_DYLIB="$FRAMEWORKS/libsherpa-onnx-c-api.dylib"
 ONNX_DYLIB="$FRAMEWORKS/libonnxruntime.1.17.1.dylib"
@@ -180,6 +211,7 @@ EXPECTED_VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
 [[ -n "$EXPECTED_VERSION" ]] || fail "could not read version from Cargo.toml"
 assert_plist CFBundleIdentifier com.ptt2me.app
 assert_plist CFBundleShortVersionString "$EXPECTED_VERSION"
+assert_plist PTT2meDistributionVariant "$VARIANT"
 assert_plist LSUIElement true
 assert_plist LSMinimumSystemVersion 13.0
 
@@ -203,14 +235,16 @@ check_onnx_linkage "$ONNX_DYLIB"
 codesign --verify --deep --strict "$APP_PATH" >/dev/null 2>&1 ||
     fail "code signature verification failed"
 
-if "$EXECUTABLE" --smoke-model; then
-    :
-else
-    SMOKE_STATUS=$?
-    if [[ "$SMOKE_STATUS" == 124 ]]; then
-        fail "bundled model initialization exceeded 180 seconds"
+if [[ "$VARIANT" == "full" ]]; then
+    if "$EXECUTABLE" --smoke-model; then
+        :
+    else
+        SMOKE_STATUS=$?
+        if [[ "$SMOKE_STATUS" == 124 ]]; then
+            fail "bundled model initialization exceeded 180 seconds"
+        fi
+        fail "bundled model initialization failed with status $SMOKE_STATUS"
     fi
-    fail "bundled model initialization failed with status $SMOKE_STATUS"
 fi
 
-echo "PTT2me bundle is valid: $APP_PATH"
+echo "PTT2me $VARIANT bundle is valid: $APP_PATH"

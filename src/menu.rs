@@ -33,24 +33,39 @@ pub struct MenuProjection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PermissionActionProjection {
+struct StatusActionProjection {
+    title: &'static str,
     visible: bool,
     enabled: bool,
-    permission: Option<PermissionKind>,
+    kind: Option<StatusActionKind>,
 }
 
-impl PermissionActionProjection {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusActionKind {
+    Permission(PermissionKind),
+    RetryModelPreparation,
+}
+
+impl StatusActionProjection {
     const fn from_status(status: &AppStatus) -> Self {
         match status {
             AppStatus::PermissionBlocked(permission) => Self {
+                title: "Открыть настройки…",
                 visible: true,
                 enabled: true,
-                permission: Some(*permission),
+                kind: Some(StatusActionKind::Permission(*permission)),
+            },
+            AppStatus::ModelRepairRequired | AppStatus::ModelPreparationFailed => Self {
+                title: "Повторить подготовку модели",
+                visible: true,
+                enabled: true,
+                kind: Some(StatusActionKind::RetryModelPreparation),
             },
             _ => Self {
+                title: "Открыть настройки…",
                 visible: false,
                 enabled: false,
-                permission: None,
+                kind: None,
             },
         }
     }
@@ -59,11 +74,23 @@ impl PermissionActionProjection {
 impl MenuProjection {
     pub fn from_status(status: &AppStatus) -> Self {
         let (title, symbol, pulse, style) = match status {
-            AppStatus::Starting => (
-                "● Запуск…".into(),
+            AppStatus::PreparingModel => (
+                "● Подготовка модели…".into(),
                 "hourglass",
                 false,
                 SymbolStyle::Template,
+            ),
+            AppStatus::ModelRepairRequired => (
+                "● Требуется восстановление модели".into(),
+                "exclamationmark.triangle.fill",
+                false,
+                SymbolStyle::HierarchicalRed,
+            ),
+            AppStatus::ModelPreparationFailed => (
+                "● Ошибка подготовки модели".into(),
+                "exclamationmark.triangle.fill",
+                false,
+                SymbolStyle::HierarchicalRed,
             ),
             AppStatus::PermissionBlocked(permission) => (
                 format!("● Нужен доступ: {}", permission_title(*permission)),
@@ -160,6 +187,7 @@ fn toggled_append_space(selected: bool) -> (bool, MenuCommand) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MenuAction {
     OpenPermission(PermissionKind),
+    RetryModelPreparation,
 }
 
 #[derive(Clone)]
@@ -205,7 +233,7 @@ fn symbol_style(projection: &MenuProjection) -> SymbolStyle {
 struct MenuTargetIvars {
     publisher: MenuCommandPublisher,
     action_sender: Sender<MenuAction>,
-    permission: Cell<Option<PermissionKind>>,
+    status_action: Cell<Option<StatusActionKind>>,
     append_space: Cell<bool>,
 }
 
@@ -287,14 +315,18 @@ declare_class!(
             unsafe { app.terminate(Some(sender)) };
         }
 
-        #[method(openPermissionSettings:)]
-        fn open_permission_settings(&self, _sender: &AnyObject) {
-            if let Some(permission) = self.ivars().permission.get() {
-                let _ = self
-                    .ivars()
-                    .action_sender
-                    .send(MenuAction::OpenPermission(permission));
-            }
+        #[method(performStatusAction:)]
+        fn perform_status_action(&self, _sender: &AnyObject) {
+            let action = match self.ivars().status_action.get() {
+                Some(StatusActionKind::Permission(permission)) => {
+                    MenuAction::OpenPermission(permission)
+                }
+                Some(StatusActionKind::RetryModelPreparation) => {
+                    MenuAction::RetryModelPreparation
+                }
+                None => return,
+            };
+            let _ = self.ivars().action_sender.send(action);
         }
 
         #[method(assignTrigger:)]
@@ -343,7 +375,7 @@ impl MenuTarget {
         let this = mtm.alloc().set_ivars(MenuTargetIvars {
             publisher: MenuCommandPublisher::new(sender, hotkey, readiness),
             action_sender,
-            permission: Cell::new(None),
+            status_action: Cell::new(None),
             append_space: Cell::new(append_space),
         });
         unsafe { msg_send_id![super(this), init] }
@@ -357,7 +389,7 @@ pub struct MenuBar {
     _status_item: Retained<NSStatusItem>,
     _menu: Retained<NSMenu>,
     status_row: Retained<NSMenuItem>,
-    permission_row: Retained<NSMenuItem>,
+    status_action_row: Retained<NSMenuItem>,
     current_trigger_row: Retained<NSMenuItem>,
     threshold_rows: [Retained<NSMenuItem>; 3],
     trailing_space_row: Retained<NSMenuItem>,
@@ -388,14 +420,14 @@ impl MenuBar {
         unsafe { menu.setAutoenablesItems(false) };
 
         let mut status_row = None;
-        let mut permission_row = None;
+        let mut status_action_row = None;
         let mut current_trigger_row = None;
         let mut threshold_rows = Vec::with_capacity(HoldThreshold::OPTIONS.len());
         let mut trailing_space_row = None;
         for entry in MENU_DESCRIPTOR {
             match entry {
                 MenuEntry::Status => {
-                    let item = menu_item(mtm, "● Запуск…", None);
+                    let item = menu_item(mtm, "● Подготовка модели…", None);
                     unsafe { item.setEnabled(false) };
                     menu.addItem(&item);
                     status_row = Some(item);
@@ -406,18 +438,15 @@ impl MenuBar {
                     menu.addItem(&item);
                 }
                 MenuEntry::PermissionSettings => {
-                    let item = menu_item(
-                        mtm,
-                        "Открыть настройки…",
-                        Some(sel!(openPermissionSettings:)),
-                    );
+                    let item =
+                        menu_item(mtm, "Открыть настройки…", Some(sel!(performStatusAction:)));
                     unsafe {
                         item.setTarget(Some(&target));
                         item.setEnabled(false);
                         item.setHidden(true);
                     }
                     menu.addItem(&item);
-                    permission_row = Some(item);
+                    status_action_row = Some(item);
                 }
                 MenuEntry::Trigger => {
                     let parent = menu_item(mtm, "Клавиша активации", None);
@@ -511,8 +540,8 @@ impl MenuBar {
             _status_item: status_item,
             _menu: menu,
             status_row: status_row.expect("menu descriptor must contain the status row"),
-            permission_row: permission_row
-                .expect("menu descriptor must contain the permission action row"),
+            status_action_row: status_action_row
+                .expect("menu descriptor must contain the status action row"),
             current_trigger_row: current_trigger_row
                 .expect("menu descriptor must contain the current trigger row"),
             threshold_rows: threshold_rows
@@ -525,7 +554,7 @@ impl MenuBar {
             action_receiver,
             pulse_active: false,
         };
-        menu_bar.render(&AppStatus::Starting);
+        menu_bar.render(&AppStatus::PreparingModel);
         menu_bar.render_preferences(preferences);
         menu_bar.render_append_space(append_space);
         menu_bar
@@ -539,17 +568,16 @@ impl MenuBar {
         let _mtm = main_thread_marker();
 
         let projection = MenuProjection::from_status(status);
-        let permission_action = PermissionActionProjection::from_status(status);
+        let status_action = StatusActionProjection::from_status(status);
         unsafe {
             self.status_row
                 .setTitle(&NSString::from_str(&projection.title));
-            self.permission_row.setHidden(!permission_action.visible);
-            self.permission_row.setEnabled(permission_action.enabled);
+            self.status_action_row
+                .setTitle(&NSString::from_str(status_action.title));
+            self.status_action_row.setHidden(!status_action.visible);
+            self.status_action_row.setEnabled(status_action.enabled);
         }
-        self._target
-            .ivars()
-            .permission
-            .set(permission_action.permission);
+        self._target.ivars().status_action.set(status_action.kind);
 
         if let Some(image) = system_symbol(&projection) {
             unsafe { self.button.setImage(Some(&image)) };
@@ -746,9 +774,9 @@ mod tests {
     #[test]
     fn startup_permission_and_error_have_exact_presentations() {
         assert_eq!(
-            MenuProjection::from_status(&AppStatus::Starting),
+            MenuProjection::from_status(&AppStatus::PreparingModel),
             MenuProjection {
-                title: "● Запуск…".into(),
+                title: "● Подготовка модели…".into(),
                 symbol: "hourglass",
                 pulse: false,
                 style: SymbolStyle::Template,
@@ -797,6 +825,20 @@ mod tests {
                 style: SymbolStyle::Template,
             }
         );
+    }
+
+    #[test]
+    fn model_preparation_failures_expose_only_the_targeted_retry_action() {
+        for status in [
+            AppStatus::ModelRepairRequired,
+            AppStatus::ModelPreparationFailed,
+        ] {
+            let action = StatusActionProjection::from_status(&status);
+            assert_eq!(action.title, "Повторить подготовку модели");
+            assert!(action.visible);
+            assert!(action.enabled);
+            assert_eq!(action.kind, Some(StatusActionKind::RetryModelPreparation));
+        }
     }
 
     #[test]
@@ -869,11 +911,12 @@ mod tests {
     #[test]
     fn permission_action_tracks_the_current_missing_permission() {
         assert_eq!(
-            PermissionActionProjection::from_status(&AppStatus::Ready),
-            PermissionActionProjection {
+            StatusActionProjection::from_status(&AppStatus::Ready),
+            StatusActionProjection {
+                title: "Открыть настройки…",
                 visible: false,
                 enabled: false,
-                permission: None,
+                kind: None,
             }
         );
         for permission in [
@@ -882,11 +925,12 @@ mod tests {
             PermissionKind::Microphone,
         ] {
             assert_eq!(
-                PermissionActionProjection::from_status(&AppStatus::PermissionBlocked(permission)),
-                PermissionActionProjection {
+                StatusActionProjection::from_status(&AppStatus::PermissionBlocked(permission)),
+                StatusActionProjection {
+                    title: "Открыть настройки…",
                     visible: true,
                     enabled: true,
-                    permission: Some(permission),
+                    kind: Some(StatusActionKind::Permission(permission)),
                 }
             );
         }

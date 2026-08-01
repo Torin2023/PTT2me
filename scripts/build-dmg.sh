@@ -2,17 +2,61 @@
 set -euo pipefail
 
 readonly PRODUCT="PTT2me"
-readonly TARGET_PLATFORM="macos-arm64"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 readonly REPO_ROOT
+cd -- "$REPO_ROOT"
 
 fail() {
     echo "PTT2me DMG build failed: $*" >&2
     exit 1
 }
+
+usage() {
+    fail "usage: $0 --variant full|update --model-manifest PATH --app APP_PATH --output DMG_PATH"
+}
+
+VARIANT=""
+MODEL_MANIFEST=""
+APP_PATH=""
+DMG_PATH=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --variant)
+            [[ $# -ge 2 ]] || usage
+            VARIANT="$2"
+            shift 2
+            ;;
+        --model-manifest)
+            [[ $# -ge 2 ]] || usage
+            MODEL_MANIFEST="$2"
+            shift 2
+            ;;
+        --app)
+            [[ $# -ge 2 ]] || usage
+            APP_PATH="$2"
+            shift 2
+            ;;
+        --output)
+            [[ $# -ge 2 ]] || usage
+            DMG_PATH="$2"
+            shift 2
+            ;;
+        *) usage ;;
+    esac
+done
+
+[[ "$VARIANT" == "full" || "$VARIANT" == "update" ]] || usage
+[[ -n "$MODEL_MANIFEST" && -n "$APP_PATH" && -n "$DMG_PATH" ]] || usage
+[[ -d "$APP_PATH" && ! -L "$APP_PATH" ]] ||
+    fail "app bundle is not a real directory: $APP_PATH"
+COMMITTED_MODEL_MANIFEST="$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
+[[ -f "$MODEL_MANIFEST" && ! -L "$MODEL_MANIFEST" ]] ||
+    fail "model manifest is not a real file: $MODEL_MANIFEST"
+cmp -s "$COMMITTED_MODEL_MANIFEST" "$MODEL_MANIFEST" ||
+    fail "--model-manifest must match the committed exact bytes"
 
 cleanup() {
     if [[ "${DMG_MOUNTED:-false}" == true ]]; then
@@ -31,25 +75,28 @@ for command in hdiutil shasum mktemp; do
         fail "required command is unavailable: $command"
 done
 
-cd -- "$REPO_ROOT"
-VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
-[[ -n "$VERSION" ]] || fail "could not read version from Cargo.toml"
-
-readonly DMG_NAME="$PRODUCT-$VERSION-$TARGET_PLATFORM.dmg"
-readonly DMG_PATH="$REPO_ROOT/dist/$DMG_NAME"
+[[ "$DMG_PATH" == *.dmg ]] || fail "--output must end in .dmg"
+DMG_OUTPUT_DIR="$(cd -- "$(dirname -- "$DMG_PATH")" 2>/dev/null && pwd -P)" ||
+    fail "output directory does not exist: $(dirname -- "$DMG_PATH")"
+DMG_NAME="$(basename -- "$DMG_PATH")"
+DMG_PATH="$DMG_OUTPUT_DIR/$DMG_NAME"
+readonly DMG_NAME DMG_PATH DMG_OUTPUT_DIR
 readonly CHECKSUM_PATH="$DMG_PATH.sha256"
 
-"$SCRIPT_DIR/build-app.sh"
+"$SCRIPT_DIR/check-bundle.sh" \
+    --variant "$VARIANT" \
+    --model-manifest "$MODEL_MANIFEST" \
+    "$APP_PATH"
 
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ptt2me-dmg.XXXXXX")"
 readonly TEMP_ROOT
 readonly STAGING_DIR="$TEMP_ROOT/staging"
 readonly MOUNT_DIR="$TEMP_ROOT/mount"
-TEMP_DMG="$REPO_ROOT/dist/.$DMG_NAME.tmp.dmg"
-TEMP_CHECKSUM="$REPO_ROOT/dist/.$DMG_NAME.sha256.tmp"
+TEMP_DMG="$DMG_OUTPUT_DIR/.$DMG_NAME.tmp.dmg"
+TEMP_CHECKSUM="$DMG_OUTPUT_DIR/.$DMG_NAME.sha256.tmp"
 
 mkdir -p "$STAGING_DIR" "$MOUNT_DIR"
-cp -R "$REPO_ROOT/dist/$PRODUCT.app" "$STAGING_DIR/$PRODUCT.app"
+cp -R "$APP_PATH" "$STAGING_DIR/$PRODUCT.app"
 ln -s /Applications "$STAGING_DIR/Applications"
 
 hdiutil create \
@@ -73,7 +120,10 @@ DMG_MOUNTED=true
     fail "Applications link has the wrong target"
 [[ "$(find "$MOUNT_DIR" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" == "2" ]] ||
     fail "mounted image contains unexpected root items"
-"$SCRIPT_DIR/check-bundle.sh" "$MOUNT_DIR/$PRODUCT.app"
+"$SCRIPT_DIR/check-bundle.sh" \
+    --variant "$VARIANT" \
+    --model-manifest "$MODEL_MANIFEST" \
+    "$MOUNT_DIR/$PRODUCT.app"
 
 hdiutil detach "$MOUNT_DIR" -quiet
 DMG_MOUNTED=false
