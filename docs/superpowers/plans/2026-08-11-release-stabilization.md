@@ -212,6 +212,8 @@
   tests/release_preflight.sh
   tests/release_builder_contracts.sh
   tests/verify_release_artifacts.sh
+  tests/release_ci_contracts.sh
+  tests/release_documentation.sh
   ```
 
   Тот же test проверяет, что `.github/workflows/ci.yml` содержит отдельный step

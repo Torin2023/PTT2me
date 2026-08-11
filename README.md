@@ -186,6 +186,64 @@ build, exact clean `HEAD`, model source, committed model manifest, publication
 timestamp, and matching key pair. The private signing key must remain outside
 Git. The published package version is exactly 1.1.0.
 
+### Reproducible release gates
+
+On a controlled Apple Silicon Mac, run the fail-closed preflight before the
+production builder. The model directory and private key are external release
+inputs; the scripts never download, generate, or replace them:
+
+```bash
+scripts/release-preflight.sh \
+  --version X.Y.Z \
+  --build YYYYMMDDHHMM \
+  --source-commit COMMIT \
+  --model-manifest models/manifests/gigaam-v3-rnnt-v1.json \
+  --model-source /absolute/path/to/gigaam-v3-rnnt \
+  --public-key updates/public-key.txt \
+  --private-key /absolute/path/outside/git/private-key.txt \
+  --published-at YYYY-MM-DDTHH:MM:SSZ \
+  --output-dir /absolute/path/to/empty-release-set
+
+scripts/build-release-artifacts.sh \
+  --version X.Y.Z \
+  --build YYYYMMDDHHMM \
+  --source-commit COMMIT \
+  --model-manifest models/manifests/gigaam-v3-rnnt-v1.json \
+  --model-source /absolute/path/to/gigaam-v3-rnnt \
+  --public-key updates/public-key.txt \
+  --private-key /absolute/path/outside/git/private-key.txt \
+  --published-at YYYY-MM-DDTHH:MM:SSZ \
+  --output-dir /absolute/path/to/empty-release-set
+```
+
+The builder publishes exactly five no-overwrite outputs into the selected
+directory. Verify that closed set independently, without the private key or
+builder workspace:
+
+```bash
+scripts/verify-release-artifacts.sh \
+  --version X.Y.Z \
+  --source-commit COMMIT \
+  --full-dmg /absolute/path/to/release-set/PTT2me-X.Y.Z-full-macos-arm64.dmg \
+  --full-checksum /absolute/path/to/release-set/PTT2me-X.Y.Z-full-macos-arm64.dmg.sha256 \
+  --update-dmg /absolute/path/to/release-set/PTT2me-X.Y.Z-update-macos-arm64.dmg \
+  --update-checksum /absolute/path/to/release-set/PTT2me-X.Y.Z-update-macos-arm64.dmg.sha256 \
+  --manifest /absolute/path/to/release-set/PTT2me-X.Y.Z-signed-update-manifest.json \
+  --public-key updates/public-key.txt \
+  --model-manifest models/manifests/gigaam-v3-rnnt-v1.json
+```
+
+This is the rehearsal form before the tag exists. Immediately before
+publication, repeat the same verifier command with `--expected-tag vX.Y.Z`; the
+tag must resolve to the signed source commit. Then complete a separate copy of
+[`docs/release/MANUAL_P0_CHECKLIST.md`](docs/release/MANUAL_P0_CHECKLIST.md)
+from the installed Full DMG. Filled checklists remain beside local release
+outputs and are not committed.
+
+The preflight, builder, and verifier do not publish GitHub Release or the Pages stable channel.
+Publication is a separate owner-authorized workflow after Gate A, Gate B,
+Gate C, and the manual P0 gate all pass.
+
 ## Updating (PTT2me 1.1.0)
 
 Preview 1.0.5 cannot discover this release and must be replaced once with the
