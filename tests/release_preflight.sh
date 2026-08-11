@@ -27,7 +27,7 @@ write_fake_tools() {
     mkdir -p "$FAKE_BIN"
     : >"$FAKE_TOOL_LOG"
 
-    for tool in awk base64 basename cmp date dirname find git plutil printf pwd shasum stat tr wc; do
+    for tool in awk base64 basename cmp date dirname find git mktemp plutil printf pwd shasum stat tr wc; do
         link_tool "$tool"
     done
 
@@ -46,6 +46,14 @@ write_fake_tools() {
         '#!/bin/bash' \
         'echo "$*" >>"$FAKE_TOOL_LOG"' \
         'if [[ "$1" == "check" && "${FAKE_CARGO_FAIL_CHECK:-0}" == "1" ]]; then exit 71; fi' \
+        'if [[ "$1" == "run" ]]; then' \
+        '  output="${!#}"' \
+        '  if [[ -n "${FAKE_DERIVED_KEY_CONTENT:-}" ]]; then' \
+        '    printf "%s\n" "$FAKE_DERIVED_KEY_CONTENT" >"$output"' \
+        '  else' \
+        '    /bin/cp "$FAKE_PUBLIC_KEY_SOURCE" "$output"' \
+        '  fi' \
+        'fi' \
         'if [[ "$1" == "test" && "${FAKE_CARGO_FAIL_APPKIT:-0}" == "1" ]]; then exit 72; fi' \
         'exit 0' >"$FAKE_BIN/cargo"
     printf '%s\n' \
@@ -137,6 +145,7 @@ preflight_command() {
     env \
         PATH="$FAKE_BIN:/bin" \
         FAKE_TOOL_LOG="$FAKE_TOOL_LOG" \
+        FAKE_PUBLIC_KEY_SOURCE="$PUBLIC_KEY" \
         "$FIXTURE_REPO/scripts/release-preflight.sh" \
         --version "${TEST_VERSION:-1.1.0}" \
         --build "${TEST_BUILD:-202608111200}" \
@@ -225,8 +234,20 @@ chmod 600 "$FIXTURE_REPO/private-key.txt"
 TEST_PRIVATE_KEY="$FIXTURE_REPO/private-key.txt" expect_failure key preflight_command
 
 write_fixture_repo
+SIBLING_WORKTREE="$TEMP_ROOT/sibling-worktree-$FIXTURE_INDEX"
+/usr/bin/git -C "$FIXTURE_REPO" worktree add -q \
+    -b "fixture-sibling-$FIXTURE_INDEX" "$SIBLING_WORKTREE"
+printf '%s\n' 'sibling-worktree-secret' >"$SIBLING_WORKTREE/private-key.txt"
+chmod 600 "$SIBLING_WORKTREE/private-key.txt"
+TEST_PRIVATE_KEY="$SIBLING_WORKTREE/private-key.txt" expect_failure key preflight_command
+
+write_fixture_repo
 chmod 644 "$PRIVATE_KEY"
 expect_failure key preflight_command
+
+write_fixture_repo
+FAKE_DERIVED_KEY_CONTENT='BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' \
+    expect_failure key preflight_command
 
 write_fixture_repo
 MUTATED_MANIFEST="$EXTERNAL_INPUTS/mutated-model.json"
@@ -279,6 +300,11 @@ OUTPUT="$(preflight_command 2>&1)" || {
     exit 1
 }
 [[ "$(sed -n '2p' "$FAKE_TOOL_LOG")" == \
+    run\ --quiet\ --locked\ --bin\ ptt2me-update-signer\ --\ --derive-public-key* ]] || {
+    echo "preflight must derive the public key from the supplied private key" >&2
+    exit 1
+}
+[[ "$(sed -n '3p' "$FAKE_TOOL_LOG")" == \
     'test --locked --test pasteboard_main --features test-support -- --test-threads=1' ]] || {
     echo "preflight must run the dedicated AppKit test last" >&2
     exit 1

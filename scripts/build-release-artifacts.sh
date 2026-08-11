@@ -19,6 +19,16 @@ usage() {
     fail "usage: $0 --version X.Y.Z --build YYYYMMDDHHMM --source-commit COMMIT --model-manifest PATH --model-source PATH --public-key PATH --private-key PATH --published-at YYYY-MM-DDTHH:MM:SSZ --output-dir PATH"
 }
 
+reject_private_key_boundary() {
+    local label="$1"
+    local boundary="$2"
+    case "$PRIVATE_KEY" in
+        "$boundary" | "$boundary"/*)
+            fail "production private key must be stored outside $label"
+            ;;
+    esac
+}
+
 VERSION=""
 BUILD=""
 SOURCE_COMMIT=""
@@ -127,17 +137,32 @@ readonly MODEL_MANIFEST MODEL_SOURCE PUBLIC_KEY PRIVATE_KEY OUTPUT_DIR
     --published-at "$PUBLISHED_AT" \
     --output-dir "$OUTPUT_DIR"
 
-case "$PRIVATE_KEY" in
-    "$REPO_ROOT" | "$REPO_ROOT"/*)
-        fail "production private key must be stored outside the Git repository"
-        ;;
-esac
 PRIVATE_MODE="$(stat -f '%Lp' "$PRIVATE_KEY" 2>/dev/null)" ||
     fail "could not inspect production private key permissions"
 [[ "$PRIVATE_MODE" =~ ^[0-7]{3,4}$ && $((8#$PRIVATE_MODE & 077)) -eq 0 ]] ||
     fail "production private key permissions must deny group and other access"
 
 cd -- "$REPO_ROOT"
+GIT_COMMON_RAW="$(git rev-parse --git-common-dir 2>/dev/null)" ||
+    fail "could not resolve the Git common directory"
+GIT_COMMON_DIR="$(cd -- "$GIT_COMMON_RAW" && pwd -P)" ||
+    fail "could not canonicalize the Git common directory"
+GIT_DIR_RAW="$(git rev-parse --git-dir 2>/dev/null)" ||
+    fail "could not resolve the current Git directory"
+GIT_DIR="$(cd -- "$GIT_DIR_RAW" && pwd -P)" ||
+    fail "could not canonicalize the current Git directory"
+reject_private_key_boundary "the Git common directory" "$GIT_COMMON_DIR"
+reject_private_key_boundary "the current Git directory" "$GIT_DIR"
+GIT_WORKTREE_PATHS="$(git worktree list --porcelain 2>/dev/null | \
+    awk '/^worktree / { sub(/^worktree /, ""); print }')" ||
+    fail "could not enumerate Git worktrees"
+while IFS= read -r worktree_path; do
+    [[ -n "$worktree_path" ]] || continue
+    CANONICAL_WORKTREE="$(cd -- "$worktree_path" && pwd -P)" ||
+        fail "could not canonicalize Git worktree"
+    reject_private_key_boundary "Git worktree $CANONICAL_WORKTREE" "$CANONICAL_WORKTREE"
+done <<<"$GIT_WORKTREE_PATHS"
+
 readonly COMMITTED_PUBLIC_KEY="updates/public-key.txt"
 git cat-file -e "HEAD:$COMMITTED_PUBLIC_KEY" 2>/dev/null ||
     fail "$COMMITTED_PUBLIC_KEY must be tracked in git HEAD"

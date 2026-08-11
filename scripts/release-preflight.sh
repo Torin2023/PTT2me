@@ -42,6 +42,16 @@ canonical_directory() {
     (cd -- "$path" && pwd -P) || fail "$category" "could not resolve $label: $path"
 }
 
+reject_private_key_boundary() {
+    local label="$1"
+    local boundary="$2"
+    case "$PRIVATE_KEY" in
+        "$boundary" | "$boundary"/*)
+            fail key "production private key must be stored outside $label: $PRIVATE_KEY"
+            ;;
+    esac
+}
+
 manifest_value() {
     local keypath="$1"
     local expected_type="$2"
@@ -138,11 +148,6 @@ PRIVATE_KEY="$(canonical_file key "production private key" "$PRIVATE_KEY")"
 OUTPUT_DIR="$(canonical_directory output "output directory" "$OUTPUT_DIR")"
 readonly MODEL_MANIFEST MODEL_SOURCE PUBLIC_KEY PRIVATE_KEY OUTPUT_DIR
 
-case "$PRIVATE_KEY" in
-    "$REPO_ROOT" | "$REPO_ROOT"/*)
-        fail key "production private key must be stored outside the Git repository: $PRIVATE_KEY"
-        ;;
-esac
 PRIVATE_MODE="$(stat -f '%Lp' "$PRIVATE_KEY" 2>/dev/null)" ||
     fail key "could not inspect private key permissions: $PRIVATE_KEY"
 [[ "$PRIVATE_MODE" =~ ^[0-7]{3,4}$ ]] ||
@@ -151,8 +156,8 @@ PRIVATE_MODE="$(stat -f '%Lp' "$PRIVATE_KEY" 2>/dev/null)" ||
     fail key "private key permissions must deny group and other access: $PRIVATE_KEY"
 
 for command_name in \
-    awk base64 cargo codesign cmp df find git hdiutil lipo otool plutil rustc \
-    shasum stat tr wc; do
+    awk base64 cargo codesign cmp df find git hdiutil lipo mktemp otool plutil \
+    rustc shasum stat tr wc; do
     command -v "$command_name" >/dev/null 2>&1 ||
         fail tools "required command is unavailable: $command_name"
 done
@@ -177,21 +182,26 @@ ACTIVE_RUSTC="$(rustc --version 2>/dev/null | awk '{print $2}')" ||
 [[ "$ACTIVE_RUSTC" == "$TOOLCHAIN_CHANNEL" ]] ||
     fail toolchain "active rustc $ACTIVE_RUSTC does not match rust-toolchain.toml $TOOLCHAIN_CHANNEL"
 
-CARGO_VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' "$REPO_ROOT/Cargo.toml")"
-LOCK_VERSION="$(awk -F '"' '
-    $0 == "name = \"ptt2me\"" { package = 1; next }
-    package && /^version = "/ { print $2; exit }
-' "$REPO_ROOT/Cargo.lock")"
-[[ "$VERSION" == "$CARGO_VERSION" && "$VERSION" == "$LOCK_VERSION" ]] ||
-    fail identity "release version must match Cargo.toml and Cargo.lock: $VERSION"
-
 cd -- "$REPO_ROOT"
-HEAD_COMMIT="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
-    fail git "could not resolve exact git HEAD"
-[[ "$SOURCE_COMMIT" == "$HEAD_COMMIT" ]] ||
-    fail git "source commit must equal exact git HEAD: $SOURCE_COMMIT"
-[[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] ||
-    fail git "release source tree must be clean: $REPO_ROOT"
+GIT_COMMON_RAW="$(git rev-parse --git-common-dir 2>/dev/null)" ||
+    fail git "could not resolve the Git common directory"
+GIT_COMMON_DIR="$(cd -- "$GIT_COMMON_RAW" && pwd -P)" ||
+    fail git "could not canonicalize the Git common directory: $GIT_COMMON_RAW"
+GIT_DIR_RAW="$(git rev-parse --git-dir 2>/dev/null)" ||
+    fail git "could not resolve the current Git directory"
+GIT_DIR="$(cd -- "$GIT_DIR_RAW" && pwd -P)" ||
+    fail git "could not canonicalize the current Git directory: $GIT_DIR_RAW"
+reject_private_key_boundary "the Git common directory" "$GIT_COMMON_DIR"
+reject_private_key_boundary "the current Git directory" "$GIT_DIR"
+GIT_WORKTREE_PATHS="$(git worktree list --porcelain 2>/dev/null | \
+    awk '/^worktree / { sub(/^worktree /, ""); print }')" ||
+    fail git "could not enumerate Git worktrees"
+while IFS= read -r worktree_path; do
+    [[ -n "$worktree_path" ]] || continue
+    CANONICAL_WORKTREE="$(cd -- "$worktree_path" && pwd -P)" ||
+        fail git "could not canonicalize Git worktree: $worktree_path"
+    reject_private_key_boundary "Git worktree $CANONICAL_WORKTREE" "$CANONICAL_WORKTREE"
+done <<<"$GIT_WORKTREE_PATHS"
 
 COMMITTED_PUBLIC_KEY="$REPO_ROOT/updates/public-key.txt"
 git cat-file -e 'HEAD:updates/public-key.txt' 2>/dev/null ||
@@ -200,6 +210,21 @@ git diff --quiet HEAD -- updates/public-key.txt ||
     fail key "updates/public-key.txt worktree bytes must equal git HEAD"
 cmp -s "$COMMITTED_PUBLIC_KEY" "$PUBLIC_KEY" ||
     fail key "public key must match updates/public-key.txt: $PUBLIC_KEY"
+
+CARGO_VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' "$REPO_ROOT/Cargo.toml")"
+LOCK_VERSION="$(awk -F '"' '
+    $0 == "name = \"ptt2me\"" { package = 1; next }
+    package && /^version = "/ { print $2; exit }
+' "$REPO_ROOT/Cargo.lock")"
+[[ "$VERSION" == "$CARGO_VERSION" && "$VERSION" == "$LOCK_VERSION" ]] ||
+    fail identity "release version must match Cargo.toml and Cargo.lock: $VERSION"
+
+HEAD_COMMIT="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
+    fail git "could not resolve exact git HEAD"
+[[ "$SOURCE_COMMIT" == "$HEAD_COMMIT" ]] ||
+    fail git "source commit must equal exact git HEAD: $SOURCE_COMMIT"
+[[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] ||
+    fail git "release source tree must be clean: $REPO_ROOT"
 
 COMMITTED_MODEL_MANIFEST="$REPO_ROOT/models/manifests/$MODEL_ID.json"
 git cat-file -e "HEAD:models/manifests/$MODEL_ID.json" 2>/dev/null ||
@@ -248,6 +273,17 @@ done
     fail toolchain "manifest signer source is unavailable: $REPO_ROOT/src/bin/ptt2me-update-signer.rs"
 cargo check --locked --bins ||
     fail toolchain "signer/verifier binaries failed cargo check"
+KEY_CHECK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ptt2me-release-key-check.XXXXXX")" ||
+    fail tools "could not create a private key verification workspace"
+trap '/bin/rm -rf "$KEY_CHECK_ROOT"' EXIT
+DERIVED_PUBLIC_KEY="$KEY_CHECK_ROOT/derived-public-key.txt"
+cargo run --quiet --locked --bin ptt2me-update-signer -- \
+    --derive-public-key "$PRIVATE_KEY" "$DERIVED_PUBLIC_KEY" >/dev/null 2>&1 ||
+    fail key "private key could not derive a canonical Ed25519 public key"
+cmp -s "$DERIVED_PUBLIC_KEY" "$PUBLIC_KEY" ||
+    fail key "private key does not match the committed public key"
+/bin/rm -rf "$KEY_CHECK_ROOT"
+trap - EXIT
 cargo test --locked --test pasteboard_main --features test-support -- --test-threads=1 ||
     fail appkit "dedicated NSPasteboard test requires a passing GUI/AppKit session"
 

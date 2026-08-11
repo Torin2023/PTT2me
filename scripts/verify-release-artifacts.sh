@@ -258,7 +258,8 @@ MODEL_MANIFEST_SHA="$(shasum -a 256 "$MODEL_MANIFEST" | awk '{print $1}')"
     fail identity "signed model manifest digest does not match the supplied model manifest"
 
 if [[ -n "$EXPECTED_TAG" ]]; then
-    TAG_COMMIT="$(git -C "$REPO_ROOT" rev-parse --verify "$EXPECTED_TAG^{commit}" 2>/dev/null)" ||
+    TAG_COMMIT="$(git -C "$REPO_ROOT" rev-parse --verify \
+        "refs/tags/$EXPECTED_TAG^{commit}" 2>/dev/null)" ||
         fail git "expected release tag does not resolve to a commit: $EXPECTED_TAG"
     [[ "$TAG_COMMIT" == "$SOURCE_COMMIT" ]] ||
         fail git "expected release tag does not point to the signed source commit: $EXPECTED_TAG"
@@ -268,12 +269,12 @@ hdiutil verify "$FULL_DMG" >/dev/null ||
     fail dmg "hdiutil verify failed for Full DMG: $FULL_DMG"
 hdiutil verify "$UPDATE_DMG" >/dev/null ||
     fail dmg "hdiutil verify failed for Update DMG: $UPDATE_DMG"
+FULL_MOUNTED=true
 hdiutil attach "$FULL_DMG" -readonly -nobrowse -noautoopen -mountpoint "$FULL_MOUNT" >/dev/null ||
     fail mount "could not mount Full DMG read-only: $FULL_DMG"
-FULL_MOUNTED=true
+UPDATE_MOUNTED=true
 hdiutil attach "$UPDATE_DMG" -readonly -nobrowse -noautoopen -mountpoint "$UPDATE_MOUNT" >/dev/null ||
     fail mount "could not mount Update DMG read-only: $UPDATE_DMG"
-UPDATE_MOUNTED=true
 
 verify_mounted_root() {
     local label="$1"

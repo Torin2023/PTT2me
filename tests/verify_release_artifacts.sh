@@ -21,8 +21,10 @@ FIXTURE_INDEX=0
 write_fake_hdiutil() {
     FAKE_BIN="$TEMP_ROOT/fake-bin-$FIXTURE_INDEX"
     FAKE_HDIUTIL_LOG="$TEMP_ROOT/hdiutil-$FIXTURE_INDEX.log"
+    FAKE_HDIUTIL_STATE="$TEMP_ROOT/hdiutil-$FIXTURE_INDEX.state"
     mkdir -p "$FAKE_BIN"
     : >"$FAKE_HDIUTIL_LOG"
+    : >"$FAKE_HDIUTIL_STATE"
     printf '%s\n' \
         '#!/bin/bash' \
         'set -euo pipefail' \
@@ -48,12 +50,17 @@ write_fake_hdiutil() {
         '    done' \
         '    [[ -n "$mountpoint" ]] || exit 83' \
         '    /bin/cp -R "$IMAGE_ROOT/$variant/." "$mountpoint/"' \
+        '    printf "%s\n" "$mountpoint" >>"$FAKE_HDIUTIL_STATE"' \
+        '    if [[ "${FAKE_HDIUTIL_SIGNAL_AFTER_ATTACH:-}" == "$variant" ]]; then /bin/kill -TERM "$PPID"; fi' \
         '    ;;' \
         '  detach)' \
         '    mountpoint="$1"' \
         '    variant=update' \
         '    if [[ "$(basename -- "$mountpoint")" == full-mount ]]; then variant=full; fi' \
         '    if [[ "${FAKE_HDIUTIL_FAIL:-}" == "detach-$variant" ]]; then exit 84; fi' \
+        '    state_tmp="$FAKE_HDIUTIL_STATE.tmp.$$"' \
+        '    /usr/bin/grep -Fvx -- "$mountpoint" "$FAKE_HDIUTIL_STATE" >"$state_tmp" || true' \
+        '    /bin/mv "$state_tmp" "$FAKE_HDIUTIL_STATE"' \
         '    ;;' \
         '  *) exit 85 ;;' \
         'esac' >"$FAKE_BIN/hdiutil"
@@ -209,6 +216,7 @@ verify_command() {
         PATH="$FAKE_BIN:/usr/bin:/bin" \
         IMAGE_ROOT="$IMAGE_ROOT" \
         FAKE_HDIUTIL_LOG="$FAKE_HDIUTIL_LOG" \
+        FAKE_HDIUTIL_STATE="$FAKE_HDIUTIL_STATE" \
         PTT2ME_MANIFEST_VERIFIER="$MANIFEST_VERIFIER" \
         PTT2ME_MANIFEST_LIBRARY_PATH="$REPO_ROOT/target/debug" \
         "$FIXTURE_REPO/scripts/verify-release-artifacts.sh" \
@@ -246,14 +254,35 @@ expect_failure() {
 
 expect_detach_logged() {
     local variant="$1"
-    grep -Fq "detach" "$FAKE_HDIUTIL_LOG" || {
-        echo "verifier did not attempt detach after mounted $variant failure" >&2
-        exit 1
-    }
-    grep -Fq "$variant-mount" "$FAKE_HDIUTIL_LOG" || {
+    grep -Eq "^detach .*/$variant-mount -quiet$" "$FAKE_HDIUTIL_LOG" || {
         echo "verifier did not detach $variant mount after failure" >&2
         exit 1
     }
+}
+
+expect_no_mounts() {
+    [[ ! -s "$FAKE_HDIUTIL_STATE" ]] || {
+        echo "verifier left synthetic DMG mounts active:" >&2
+        cat "$FAKE_HDIUTIL_STATE" >&2
+        exit 1
+    }
+}
+
+expect_signal_cleanup() {
+    local before after
+    before="$(output_fingerprint)"
+    if FAKE_HDIUTIL_SIGNAL_AFTER_ATTACH=update verify_command >/dev/null 2>&1; then
+        echo "expected verifier termination during Update attach" >&2
+        exit 1
+    fi
+    after="$(output_fingerprint)"
+    [[ "$before" == "$after" ]] || {
+        echo "verifier modified release outputs during signal cleanup" >&2
+        exit 1
+    }
+    expect_detach_logged full
+    expect_detach_logged update
+    expect_no_mounts
 }
 
 resign_payload_version() {
@@ -310,6 +339,11 @@ TEST_SOURCE_COMMIT=0000000000000000000000000000000000000000 \
     expect_failure git verify_command
 
 write_fixture
+/usr/bin/git -C "$FIXTURE_REPO" tag -d v1.1.0 >/dev/null
+/usr/bin/git -C "$FIXTURE_REPO" branch v1.1.0 "$SOURCE_COMMIT"
+TEST_EXPECTED_TAG=v1.1.0 expect_failure git verify_command
+
+write_fixture
 /usr/bin/git -C "$FIXTURE_REPO" commit --allow-empty -qm moved-tag
 /usr/bin/git -C "$FIXTURE_REPO" tag -f v1.1.0 >/dev/null
 TEST_EXPECTED_TAG=v1.1.0 expect_failure git verify_command
@@ -319,12 +353,14 @@ rm -rf "$IMAGE_ROOT/full/PTT2me.app/Contents/Resources/models"
 expect_failure bundle verify_command
 expect_detach_logged full
 expect_detach_logged update
+expect_no_mounts
 
 write_fixture
 mkdir -p "$IMAGE_ROOT/update/PTT2me.app/Contents/Resources/models"
 expect_failure bundle verify_command
 expect_detach_logged full
 expect_detach_logged update
+expect_no_mounts
 
 write_fixture
 FAKE_HDIUTIL_FAIL=verify-full expect_failure dmg verify_command
@@ -332,26 +368,33 @@ FAKE_HDIUTIL_FAIL=verify-full expect_failure dmg verify_command
 write_fixture
 FAKE_HDIUTIL_FAIL=attach-update expect_failure mount verify_command
 expect_detach_logged full
+expect_no_mounts
 
 write_fixture
 FAKE_BUNDLE_FAIL_VARIANT=full expect_failure bundle verify_command
 expect_detach_logged full
 expect_detach_logged update
+expect_no_mounts
 
 write_fixture
 FAKE_PARITY_FAIL=1 expect_failure parity verify_command
 expect_detach_logged full
 expect_detach_logged update
+expect_no_mounts
 
 write_fixture
 FAKE_SMOKE_FAIL=1 expect_failure smoke verify_command
 expect_detach_logged full
 expect_detach_logged update
+expect_no_mounts
 
 write_fixture
 FAKE_HDIUTIL_FAIL=detach-update expect_failure cleanup verify_command
 expect_detach_logged full
 expect_detach_logged update
+
+write_fixture
+expect_signal_cleanup
 
 write_fixture
 TEST_EXPECTED_TAG=v1.1.0
@@ -371,5 +414,6 @@ AFTER="$(output_fingerprint)"
 }
 expect_detach_logged full
 expect_detach_logged update
+expect_no_mounts
 
 echo "Release artifact verifier contract checks passed"

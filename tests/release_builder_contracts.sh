@@ -20,11 +20,14 @@ PREFLIGHT_LINE="$(line_number '"$SCRIPT_DIR/release-preflight.sh"')"
 PUBLIC_KEY_REPEAT_LINE="$(line_number 'git cat-file -e "HEAD:$COMMITTED_PUBLIC_KEY"')"
 MODEL_REPEAT_LINE="$(line_number '"$SCRIPT_DIR/check-model-variant.sh"')"
 GIT_REPEAT_LINE="$(line_number 'git status --porcelain=v1 --untracked-files=all')"
+GIT_COMMON_REPEAT_LINE="$(line_number 'git rev-parse --git-common-dir')"
+WORKTREE_REPEAT_LINE="$(line_number 'git worktree list --porcelain')"
 TEMP_LINE="$(line_number 'TEMP_ROOT="$(mktemp -d')"
 BUILD_LINE="$(line_number '"$SCRIPT_DIR/build-app.sh"')"
 
 for later in \
     "$PUBLIC_KEY_REPEAT_LINE" "$MODEL_REPEAT_LINE" "$GIT_REPEAT_LINE" \
+    "$GIT_COMMON_REPEAT_LINE" "$WORKTREE_REPEAT_LINE" \
     "$TEMP_LINE" "$BUILD_LINE"; do
     [[ "$PREFLIGHT_LINE" -lt "$later" ]] || {
         echo "builder must run release preflight before its repeated checks and build side effects" >&2
