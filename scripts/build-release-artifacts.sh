@@ -116,11 +116,26 @@ PRIVATE_KEY="$PRIVATE_KEY_DIR/$(basename -- "$PRIVATE_KEY")"
 OUTPUT_DIR="$(cd -- "$OUTPUT_DIR" && pwd -P)"
 readonly MODEL_MANIFEST MODEL_SOURCE PUBLIC_KEY PRIVATE_KEY OUTPUT_DIR
 
+"$SCRIPT_DIR/release-preflight.sh" \
+    --version "$VERSION" \
+    --build "$BUILD" \
+    --source-commit "$SOURCE_COMMIT" \
+    --model-manifest "$MODEL_MANIFEST" \
+    --model-source "$MODEL_SOURCE" \
+    --public-key "$PUBLIC_KEY" \
+    --private-key "$PRIVATE_KEY" \
+    --published-at "$PUBLISHED_AT" \
+    --output-dir "$OUTPUT_DIR"
+
 case "$PRIVATE_KEY" in
     "$REPO_ROOT" | "$REPO_ROOT"/*)
         fail "production private key must be stored outside the Git repository"
         ;;
 esac
+PRIVATE_MODE="$(stat -f '%Lp' "$PRIVATE_KEY" 2>/dev/null)" ||
+    fail "could not inspect production private key permissions"
+[[ "$PRIVATE_MODE" =~ ^[0-7]{3,4}$ && $((8#$PRIVATE_MODE & 077)) -eq 0 ]] ||
+    fail "production private key permissions must deny group and other access"
 
 cd -- "$REPO_ROOT"
 readonly COMMITTED_PUBLIC_KEY="updates/public-key.txt"
