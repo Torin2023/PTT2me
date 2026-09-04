@@ -265,6 +265,7 @@ fn release_coordinator_rejects_a_different_public_key_before_building() {
         format!("{}\n", STANDARD.encode(signing_key.to_bytes())),
     )
     .unwrap();
+    fs::set_permissions(&private_key, fs::Permissions::from_mode(0o600)).unwrap();
 
     let output = Command::new(repository.join("scripts/build-release-artifacts.sh"))
         .arg("--version")
@@ -290,7 +291,10 @@ fn release_coordinator_rejects_a_different_public_key_before_building() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("public key must match updates/public-key.txt"));
+    assert!(
+        stderr.contains("public key must match updates/public-key.txt"),
+        "unexpected release coordinator stderr: {stderr}"
+    );
     assert!(!stderr.contains("production model manifest is not exact"));
     assert!(fs::read_dir(&output_dir).unwrap().next().is_none());
 }

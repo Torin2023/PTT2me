@@ -19,6 +19,16 @@ usage() {
     fail "usage: $0 --version X.Y.Z --build YYYYMMDDHHMM --source-commit COMMIT --model-manifest PATH --model-source PATH --public-key PATH --private-key PATH --published-at YYYY-MM-DDTHH:MM:SSZ --output-dir PATH"
 }
 
+reject_private_key_boundary() {
+    local label="$1"
+    local boundary="$2"
+    case "$PRIVATE_KEY" in
+        "$boundary" | "$boundary"/*)
+            fail "production private key must be stored outside $label"
+            ;;
+    esac
+}
+
 VERSION=""
 BUILD=""
 SOURCE_COMMIT=""
@@ -116,13 +126,50 @@ PRIVATE_KEY="$PRIVATE_KEY_DIR/$(basename -- "$PRIVATE_KEY")"
 OUTPUT_DIR="$(cd -- "$OUTPUT_DIR" && pwd -P)"
 readonly MODEL_MANIFEST MODEL_SOURCE PUBLIC_KEY PRIVATE_KEY OUTPUT_DIR
 
-case "$PRIVATE_KEY" in
-    "$REPO_ROOT" | "$REPO_ROOT"/*)
-        fail "production private key must be stored outside the Git repository"
-        ;;
-esac
+"$SCRIPT_DIR/release-preflight.sh" \
+    --version "$VERSION" \
+    --build "$BUILD" \
+    --source-commit "$SOURCE_COMMIT" \
+    --model-manifest "$MODEL_MANIFEST" \
+    --model-source "$MODEL_SOURCE" \
+    --public-key "$PUBLIC_KEY" \
+    --private-key "$PRIVATE_KEY" \
+    --published-at "$PUBLISHED_AT" \
+    --output-dir "$OUTPUT_DIR"
+
+[[ -z "$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+    fail "output directory must remain empty after release preflight"
+
+PRIVATE_MODE="$(stat -f '%Lp' "$PRIVATE_KEY" 2>/dev/null)" ||
+    fail "could not inspect production private key permissions"
+[[ "$PRIVATE_MODE" =~ ^[0-7]{3,4}$ && $((8#$PRIVATE_MODE & 077)) -eq 0 ]] ||
+    fail "production private key permissions must deny group and other access"
+PRIVATE_ACL="$(/bin/ls -lde "$PRIVATE_KEY" 2>/dev/null)" ||
+    fail "could not inspect production private key ACL"
+[[ "$(printf '%s\n' "$PRIVATE_ACL" | wc -l | tr -d ' ')" == "1" ]] ||
+    fail "production private key must not have ACL entries"
 
 cd -- "$REPO_ROOT"
+GIT_COMMON_RAW="$(git rev-parse --git-common-dir 2>/dev/null)" ||
+    fail "could not resolve the Git common directory"
+GIT_COMMON_DIR="$(cd -- "$GIT_COMMON_RAW" && pwd -P)" ||
+    fail "could not canonicalize the Git common directory"
+GIT_DIR_RAW="$(git rev-parse --git-dir 2>/dev/null)" ||
+    fail "could not resolve the current Git directory"
+GIT_DIR="$(cd -- "$GIT_DIR_RAW" && pwd -P)" ||
+    fail "could not canonicalize the current Git directory"
+reject_private_key_boundary "the Git common directory" "$GIT_COMMON_DIR"
+reject_private_key_boundary "the current Git directory" "$GIT_DIR"
+GIT_WORKTREE_PATHS="$(git worktree list --porcelain 2>/dev/null | \
+    awk '/^worktree / { sub(/^worktree /, ""); print }')" ||
+    fail "could not enumerate Git worktrees"
+while IFS= read -r worktree_path; do
+    [[ -n "$worktree_path" ]] || continue
+    CANONICAL_WORKTREE="$(cd -- "$worktree_path" && pwd -P)" ||
+        fail "could not canonicalize Git worktree"
+    reject_private_key_boundary "Git worktree $CANONICAL_WORKTREE" "$CANONICAL_WORKTREE"
+done <<<"$GIT_WORKTREE_PATHS"
+
 readonly COMMITTED_PUBLIC_KEY="updates/public-key.txt"
 git cat-file -e "HEAD:$COMMITTED_PUBLIC_KEY" 2>/dev/null ||
     fail "$COMMITTED_PUBLIC_KEY must be tracked in git HEAD"
@@ -170,12 +217,22 @@ TEMP_ROOT="$(mktemp -d "$OUTPUT_DIR/.ptt2me-$VERSION-release.XXXXXX")" ||
     fail "could not create private release workspace"
 chmod 700 "$TEMP_ROOT"
 PUBLISHED_PATHS=()
+PUBLISHED_SOURCES=()
+IN_FLIGHT_SOURCE=""
+IN_FLIGHT_DESTINATION=""
 BUILD_SUCCEEDED=false
 cleanup() {
     if [[ "$BUILD_SUCCEEDED" != true ]]; then
+        if [[ -n "$IN_FLIGHT_SOURCE" && -n "$IN_FLIGHT_DESTINATION" && \
+            -e "$IN_FLIGHT_DESTINATION" && "$IN_FLIGHT_SOURCE" -ef "$IN_FLIGHT_DESTINATION" ]]; then
+            rm -f "$IN_FLIGHT_DESTINATION"
+        fi
         if (( ${#PUBLISHED_PATHS[@]} > 0 )); then
-            for path in "${PUBLISHED_PATHS[@]}"; do
-                rm -f "$path"
+            for index in "${!PUBLISHED_PATHS[@]}"; do
+                if [[ -e "${PUBLISHED_PATHS[$index]}" && \
+                    "${PUBLISHED_SOURCES[$index]}" -ef "${PUBLISHED_PATHS[$index]}" ]]; then
+                    rm -f "${PUBLISHED_PATHS[$index]}"
+                fi
             done
         fi
     fi
@@ -247,8 +304,12 @@ printf '%s\n' \
     "{\"channel\":\"stable\",\"version\":\"$VERSION\",\"build\":$BUILD,\"source_commit\":\"$SOURCE_COMMIT\",\"minimum_macos\":\"13.0\",\"architecture\":\"arm64\",\"required_model\":{\"id\":\"$MODEL_ID\",\"manifest_sha256\":\"$MODEL_SHA\"},\"fresh_install\":{\"url\":\"https://github.com/Torin2023/PTT2me/releases/download/v$VERSION/$FULL_DMG_NAME\",\"sha256\":\"$FULL_SHA\",\"size\":$FULL_SIZE},\"application_update\":{\"url\":\"https://github.com/Torin2023/PTT2me/releases/download/v$VERSION/$UPDATE_DMG_NAME\",\"sha256\":\"$UPDATE_SHA\",\"size\":$UPDATE_SIZE},\"published_at\":\"$PUBLISHED_AT\"}" \
     >"$PAYLOAD"
 
-"$SCRIPT_DIR/sign-update-manifest.sh" "$PRIVATE_KEY" "$PAYLOAD" "$SIGNED_MANIFEST"
+SIGNER_BINARY="$REPO_ROOT/target/$TARGET/release/ptt2me-update-signer"
+[[ -x "$SIGNER_BINARY" ]] || fail "pinned release manifest signer is unavailable"
+PTT2ME_MANIFEST_SIGNER="$SIGNER_BINARY" \
+    "$SCRIPT_DIR/sign-update-manifest.sh" "$PRIVATE_KEY" "$PAYLOAD" "$SIGNED_MANIFEST"
 PTT2ME_MANIFEST_VERIFIER="$FULL_APP/Contents/MacOS/$PRODUCT" \
+    PTT2ME_MANIFEST_LIBRARY_PATH= \
     "$SCRIPT_DIR/validate-update-manifest.sh" \
     "$PUBLIC_KEY" "$SIGNED_MANIFEST" "$FULL_DMG" "$UPDATE_DMG" "$MODEL_MANIFEST"
 
@@ -257,8 +318,13 @@ for source in \
     "$UPDATE_DMG" "$UPDATE_DMG.sha256" \
     "$SIGNED_MANIFEST"; do
     destination="$OUTPUT_DIR/$(basename -- "$source")"
+    IN_FLIGHT_SOURCE="$source"
+    IN_FLIGHT_DESTINATION="$destination"
     ln "$source" "$destination" || fail "could not publish release output without overwrite"
     PUBLISHED_PATHS+=("$destination")
+    PUBLISHED_SOURCES+=("$source")
+    IN_FLIGHT_SOURCE=""
+    IN_FLIGHT_DESTINATION=""
 done
 BUILD_SUCCEEDED=true
 

@@ -5,6 +5,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 CHECK_MODEL_VARIANT="$REPO_ROOT/scripts/check-model-variant.sh"
 CHECK_PRODUCTION_MANIFEST="$REPO_ROOT/scripts/check-production-model-manifest.sh"
+CURRENT_VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' "$REPO_ROOT/Cargo.toml")"
+[[ "$CURRENT_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+    echo "could not read canonical package version from Cargo.toml" >&2
+    exit 1
+}
 
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ptt2me-model-variants.XXXXXX")"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
@@ -120,7 +125,7 @@ plutil -create xml1 "$INVALID_IDENTITY_PLIST"
 /usr/libexec/PlistBuddy -c \
     "Add :CFBundleIdentifier string com.ptt2me.app" "$INVALID_IDENTITY_PLIST"
 /usr/libexec/PlistBuddy -c \
-    "Add :CFBundleShortVersionString string 1.0.5" "$INVALID_IDENTITY_PLIST"
+    "Add :CFBundleShortVersionString string $CURRENT_VERSION" "$INVALID_IDENTITY_PLIST"
 /usr/libexec/PlistBuddy -c \
     "Add :CFBundleVersion string 202608011200" "$INVALID_IDENTITY_PLIST"
 /usr/libexec/PlistBuddy -c \
