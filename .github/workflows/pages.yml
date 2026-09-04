@@ -1,12 +1,14 @@
-name: Update manifest Pages
+name: Product site and update manifest Pages
 
 on:
   push:
     branches:
       - main
     paths:
+      - site/**
       - updates/**
       - models/manifests/**
+      - scripts/assemble-pages-artifact.sh
       - scripts/validate-update-manifest.sh
       - .github/workflows/pages.yml
   workflow_dispatch:
@@ -17,7 +19,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: update-manifest-pages
+  group: product-site-and-update-manifest-pages
   cancel-in-progress: false
 
 jobs:
@@ -132,16 +134,60 @@ jobs:
           source_version="$(git show "$signed_source:Cargo.toml" | awk -F '"' '/^version = "/ { print $2; exit }')"
           [[ "$source_version" == "$VERSION" ]]
 
-      - name: Upload only the updates tree
-        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
-        with:
-          path: updates
-
-  deploy:
-    name: Deploy update manifests
+  package:
+    name: Build product site and Pages artifact
     needs:
       - gate
       - validate
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Select exact Node.js runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.13.0
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install locked site dependencies
+        working-directory: site
+        run: npm ci
+
+      - name: Build and test the product site
+        working-directory: site
+        env:
+          GITHUB_PAGES_BASE_PATH: /PTT2me
+        run: npm test
+
+      - name: Lint the product site
+        working-directory: site
+        run: npm run lint
+
+      - name: Export the static GitHub Pages site
+        working-directory: site
+        env:
+          GITHUB_PAGES_BASE_PATH: /PTT2me
+          GITHUB_PAGES_ORIGIN: https://torin2023.github.io
+        run: npm run export:pages
+
+      - name: Assemble site and signed update records
+        run: scripts/assemble-pages-artifact.sh site/pages-dist updates pages-artifact
+
+      - name: Upload the complete Pages artifact
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: pages-artifact
+
+  deploy:
+    name: Deploy product site and update manifests
+    needs:
+      - gate
+      - validate
+      - package
     if: github.event_name == 'push' && needs.gate.outputs.publish == 'true'
     runs-on: ubuntu-latest
     environment:
