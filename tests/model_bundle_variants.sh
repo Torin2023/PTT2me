@@ -120,10 +120,14 @@ touch \
     "$INVALID_IDENTITY_APP/Contents/MacOS/PTT2me" \
     "$INVALID_IDENTITY_APP/Contents/Frameworks/libsherpa-onnx-c-api.dylib" \
     "$INVALID_IDENTITY_APP/Contents/Frameworks/libonnxruntime.1.17.1.dylib"
+cp "$REPO_ROOT/assets/PTT2me.icns" \
+    "$INVALID_IDENTITY_APP/Contents/Resources/PTT2me.icns"
 INVALID_IDENTITY_PLIST="$INVALID_IDENTITY_APP/Contents/Info.plist"
 plutil -create xml1 "$INVALID_IDENTITY_PLIST"
 /usr/libexec/PlistBuddy -c \
     "Add :CFBundleIdentifier string com.ptt2me.app" "$INVALID_IDENTITY_PLIST"
+/usr/libexec/PlistBuddy -c \
+    "Add :CFBundleIconFile string PTT2me.icns" "$INVALID_IDENTITY_PLIST"
 /usr/libexec/PlistBuddy -c \
     "Add :CFBundleShortVersionString string $CURRENT_VERSION" "$INVALID_IDENTITY_PLIST"
 /usr/libexec/PlistBuddy -c \

@@ -52,6 +52,7 @@ EXECUTABLE="$CONTENTS/MacOS/PTT2me"
 FRAMEWORKS="$CONTENTS/Frameworks"
 RESOURCES="$CONTENTS/Resources"
 PLIST="$CONTENTS/Info.plist"
+ICON="$RESOURCES/PTT2me.icns"
 
 require_file() {
     local path="$1"
@@ -208,9 +209,12 @@ require_file "$ONNX_DYLIB"
 require_arm64 "$ONNX_DYLIB"
 
 require_file "$PLIST"
+"$SCRIPT_DIR/check-app-icon.sh" "$REPO_ROOT/assets/PTT2me.icns" "$ICON" ||
+    fail "application icon is invalid"
 EXPECTED_VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
 [[ -n "$EXPECTED_VERSION" ]] || fail "could not read version from Cargo.toml"
 assert_plist CFBundleIdentifier com.ptt2me.app
+assert_plist CFBundleIconFile PTT2me.icns
 assert_plist CFBundleShortVersionString "$EXPECTED_VERSION"
 assert_plist PTT2meDistributionVariant "$VARIANT"
 assert_plist LSUIElement true

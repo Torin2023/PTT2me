@@ -1002,8 +1002,8 @@ mod tests {
         length: usize,
     ) {
         for _ in 0..100 {
-            let _ = lane.drain_worker_results();
-            if timeline.lock().unwrap().len() >= length {
+            let (_, handled) = lane.drain_worker_results();
+            if handled && timeline.lock().unwrap().len() >= length {
                 return;
             }
             std::thread::sleep(Duration::from_millis(2));

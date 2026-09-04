@@ -6,6 +6,7 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 cd -- "$REPO_ROOT"
 
 bash tests/model_bundle_variants.sh
+bash tests/app_icon_contract.sh
 bash tests/release_preflight.sh
 bash tests/release_builder_contracts.sh
 bash tests/verify_release_artifacts.sh

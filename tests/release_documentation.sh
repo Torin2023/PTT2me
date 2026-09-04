@@ -29,6 +29,7 @@ for text in \
     'Проверяющий:' \
     'Дата проверки:' \
     '## 1. Запуск, установка и TCC' \
+    'фирменную иконку в Finder' \
     '20 коротких Fn/Globe' \
     '20 длинных Fn/Globe' \
     'назначенная обычная клавиша' \
@@ -40,9 +41,11 @@ for text in \
     'пустой recognition output' \
     'punctuation модели' \
     'Пробел в конце' \
-    'Accessibility selected-text' \
-    'Unicode' \
-    'pasteboard fallback' \
+    'Accessibility-проверка' \
+    'Смена focus на secure text field' \
+    'отсутствие AX focus' \
+    'Command-V insertion' \
+    'Pasteboard insertion' \
     'plain/rich/image/file representations' \
     'новый пользовательский clipboard' \
     'focused field' \

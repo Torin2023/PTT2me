@@ -19,9 +19,7 @@ use crate::asr::{spawn_asr_worker, AsrCommand, AsrEvent};
 use crate::audio::{AudioError, AudioRecorder};
 use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS};
 use crate::hotkey::{AssignmentEpoch, HotkeyControl, HotkeyListener, HotkeySignal};
-use crate::inserter::{
-    InsertError, PendingInsertion, PASTEBOARD_RESTORE_DELAY_MS, PASTEBOARD_SETTLE_DELAY_MS,
-};
+use crate::inserter::{InsertError, PASTEBOARD_RESTORE_DELAY_MS, PASTEBOARD_SETTLE_DELAY_MS};
 use crate::menu::{MenuAction, UpdaterMenuAction};
 use crate::menu::{MenuBar, MenuCommand, MenuReadiness};
 use crate::model::{resources_dir_from_executable, ModelPaths};
@@ -48,7 +46,7 @@ use crate::preferences::{
 use crate::state::{
     AppController, AppEvent, AppStatus, Effect, ModelPreparationFailure, PermissionSnapshot,
 };
-use crate::text_inserter::{self, InsertMethod, InsertOutcome};
+use crate::text_inserter::{self, PendingTextInsertion};
 use crate::updater::{RetryAction, SystemClock, UpdateClock, UpdaterState};
 use crate::updater_runtime::{
     load_production_updater_config, updater_open_allowed, OrderlyQuitGate, SystemUpdaterLane,
@@ -432,17 +430,17 @@ trait PasteInsertion {
     fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError;
 }
 
-impl PasteInsertion for PendingInsertion {
+impl PasteInsertion for PendingTextInsertion {
     fn paste(&mut self) -> Result<(), InsertError> {
-        PendingInsertion::paste(self)
+        PendingTextInsertion::paste(self)
     }
 
     fn restore(&mut self) -> Result<(), InsertError> {
-        PendingInsertion::restore(self)
+        PendingTextInsertion::restore(self)
     }
 
     fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {
-        PendingInsertion::restore_after_paste_failure(self, primary)
+        PendingTextInsertion::restore_after_paste_failure(self, primary)
     }
 }
 
@@ -616,7 +614,7 @@ pub struct Runtime {
     capture_limit_timer: Option<ScheduledTimer>,
     insertion_timer: Option<ScheduledTimer>,
     error_timer: Option<ScheduledTimer>,
-    pending_insertion: Option<PasteFlow<PendingInsertion>>,
+    pending_insertion: Option<PasteFlow<PendingTextInsertion>>,
     applied_permissions: PermissionSnapshot,
     microphone_permissions: MicrophonePermissionRuntime,
     tap_needs_retry: bool,
@@ -1316,15 +1314,7 @@ impl Runtime {
             }
             Effect::InsertText(text) => {
                 match text_inserter::begin(&text, self.output_preferences.current().append_space) {
-                    Ok(InsertOutcome::Complete(method)) => {
-                        let method = match method {
-                            InsertMethod::Accessibility => "accessibility",
-                            InsertMethod::UnicodeEvents => "unicode_events",
-                        };
-                        tracing::debug!(method, lifecycle = "text_inserted");
-                        self.dispatch(AppEvent::PasteFinished(Ok(())));
-                    }
-                    Ok(InsertOutcome::PendingClipboard(insertion)) => {
+                    Ok(insertion) => {
                         let flow = PasteFlow::begin(insertion, self);
                         self.pending_insertion = Some(flow);
                     }
@@ -1444,7 +1434,9 @@ impl PasteFlowBoundary for Runtime {
 
     fn finish_and_drain_hotkeys(&mut self, result: Result<(), String>) {
         cancel_timer(&self.run_loop, &mut self.insertion_timer);
-        if result.is_err() {
+        if result.is_ok() {
+            tracing::debug!(method = "clipboard", lifecycle = "text_inserted");
+        } else {
             tracing::warn!(error_category = "text_insertion");
         }
         self.dispatch(AppEvent::PasteFinished(result));

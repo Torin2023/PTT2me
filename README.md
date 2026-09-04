@@ -56,11 +56,11 @@ the captured phrase, and inserts a
 non-empty result into whichever editable field owns the cursor at that moment.
 A capture ends automatically after 25 seconds.
 
-Insertion first tries the focused field's Accessibility selected-text
-attribute, then direct Unicode keyboard events. If neither method is
-available, PTT2me temporarily uses the full macOS pasteboard and Command-V,
-then performs a guarded restore after one second. A newer pasteboard change is
-never overwritten.
+Insertion uses Accessibility to inspect the focused field and rejects secure
+text fields. For ordinary text, PTT2me temporarily uses the full macOS
+pasteboard and Command-V so browser and web-based editors receive a normal
+paste event, then performs a guarded restore after one second. A newer
+pasteboard change is never overwritten.
 
 A short press is preserved: PTT2me replays it once to macOS, so the normal
 Fn/Globe input-source action still works. The same applies to a short press of
