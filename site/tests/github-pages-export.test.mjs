@@ -15,6 +15,9 @@ test("rewrites local site assets for the GitHub Pages project path", () => {
   const html = [
     '<link rel="stylesheet" href="/assets/site.css">',
     "<style>@font-face{src:url(/assets/font.woff2)}</style>",
+    '<script src="/_next/static/chunks/site.js"></script>',
+    "<style>@font-face{src:url(/private/build/site/.vinext/fonts/geist/font.woff2)}</style>",
+    '<link rel="preload" href="https://cdn.example/.vinext/fonts/external.woff2">',
     '<link rel="icon" href="http://localhost/favicon.svg">',
     '<meta property="og:image" content="http://localhost/og.png">',
     '<a href="#how">Как работает</a>',
@@ -28,6 +31,19 @@ test("rewrites local site assets for the GitHub Pages project path", () => {
 
   assert.match(rewritten, /href="\/PTT2me\/assets\/site\.css"/);
   assert.match(rewritten, /url\(\/PTT2me\/assets\/font\.woff2\)/);
+  assert.match(
+    rewritten,
+    /src="\/PTT2me\/_next\/static\/chunks\/site\.js"/,
+  );
+  assert.match(
+    rewritten,
+    /url\(\/PTT2me\/_next\/static\/_vinext_fonts\/geist\/font\.woff2\)/,
+  );
+  assert.doesNotMatch(rewritten, /\/private\/build\/site\/\.vinext\/fonts/);
+  assert.match(
+    rewritten,
+    /href="https:\/\/cdn\.example\/\.vinext\/fonts\/external\.woff2"/,
+  );
   assert.match(
     rewritten,
     /href="https:\/\/torin2023\.github\.io\/PTT2me\/favicon\.svg"/,
@@ -56,11 +72,16 @@ test("exports a deployable static site without the server bundle", async () => {
 
     const html = await readFile(join(outputDirectory, "index.html"), "utf8");
     assert.match(html, /Preview 1\.1\.1/);
-    assert.match(html, /\/PTT2me\/assets\//);
+    assert.match(html, /\/PTT2me\/_next\/static\//);
     assert.doesNotMatch(html, /http:\/\/localhost/);
+    assert.doesNotMatch(html, /\/\.vinext\/fonts\//);
+    assert.doesNotMatch(html, /\/(?:private|Users|home)\/[^"'()\s]+/);
 
     await access(join(outputDirectory, ".nojekyll"));
-    await access(join(outputDirectory, "assets"));
+    await access(join(outputDirectory, "_next", "static", "chunks"));
+    await access(
+      join(outputDirectory, "_next", "static", "_vinext_fonts"),
+    );
     await access(join(outputDirectory, "favicon.svg"));
     await assert.rejects(access(join(outputDirectory, "server")));
     await assert.rejects(access(join(outputDirectory, ".vite")));
@@ -72,20 +93,28 @@ test("exports a deployable static site without the server bundle", async () => {
 });
 
 test(
-  "build scopes dynamic preload dependencies to the GitHub Pages project",
+  "build publishes the browser entry under the Next static asset root",
   { skip: process.env.GITHUB_PAGES_BASE_PATH !== "/PTT2me" },
   async () => {
-    const assetsDirectory = new URL("../dist/client/assets/", import.meta.url);
+    const assetsDirectory = new URL(
+      "../dist/client/_next/static/chunks/",
+      import.meta.url,
+    );
     const scripts = (await readdir(assetsDirectory)).filter((file) =>
       file.endsWith(".js"),
     );
-    const clientCode = (
-      await Promise.all(
-        scripts.map((file) => readFile(new URL(file, assetsDirectory), "utf8")),
-      )
-    ).join("\n");
+    assert.ok(scripts.length >= 4);
 
-    assert.match(clientCode, /return`\/PTT2me\/`\+e/);
-    assert.doesNotMatch(clientCode, /return`\/`\+e/);
+    const entryManifest = JSON.parse(
+      await readFile(
+        new URL("../dist/client/vinext-client-entry-manifest.json", import.meta.url),
+        "utf8",
+      ),
+    );
+
+    assert.match(
+      entryManifest.appBrowserEntry,
+      /^_next\/static\/chunks\/[^/]+\.js$/,
+    );
   },
 );

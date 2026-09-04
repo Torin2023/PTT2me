@@ -1,7 +1,8 @@
 use std::cell::Cell;
 use std::ffi::{CStr, CString, OsStr};
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Cursor, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -13,12 +14,13 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
 
 use super::{
-    cache_verified_download, cache_verified_download_with_promoter, file_url_for_path,
-    next_automatic_check_at, read_bounded_manifest, validate_http_response_metadata,
-    verify_and_open_dmg_with, ArtifactKind, ArtifactWorker, CheckReason, DownloadResponse,
-    FileUpdateStorage, OperationId, QuarantineChecker, RetryAction, RetryContext, SelectedArtifact,
-    UpdateFailure, UpdateFetch, Updater, UpdaterCommand, UpdaterEvent, UpdaterState,
-    VerifiedDownload, AUTOMATIC_CHECK_INTERVAL_SECONDS, FIRST_AUTOMATIC_CHECK_DELAY_SECONDS,
+    cache_verified_download, cache_verified_download_with_promoter, descriptor_has_quarantine,
+    file_url_for_path, next_automatic_check_at, read_bounded_manifest,
+    validate_http_response_metadata, verify_and_open_dmg_with, ArtifactKind, ArtifactWorker,
+    CheckReason, DownloadResponse, FileUpdateStorage, OperationId, QuarantineChecker, RetryAction,
+    RetryContext, SelectedArtifact, UpdateFailure, UpdateFetch, Updater, UpdaterCommand,
+    UpdaterEvent, UpdaterState, VerifiedDownload, AUTOMATIC_CHECK_INTERVAL_SECONDS,
+    FIRST_AUTOMATIC_CHECK_DELAY_SECONDS,
 };
 use crate::constants::MAX_UPDATE_ARTIFACT_BYTES;
 use crate::update_manifest::{
@@ -1293,6 +1295,25 @@ fn cache_key_contains_version_build_and_artifact_kind_and_promotes_atomically() 
 }
 
 #[test]
+fn verified_download_receives_quarantine_before_promotion() {
+    let cache = tempfile::tempdir().unwrap();
+    let release = verified_release();
+
+    let path = cache_verified_download(
+        cache.path(),
+        &release,
+        ArtifactKind::Update,
+        &release.application_update,
+        Cursor::new(b"verified PTT2me update dmg fixture"),
+        Some(34),
+    )
+    .unwrap();
+    let file = File::open(path).unwrap();
+
+    assert_eq!(descriptor_has_quarantine(file.as_raw_fd()), Ok(true));
+}
+
+#[test]
 fn verified_cached_artifact_is_reused_without_consuming_response_body() {
     let cache = tempfile::tempdir().unwrap();
     let release = verified_release();
@@ -1621,6 +1642,8 @@ fn cached_update(
     .unwrap();
     if quarantine {
         set_quarantine(&path);
+    } else {
+        clear_quarantine(&path);
     }
     (
         cache,
@@ -1647,6 +1670,18 @@ fn set_quarantine(path: &Path) {
         )
     };
     assert_eq!(result, 0, "setxattr failed: {}", io::Error::last_os_error());
+}
+
+fn clear_quarantine(path: &Path) {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let attribute = b"com.apple.quarantine\0";
+    let result = unsafe { libc::removexattr(path.as_ptr(), attribute.as_ptr().cast(), 0) };
+    assert_eq!(
+        result,
+        0,
+        "removexattr failed: {}",
+        io::Error::last_os_error()
+    );
 }
 
 #[test]
