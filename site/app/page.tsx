@@ -1,7 +1,7 @@
 const DOWNLOAD_URL =
-  "https://github.com/Torin2023/PTT2me/releases/download/v1.1.0/PTT2me-1.1.0-full-macos-arm64.dmg";
+  "https://github.com/Torin2023/PTT2me/releases/download/v1.1.1/PTT2me-1.1.1-full-macos-arm64.dmg";
 const REPOSITORY_URL = "https://github.com/Torin2023/PTT2me";
-const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.1.0`;
+const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.1.1`;
 
 const steps = [
   ["01", "Удерживайте", "Нажмите и удерживайте выбранную клавишу."],
@@ -27,7 +27,7 @@ export default function Home() {
         </a>
         <nav aria-label="Разделы сайта">
           <a href="#how">Как работает</a>
-          <a href="#updates">Обновления 1.1.0</a>
+          <a href="#updates">Обновления 1.1.1</a>
           <a href={REPOSITORY_URL}>GitHub</a>
           <a className="button button-small" href={DOWNLOAD_URL}>
             Скачать
@@ -41,7 +41,7 @@ export default function Home() {
           <p className="eyebrow">
             <span className="eyebrow-line" aria-hidden="true" />
             Локальная диктовка для macOS
-            <span className="preview-badge">Preview 1.1.0</span>
+            <span className="preview-badge">Preview 1.1.1</span>
           </p>
           <h1>
             Говорите —
@@ -55,7 +55,7 @@ export default function Home() {
           </p>
           <div className="hero-actions">
             <a className="button" href={DOWNLOAD_URL}>
-              Скачать PTT2me 1.1.0
+              Скачать PTT2me 1.1.1
               <span aria-hidden="true">↘</span>
             </a>
             <a className="text-link" href={REPOSITORY_URL}>
@@ -64,7 +64,7 @@ export default function Home() {
             </a>
           </div>
           <p className="compatibility">
-            Apple Silicon <i /> macOS 13+ <i /> 183 МБ <i /> без облака
+            Apple Silicon <i /> macOS 13+ <i /> 184 МБ <i /> без облака
           </p>
         </div>
 
@@ -166,11 +166,12 @@ export default function Home() {
           <p className="eyebrow">Ваши слова остаются вашими</p>
           <h2>Распознавание без отправки в интернет.</h2>
           <p>
-            PTT2me сначала вставляет текст напрямую через Accessibility или
-            Unicode — эти способы не меняют буфер обмена. Если приложению нужен
-            совместимый Command-V fallback, PTT2me восстанавливает все прежние
-            элементы и форматы буфера и никогда не перезаписывает более новые
-            изменения.
+            Accessibility проверяет активное поле и отклоняет защищённый ввод.
+            В обычные поля PTT2me вставляет текст через системный Command-V:
+            это работает в нативных приложениях, браузерных input, textarea и
+            contenteditable, а также в строке ввода Codex. После вставки PTT2me
+            восстанавливает все прежние элементы и форматы буфера и никогда не
+            перезаписывает более новые изменения.
           </p>
           <div className="privacy-facts" aria-label="Факты о приватности">
             <span>Нет аккаунта</span>
@@ -222,7 +223,7 @@ export default function Home() {
 
       <section className="section updates-section" id="updates">
         <div className="section-heading">
-          <p className="eyebrow">PTT2me 1.1.0 опубликована</p>
+          <p className="eyebrow">PTT2me 1.1.1 опубликована</p>
           <div>
             <h2>Проверка обновлений с ручной установкой.</h2>
             <p className="release-boundary">
@@ -339,11 +340,11 @@ export default function Home() {
 
       <section className="section install" id="install">
         <div className="install-copy">
-          <p className="eyebrow">PTT2me Preview 1.1.0</p>
+          <p className="eyebrow">PTT2me Preview 1.1.1</p>
           <h2>Готовы говорить?</h2>
           <p>Для Mac с Apple Silicon и macOS 13 Ventura или новее.</p>
           <a className="button" href={DOWNLOAD_URL}>
-            Скачать Full DMG · 183 МБ
+            Скачать Full DMG · 184 МБ
             <span aria-hidden="true">↘</span>
           </a>
         </div>
@@ -387,11 +388,11 @@ export default function Home() {
         <p>
           SHA-256{" "}
           <code>
-            f8cc1cfc92634aceaf35e1c887d86d6194a4f1f5dc16ebd47b0654725f38b0d0
+            0396cb0789af86a9d3f4bff64bad743f8d8f9cbe00a04dcd7a402ea2cce53081
           </code>
         </p>
         <div>
-          <a href={RELEASE_URL}>Preview-релиз 1.1.0</a>
+          <a href={RELEASE_URL}>Preview-релиз 1.1.1</a>
           <a href={REPOSITORY_URL}>GitHub</a>
         </div>
       </footer>

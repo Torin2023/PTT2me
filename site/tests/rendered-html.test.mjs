@@ -25,7 +25,7 @@ async function render(path = "/") {
   );
 }
 
-test("renders the current PTT2me v1.1.0 product contract", async () => {
+test("renders the current PTT2me v1.1.1 product contract", async () => {
   const response = await render();
   assert.equal(response.status, 200);
 
@@ -35,22 +35,26 @@ test("renders the current PTT2me v1.1.0 product contract", async () => {
     html,
     /<title>PTT2me — локальная диктовка для macOS<\/title>/i,
   );
+  assert.match(
+    html,
+    /<meta name="description" content="PTT2me 1\.1\.1:[^"]*браузеры, Codex/,
+  );
   assert.match(html, /Говорите —[\s\S]*текст уже там/);
   assert.match(html, /Без облака/);
   assert.match(html, /Микрофон/);
-  assert.match(html, /Preview 1\.1\.0/);
-  assert.match(html, /class="preview-badge">Preview 1\.1\.0<\/span>/);
+  assert.match(html, /Preview 1\.1\.1/);
+  assert.match(html, /class="preview-badge">Preview 1\.1\.1<\/span>/);
   assert.match(
     html,
-    /https:\/\/github\.com\/Torin2023\/PTT2me\/releases\/download\/v1\.1\.0\/PTT2me-1\.1\.0-full-macos-arm64\.dmg/,
+    /https:\/\/github\.com\/Torin2023\/PTT2me\/releases\/download\/v1\.1\.1\/PTT2me-1\.1\.1-full-macos-arm64\.dmg/,
   );
   assert.match(
     html,
-    /https:\/\/github\.com\/Torin2023\/PTT2me\/releases\/tag\/v1\.1\.0/,
+    /https:\/\/github\.com\/Torin2023\/PTT2me\/releases\/tag\/v1\.1\.1/,
   );
   assert.match(
     html,
-    /f8cc1cfc92634aceaf35e1c887d86d6194a4f1f5dc16ebd47b0654725f38b0d0/,
+    /0396cb0789af86a9d3f4bff64bad743f8d8f9cbe00a04dcd7a402ea2cce53081/,
   );
   assert.match(html, /поле, где находится курсор/);
   assert.match(html, /Назначьте удобную клавишу/);
@@ -59,6 +63,10 @@ test("renders the current PTT2me v1.1.0 product contract", async () => {
   assert.match(html, /Запись начинается сразу/);
   assert.match(html, /нажатие оказалось коротким/);
   assert.match(html, /Пробел в конце/);
+  assert.match(html, /Command-V/);
+  assert.match(html, /браузер/i);
+  assert.match(html, /contenteditable/);
+  assert.match(html, /строке ввода Codex/);
   assert.doesNotMatch(html, /PTT2me-1\.0\.[234]-macos-arm64\.dmg/);
   assert.doesNotMatch(
     html,
@@ -66,7 +74,7 @@ test("renders the current PTT2me v1.1.0 product contract", async () => {
   );
   assert.doesNotMatch(
     html,
-    /releases\/download\/v1\.1\.0\/[^"']+\.sha256/,
+    /releases\/download\/v1\.1\.1\/[^"']+\.sha256/,
   );
   assert.doesNotMatch(
     html,
@@ -74,12 +82,12 @@ test("renders the current PTT2me v1.1.0 product contract", async () => {
   );
 });
 
-test("documents the published 1.1.0 update flow", async () => {
+test("documents the published 1.1.1 update flow", async () => {
   const response = await render();
   assert.equal(response.status, 200);
 
   const html = await response.text();
-  assert.match(html, /PTT2me 1\.1\.0 опубликована/);
+  assert.match(html, /PTT2me 1\.1\.1 опубликована/);
   assert.match(html, /Установку 1\.0\.5 нужно один раз заменить вручную/);
   assert.match(html, /через 60 секунд после запуска/);
   assert.match(html, /не чаще одного раза в 24 часа/);
@@ -109,7 +117,7 @@ test("documents the published 1.1.0 update flow", async () => {
 
   assert.doesNotMatch(html, /tccutil/i);
   assert.doesNotMatch(html, /application_update/);
-  assert.match(html, /Скачать PTT2me 1\.1\.0/);
+  assert.match(html, /Скачать PTT2me 1\.1\.1/);
 });
 
 test("removes the disposable starter preview", async () => {
