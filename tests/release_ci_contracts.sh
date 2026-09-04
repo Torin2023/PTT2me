@@ -12,6 +12,7 @@ WORKFLOW="$REPO_ROOT/.github/workflows/ci.yml"
 }
 
 EXPECTED_TESTS='tests/model_bundle_variants.sh
+tests/app_icon_contract.sh
 tests/release_preflight.sh
 tests/release_builder_contracts.sh
 tests/verify_release_artifacts.sh

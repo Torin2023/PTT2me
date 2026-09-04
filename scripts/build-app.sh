@@ -106,6 +106,7 @@ FRAMEWORKS="$CONTENTS/Frameworks"
 MODEL_DESTINATION="$RESOURCES/models/gigaam-v3-rnnt-v1"
 LICENSE_SOURCE="licenses"
 LICENSE_DESTINATION="$RESOURCES/licenses"
+ICON_SOURCE="$REPO_ROOT/assets/PTT2me.icns"
 RELEASE_DIR="target/$TARGET/release"
 SHERPA_DYLIB="libsherpa-onnx-c-api.dylib"
 ONNX_DYLIB="libonnxruntime.1.17.1.dylib"
@@ -126,6 +127,7 @@ for license_file in \
     ONNXRUNTIME-NOTICES.txt; do
     require_nonempty_file "$LICENSE_SOURCE/$license_file"
 done
+require_nonempty_file "$ICON_SOURCE"
 
 CARGO_VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
 [[ -n "$CARGO_VERSION" ]] || {
@@ -191,6 +193,7 @@ for license_file in \
 done
 install -m 755 "$RELEASE_DIR/$SHERPA_DYLIB" "$FRAMEWORKS/$SHERPA_DYLIB"
 install -m 755 "$RELEASE_DIR/$ONNX_DYLIB" "$FRAMEWORKS/$ONNX_DYLIB"
+install -m 644 "$ICON_SOURCE" "$RESOURCES/PTT2me.icns"
 
 lipo "$MACOS/$PRODUCT" -verify_arch arm64
 lipo "$FRAMEWORKS/$SHERPA_DYLIB" -verify_arch arm64
@@ -231,6 +234,7 @@ plutil -create xml1 "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $PRODUCT" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string $PRODUCT" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string com.ptt2me.app" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string PTT2me.icns" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleInfoDictionaryVersion string 6.0" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleName string $PRODUCT" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$PLIST"
