@@ -73,7 +73,7 @@ The menu contains the trigger controls:
 
 ```text
 <status>
-PTT2me 1.1.1
+PTT2me 1.1.2
 Проверить обновления…
 Открыть настройки…   (only while a required permission is missing)
 Клавиша активации
@@ -89,7 +89,7 @@ PTT2me 1.1.1
 Выйти
 ```
 
-This menu snapshot describes the currently published Preview 1.1.1. The
+This menu snapshot describes the currently published Preview 1.1.2. The
 updater action changes when a signed release is available or downloaded.
 
 The status and version rows are informational. While a permission is missing,
@@ -114,12 +114,17 @@ punctuation is never added, removed, or rewritten by PTT2me.
 
 ## Published release
 
-The current public download is the Preview 1.1.1 Full DMG:
-[PTT2me-1.1.1-full-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.1.1/PTT2me-1.1.1-full-macos-arm64.dmg)
-(184 MB, SHA-256
-`0396cb0789af86a9d3f4bff64bad743f8d8f9cbe00a04dcd7a402ea2cce53081`).
-See the [v1.1.1 release page](https://github.com/Torin2023/PTT2me/releases/tag/v1.1.1)
+The current public download is the Preview 1.1.2 Full DMG:
+[PTT2me-1.1.2-full-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.1.2/PTT2me-1.1.2-full-macos-arm64.dmg)
+(193,466,419 bytes / 184.5 MiB, SHA-256
+`fcb0a49fed7a3755f310d821df082a84abd362c42f01eda17524c5c3ceef72cb`).
+See the [v1.1.2 release page](https://github.com/Torin2023/PTT2me/releases/tag/v1.1.2)
 for the model-free Update DMG and checksum files.
+
+This preview passed the automated macOS/AppKit, Rust, security, signed-manifest,
+model, bundle, and DMG gates. At the owner's direction, the additional manual
+GUI matrix was not completed; that limitation is disclosed in the release
+notes.
 
 ## Build
 
@@ -186,7 +191,7 @@ use Full only. Update is selected only inside an already installed PTT2me.
 The release coordinator requires an explicit stable version, 12-digit UTC
 build, exact clean `HEAD`, model source, committed model manifest, publication
 timestamp, and matching key pair. The private signing key must remain outside
-Git. The currently published stable package version is exactly 1.1.1.
+Git. The currently published stable package version is exactly 1.1.2.
 
 ### Reproducible release gates
 
@@ -246,11 +251,13 @@ The preflight, builder, and verifier do not publish GitHub Release or the Pages 
 Publication is a separate owner-authorized workflow after Gate A, Gate B,
 Gate C, and the manual P0 gate all pass.
 
-## Updating (PTT2me 1.1.1)
+## Updating (PTT2me 1.1.2)
 
-Preview 1.0.5 cannot discover this release and must be replaced once with the
-published 1.1.1 Full DMG. Starting with 1.1.0, PTT2me checks the signed stable
-channel described below.
+Preview 1.0.5 cannot discover this release. Versions 1.1.0 and 1.1.1 can check
+the signed stable channel, but their updater cannot download the build that
+contains its fix. Replace any of these versions once with the published 1.1.2
+Full DMG. Starting with 1.1.2, PTT2me can download subsequent signed updates
+through the flow described below.
 
 - The first automatic manifest request starts no earlier than 60 seconds after
   launch. Later automatic requests run no more than once per 24 hours.
