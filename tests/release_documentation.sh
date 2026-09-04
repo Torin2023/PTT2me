@@ -40,9 +40,11 @@ for text in \
     'пустой recognition output' \
     'punctuation модели' \
     'Пробел в конце' \
-    'Accessibility selected-text' \
-    'Unicode' \
-    'pasteboard fallback' \
+    'Accessibility-проверка' \
+    'Смена focus на secure text field' \
+    'отсутствие AX focus' \
+    'Command-V insertion' \
+    'Pasteboard insertion' \
     'plain/rich/image/file representations' \
     'новый пользовательский clipboard' \
     'focused field' \

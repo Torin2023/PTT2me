@@ -60,11 +60,13 @@
 - [ ] Punctuation модели сохраняется без переписывания.
 - [ ] `Пробел в конце` добавляет ровно один ASCII space только при включённой
       настройке.
-- [ ] Accessibility selected-text вставка работает в поддерживаемом поле.
-- [ ] Unicode insertion работает, когда Accessibility path не поддерживается.
-- [ ] Pasteboard fallback работает, когда Accessibility и Unicode paths не
-      поддерживаются.
-- [ ] Pasteboard fallback восстанавливает plain/rich/image/file representations.
+- [ ] Accessibility-проверка отклоняет вставку в secure text field.
+- [ ] Смена focus на secure text field до Command-V блокирует вставку и
+      восстанавливает clipboard; ошибка или отсутствие AX focus завершается
+      безопасным отказом.
+- [ ] Command-V insertion работает в нативном текстовом поле, HTML `input`,
+      HTML `textarea`, `contenteditable` и строке ввода Codex.
+- [ ] Pasteboard insertion восстанавливает plain/rich/image/file representations.
 - [ ] Новый пользовательский clipboard, созданный во время вставки, не
       перезаписывается восстановлением старого snapshot.
 - [ ] Изменение focused field во время recognition направляет текст в текущий
