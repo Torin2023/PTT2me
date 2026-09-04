@@ -5,8 +5,9 @@ release the key, and the recognized Russian text is inserted at the cursor's
 current location. Recognition uses one fixed GigaAM v3 model. A Full build
 contains that model for an offline first launch, then keeps the verified copy
 outside the application bundle so later model-free Update builds can reuse it.
-Insertion prefers the focused Accessibility text field and preserves the
-previous pasteboard whenever compatibility requires Command-V fallback.
+Insertion uses Accessibility to validate the focused field and reject secure
+input, then sends ordinary text through the macOS pasteboard and Command-V.
+The previous pasteboard is restored unless newer contents appeared meanwhile.
 
 ## Requirements and workflow
 
@@ -72,7 +73,7 @@ The menu contains the trigger controls:
 
 ```text
 <status>
-PTT2me 1.1.0
+PTT2me 1.1.1
 Проверить обновления…
 Открыть настройки…   (only while a required permission is missing)
 Клавиша активации
@@ -88,7 +89,7 @@ PTT2me 1.1.0
 Выйти
 ```
 
-This menu snapshot describes the currently published Preview 1.1.0. The
+This menu snapshot describes the currently published Preview 1.1.1. The
 updater action changes when a signed release is available or downloaded.
 
 The status and version rows are informational. While a permission is missing,
@@ -113,11 +114,11 @@ punctuation is never added, removed, or rewritten by PTT2me.
 
 ## Published release
 
-The current public download is the Preview 1.1.0 Full DMG:
-[PTT2me-1.1.0-full-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.1.0/PTT2me-1.1.0-full-macos-arm64.dmg)
-(183 MB, SHA-256
-`f8cc1cfc92634aceaf35e1c887d86d6194a4f1f5dc16ebd47b0654725f38b0d0`).
-See the [v1.1.0 release page](https://github.com/Torin2023/PTT2me/releases/tag/v1.1.0)
+The current public download is the Preview 1.1.1 Full DMG:
+[PTT2me-1.1.1-full-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.1.1/PTT2me-1.1.1-full-macos-arm64.dmg)
+(184 MB, SHA-256
+`0396cb0789af86a9d3f4bff64bad743f8d8f9cbe00a04dcd7a402ea2cce53081`).
+See the [v1.1.1 release page](https://github.com/Torin2023/PTT2me/releases/tag/v1.1.1)
 for the model-free Update DMG and checksum files.
 
 ## Build
@@ -185,7 +186,7 @@ use Full only. Update is selected only inside an already installed PTT2me.
 The release coordinator requires an explicit stable version, 12-digit UTC
 build, exact clean `HEAD`, model source, committed model manifest, publication
 timestamp, and matching key pair. The private signing key must remain outside
-Git. The currently published stable package version is exactly 1.1.0.
+Git. The currently published stable package version is exactly 1.1.1.
 
 ### Reproducible release gates
 
@@ -245,10 +246,10 @@ The preflight, builder, and verifier do not publish GitHub Release or the Pages 
 Publication is a separate owner-authorized workflow after Gate A, Gate B,
 Gate C, and the manual P0 gate all pass.
 
-## Updating (PTT2me 1.1.0)
+## Updating (PTT2me 1.1.1)
 
 Preview 1.0.5 cannot discover this release and must be replaced once with the
-published 1.1.0 Full DMG. Starting with 1.1.0, PTT2me checks the signed stable
+published 1.1.1 Full DMG. Starting with 1.1.0, PTT2me checks the signed stable
 channel described below.
 
 - The first automatic manifest request starts no earlier than 60 seconds after
@@ -327,10 +328,11 @@ only the signed release record from GitHub Pages and carries no product user,
 device, or telemetry identifier. A DMG request to GitHub Release occurs only
 after the user's download action.
 
-Recognized text is used temporarily for insertion. Direct Accessibility and
-Unicode insertion do not modify the pasteboard. The compatibility fallback
-restores every previous pasteboard item and representation unless newer
-contents were copied during insertion.
+Recognized text is used temporarily for insertion. Accessibility validates the
+focused field and rejects secure input. Ordinary text is placed temporarily on
+the full pasteboard and inserted with Command-V so browsers, web editors,
+Codex, and native fields receive a normal paste event. Every previous item and
+representation is restored unless newer contents were copied during insertion.
 
 ## Troubleshooting
 
