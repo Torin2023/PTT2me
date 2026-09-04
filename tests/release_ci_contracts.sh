@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 RUNNER="$REPO_ROOT/scripts/test-shell-contracts.sh"
 WORKFLOW="$REPO_ROOT/.github/workflows/ci.yml"
+PAGES_WORKFLOW="$REPO_ROOT/.github/workflows/pages.yml"
 
 [[ -x "$RUNNER" ]] || {
     echo "shell contract runner is missing or not executable: $RUNNER" >&2
@@ -13,6 +14,7 @@ WORKFLOW="$REPO_ROOT/.github/workflows/ci.yml"
 
 EXPECTED_TESTS='tests/model_bundle_variants.sh
 tests/app_icon_contract.sh
+tests/pages_artifact_contract.sh
 tests/release_preflight.sh
 tests/release_builder_contracts.sh
 tests/verify_release_artifacts.sh
@@ -35,5 +37,19 @@ SHELL_TEST_LINE="$(grep -n -F 'run: bash scripts/test-shell-contracts.sh' "$WORK
     echo "CI must run shell contracts after the Rust test step" >&2
     exit 1
 }
+
+for required in \
+    '      - site/**' \
+    'npm ci' \
+    'npm test' \
+    'npm run lint' \
+    'npm run export:pages' \
+    'scripts/assemble-pages-artifact.sh site/pages-dist updates pages-artifact' \
+    'path: pages-artifact'; do
+    grep -Fq -- "$required" "$PAGES_WORKFLOW" || {
+        echo "Pages workflow is missing required site publication behavior: $required" >&2
+        exit 1
+    }
+done
 
 echo "Release CI contract checks passed"
