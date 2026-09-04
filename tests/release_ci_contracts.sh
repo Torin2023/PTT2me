@@ -52,4 +52,13 @@ for required in \
     }
 done
 
+for action_pin in \
+    'actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5' \
+    'actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5'; do
+    grep -Fq -- "$action_pin" "$PAGES_WORKFLOW" || {
+        echo "Pages workflow is missing current pinned action: $action_pin" >&2
+        exit 1
+    }
+done
+
 echo "Release CI contract checks passed"

@@ -3,6 +3,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 
 const PUBLIC_FILES = [
+  "_next/",
   "assets/",
   "favicon.svg",
   "file.svg",
@@ -25,7 +26,10 @@ export function rewritePageHtml(html, { basePath, origin }) {
   const normalizedBasePath = normalizeBasePath(basePath);
   const normalizedOrigin = origin.replace(/\/+$/, "");
   const publicBase = `${normalizedOrigin}${normalizedBasePath}`;
-  let rewritten = html;
+  let rewritten = html.replace(
+    /(["'(=])\/(?:[^/"'()\s]+\/)*\.vinext\/fonts\/([^"'()\s]+)/g,
+    `$1${normalizedBasePath}/_next/static/_vinext_fonts/$2`,
+  );
 
   for (const publicFile of PUBLIC_FILES) {
     for (const localOrigin of ["http://localhost/", "https://localhost/"]) {

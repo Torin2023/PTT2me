@@ -1,9 +1,10 @@
 use std::ffi::CString;
-use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1055,7 +1056,14 @@ fn cache_verified_download_with_promoter(
 
     let mut promoted = false;
     let write_result = (|| {
-        let file = File::create(&partial_path).map_err(|_| UpdateFailure::Storage)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&partial_path)
+            .map_err(|_| UpdateFailure::Storage)?;
         let mut writer = BufWriter::new(file);
         let limit = artifact
             .size
@@ -1068,14 +1076,18 @@ fn cache_verified_download_with_promoter(
             .get_ref()
             .sync_all()
             .map_err(|_| UpdateFailure::Storage)?;
-        drop(writer);
-
         if copied != artifact.size {
             return Err(UpdateFailure::BodySizeMismatch);
         }
 
-        let downloaded = File::open(&partial_path).map_err(|_| UpdateFailure::Storage)?;
-        verify_artifact(downloaded, artifact).map_err(map_artifact_error)?;
+        let mut downloaded = writer.into_inner().map_err(|_| UpdateFailure::Storage)?;
+        downloaded
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| UpdateFailure::Storage)?;
+        verify_artifact(&downloaded, artifact).map_err(map_artifact_error)?;
+        set_descriptor_quarantine(downloaded.as_raw_fd())?;
+        downloaded.sync_all().map_err(|_| UpdateFailure::Storage)?;
+        drop(downloaded);
         promote(&partial_path, &final_path).map_err(|_| UpdateFailure::Storage)?;
         promoted = true;
 
@@ -1572,6 +1584,33 @@ fn descriptor_has_quarantine(fd: RawFd) -> Result<bool, UpdateFailure> {
         Ok(false)
     } else {
         Err(UpdateFailure::Storage)
+    }
+}
+
+fn set_descriptor_quarantine(fd: RawFd) -> Result<(), UpdateFailure> {
+    let attribute = b"com.apple.quarantine\0";
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| UpdateFailure::Storage)?
+        .as_secs();
+    let value = format!("0081;{timestamp:08x};PTT2me;");
+    let result = unsafe {
+        libc::fsetxattr(
+            fd,
+            attribute.as_ptr().cast(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(UpdateFailure::Storage);
+    }
+    if descriptor_has_quarantine(fd)? {
+        Ok(())
+    } else {
+        Err(UpdateFailure::QuarantineMissing)
     }
 }
 
