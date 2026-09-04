@@ -1,7 +1,7 @@
 const DOWNLOAD_URL =
-  "https://github.com/Torin2023/PTT2me/releases/download/v1.1.1/PTT2me-1.1.1-full-macos-arm64.dmg";
+  "https://github.com/Torin2023/PTT2me/releases/download/v1.1.2/PTT2me-1.1.2-full-macos-arm64.dmg";
 const REPOSITORY_URL = "https://github.com/Torin2023/PTT2me";
-const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.1.1`;
+const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.1.2`;
 
 const steps = [
   ["01", "Удерживайте", "Нажмите и удерживайте выбранную клавишу."],
@@ -27,7 +27,7 @@ export default function Home() {
         </a>
         <nav aria-label="Разделы сайта">
           <a href="#how">Как работает</a>
-          <a href="#updates">Обновления 1.1.1</a>
+          <a href="#updates">Обновления 1.1.2</a>
           <a href={REPOSITORY_URL}>GitHub</a>
           <a className="button button-small" href={DOWNLOAD_URL}>
             Скачать
@@ -41,7 +41,7 @@ export default function Home() {
           <p className="eyebrow">
             <span className="eyebrow-line" aria-hidden="true" />
             Локальная диктовка для macOS
-            <span className="preview-badge">Preview 1.1.1</span>
+            <span className="preview-badge">Preview 1.1.2</span>
           </p>
           <h1>
             Говорите —
@@ -55,7 +55,7 @@ export default function Home() {
           </p>
           <div className="hero-actions">
             <a className="button" href={DOWNLOAD_URL}>
-              Скачать PTT2me 1.1.1
+              Скачать PTT2me 1.1.2
               <span aria-hidden="true">↘</span>
             </a>
             <a className="text-link" href={REPOSITORY_URL}>
@@ -64,7 +64,7 @@ export default function Home() {
             </a>
           </div>
           <p className="compatibility">
-            Apple Silicon <i /> macOS 13+ <i /> 184 МБ <i /> без облака
+            Apple Silicon <i /> macOS 13+ <i /> 184,5 МиБ <i /> без облака
           </p>
         </div>
 
@@ -223,13 +223,14 @@ export default function Home() {
 
       <section className="section updates-section" id="updates">
         <div className="section-heading">
-          <p className="eyebrow">PTT2me 1.1.1 опубликована</p>
+          <p className="eyebrow">PTT2me 1.1.2 опубликована</p>
           <div>
-            <h2>Проверка обновлений с ручной установкой.</h2>
+            <h2>Исправленная загрузка обновлений.</h2>
             <p className="release-boundary">
-              Установку 1.0.5 нужно один раз заменить вручную из Full DMG.
-              После этого PTT2me сможет предлагать следующие подписанные
-              обновления.
+              Версиям 1.1.0 и 1.1.1 нужен один ручной переход на 1.1.2 через
+              Full DMG: прежний updater не может скачать сборку с собственным
+              исправлением. Начиная с 1.1.2, PTT2me снова сможет загружать
+              следующие подписанные обновления.
             </p>
           </div>
         </div>
@@ -340,11 +341,11 @@ export default function Home() {
 
       <section className="section install" id="install">
         <div className="install-copy">
-          <p className="eyebrow">PTT2me Preview 1.1.1</p>
+          <p className="eyebrow">PTT2me Preview 1.1.2</p>
           <h2>Готовы говорить?</h2>
           <p>Для Mac с Apple Silicon и macOS 13 Ventura или новее.</p>
           <a className="button" href={DOWNLOAD_URL}>
-            Скачать Full DMG · 184 МБ
+            Скачать Full DMG · 184,5 МиБ
             <span aria-hidden="true">↘</span>
           </a>
         </div>
@@ -388,11 +389,11 @@ export default function Home() {
         <p>
           SHA-256{" "}
           <code>
-            0396cb0789af86a9d3f4bff64bad743f8d8f9cbe00a04dcd7a402ea2cce53081
+            fcb0a49fed7a3755f310d821df082a84abd362c42f01eda17524c5c3ceef72cb
           </code>
         </p>
         <div>
-          <a href={RELEASE_URL}>Preview-релиз 1.1.1</a>
+          <a href={RELEASE_URL}>Preview-релиз 1.1.2</a>
           <a href={REPOSITORY_URL}>GitHub</a>
         </div>
       </footer>
