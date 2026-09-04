@@ -31,6 +31,10 @@ PRIVATE_MODE="$(stat -f '%Lp' "$PRIVATE_KEY" 2>/dev/null)" ||
     fail "could not inspect private key permissions"
 [[ $((8#$PRIVATE_MODE & 077)) -eq 0 ]] ||
     fail "private key permissions must deny group and other access"
+PRIVATE_ACL="$(/bin/ls -lde "$PRIVATE_KEY" 2>/dev/null)" ||
+    fail "could not inspect private key ACL"
+[[ "$(printf '%s\n' "$PRIVATE_ACL" | wc -l | tr -d ' ')" == "1" ]] ||
+    fail "private key must not have ACL entries"
 
 [[ -f "$PAYLOAD" && ! -L "$PAYLOAD" ]] ||
     fail "payload is not a real file"

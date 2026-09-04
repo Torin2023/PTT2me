@@ -148,12 +148,19 @@ PRIVATE_KEY="$(canonical_file key "production private key" "$PRIVATE_KEY")"
 OUTPUT_DIR="$(canonical_directory output "output directory" "$OUTPUT_DIR")"
 readonly MODEL_MANIFEST MODEL_SOURCE PUBLIC_KEY PRIVATE_KEY OUTPUT_DIR
 
+[[ -z "$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+    fail output "output directory must be empty before release build: $OUTPUT_DIR"
+
 PRIVATE_MODE="$(stat -f '%Lp' "$PRIVATE_KEY" 2>/dev/null)" ||
     fail key "could not inspect private key permissions: $PRIVATE_KEY"
 [[ "$PRIVATE_MODE" =~ ^[0-7]{3,4}$ ]] ||
     fail key "private key has an invalid permission mode: $PRIVATE_KEY"
 [[ $((8#$PRIVATE_MODE & 077)) -eq 0 ]] ||
     fail key "private key permissions must deny group and other access: $PRIVATE_KEY"
+PRIVATE_ACL="$(/bin/ls -lde "$PRIVATE_KEY" 2>/dev/null)" ||
+    fail key "could not inspect private key ACL: $PRIVATE_KEY"
+[[ "$(printf '%s\n' "$PRIVATE_ACL" | wc -l | tr -d ' ')" == "1" ]] ||
+    fail key "private key must not have ACL entries: $PRIVATE_KEY"
 
 for command_name in \
     awk base64 cargo codesign cmp df find git hdiutil lipo mktemp otool plutil \

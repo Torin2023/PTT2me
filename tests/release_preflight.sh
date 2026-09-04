@@ -221,6 +221,10 @@ touch "$OUTPUT_DIR/PTT2me-1.1.0-full-macos-arm64.dmg"
 expect_failure output preflight_command
 
 write_fixture_repo
+touch "$OUTPUT_DIR/unrelated.txt"
+expect_failure output preflight_command
+
+write_fixture_repo
 FAKE_AVAILABLE_KB=1024 expect_failure disk preflight_command
 
 write_fixture_repo
@@ -243,6 +247,10 @@ TEST_PRIVATE_KEY="$SIBLING_WORKTREE/private-key.txt" expect_failure key prefligh
 
 write_fixture_repo
 chmod 644 "$PRIVATE_KEY"
+expect_failure key preflight_command
+
+write_fixture_repo
+chmod +a 'everyone allow read' "$PRIVATE_KEY"
 expect_failure key preflight_command
 
 write_fixture_repo

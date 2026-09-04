@@ -45,10 +45,20 @@ write_fake_hdiutil() {
         '    if [[ "$(basename -- "$image")" == *-full-* ]]; then variant=full; fi' \
         '    if [[ "${FAKE_HDIUTIL_FAIL:-}" == "attach-$variant" ]]; then exit 82; fi' \
         '    mountpoint=""' \
+        '    readonly=false' \
+        '    nobrowse=false' \
+        '    noautoopen=false' \
         '    while [[ $# -gt 0 ]]; do' \
-        '      if [[ "$1" == "-mountpoint" ]]; then mountpoint="$2"; shift 2; else shift; fi' \
+        '      case "$1" in' \
+        '        -mountpoint) mountpoint="$2"; shift 2 ;;' \
+        '        -readonly) readonly=true; shift ;;' \
+        '        -nobrowse) nobrowse=true; shift ;;' \
+        '        -noautoopen) noautoopen=true; shift ;;' \
+        '        *) shift ;;' \
+        '      esac' \
         '    done' \
         '    [[ -n "$mountpoint" ]] || exit 83' \
+        '    [[ "$readonly" == true && "$nobrowse" == true && "$noautoopen" == true ]] || exit 86' \
         '    /bin/cp -R "$IMAGE_ROOT/$variant/." "$mountpoint/"' \
         '    printf "%s\n" "$mountpoint" >>"$FAKE_HDIUTIL_STATE"' \
         '    if [[ "${FAKE_HDIUTIL_SIGNAL_AFTER_ATTACH:-}" == "$variant" ]]; then /bin/kill -TERM "$PPID"; fi' \
@@ -64,7 +74,15 @@ write_fake_hdiutil() {
         '    ;;' \
         '  *) exit 85 ;;' \
         'esac' >"$FAKE_BIN/hdiutil"
-    chmod 755 "$FAKE_BIN/hdiutil"
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'set -euo pipefail' \
+        'while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done' \
+        '[[ "${1:-}" == "--" ]] || exit 87' \
+        'shift' \
+        'DYLD_LIBRARY_PATH="$FAKE_MANIFEST_LIBRARY_PATH" exec "$FAKE_MANIFEST_VERIFIER" "$@"' \
+        >"$FAKE_BIN/cargo"
+    chmod 755 "$FAKE_BIN/hdiutil" "$FAKE_BIN/cargo"
 }
 
 write_fixture_helpers() {
@@ -86,6 +104,7 @@ done
 [[ -x "$app/Contents/MacOS/PTT2me" ]] || exit 94
 if [[ "$variant" == full ]]; then
     [[ -d "$app/Contents/Resources/models/gigaam-v3-rnnt-v1" ]] || exit 95
+    "$app/Contents/MacOS/PTT2me" --smoke-model
 else
     [[ ! -e "$app/Contents/Resources/models" ]] || exit 96
 fi
@@ -99,6 +118,27 @@ EOF
     chmod 755 \
         "$FIXTURE_REPO/scripts/check-bundle.sh" \
         "$FIXTURE_REPO/scripts/compare-macho-payload.sh"
+}
+
+write_fake_plists() {
+    local variant app
+    for variant in full update; do
+        app="$IMAGE_ROOT/$variant/PTT2me.app"
+        cat >"$app/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleShortVersionString</key>
+    <string>1.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>202608111200</string>
+    <key>PTT2meSourceCommit</key>
+    <string>$SOURCE_COMMIT</string>
+</dict>
+</plist>
+EOF
+    done
 }
 
 write_fake_app() {
@@ -180,6 +220,7 @@ write_fixture() {
     /usr/bin/git -C "$FIXTURE_REPO" commit -qm fixture
     SOURCE_COMMIT="$(/usr/bin/git -C "$FIXTURE_REPO" rev-parse HEAD)"
     /usr/bin/git -C "$FIXTURE_REPO" tag v1.1.0
+    write_fake_plists
 
     FULL_DMG="$OUTPUT_DIR/PTT2me-1.1.0-full-macos-arm64.dmg"
     FULL_CHECKSUM="$FULL_DMG.sha256"
@@ -217,8 +258,8 @@ verify_command() {
         IMAGE_ROOT="$IMAGE_ROOT" \
         FAKE_HDIUTIL_LOG="$FAKE_HDIUTIL_LOG" \
         FAKE_HDIUTIL_STATE="$FAKE_HDIUTIL_STATE" \
-        PTT2ME_MANIFEST_VERIFIER="$MANIFEST_VERIFIER" \
-        PTT2ME_MANIFEST_LIBRARY_PATH="$REPO_ROOT/target/debug" \
+        FAKE_MANIFEST_VERIFIER="$MANIFEST_VERIFIER" \
+        FAKE_MANIFEST_LIBRARY_PATH="$REPO_ROOT/target/debug" \
         "$FIXTURE_REPO/scripts/verify-release-artifacts.sh" \
         --version "${TEST_VERSION:-1.1.0}" \
         --source-commit "${TEST_SOURCE_COMMIT:-$SOURCE_COMMIT}" \
@@ -324,10 +365,19 @@ expect_failure manifest verify_command
 
 write_fixture
 printf '%s\n' changed-key >"$FIXTURE_REPO/updates/public-key.txt"
+/usr/bin/git -C "$FIXTURE_REPO" add updates/public-key.txt
+/usr/bin/git -C "$FIXTURE_REPO" commit -qm changed-key
+SOURCE_COMMIT="$(/usr/bin/git -C "$FIXTURE_REPO" rev-parse HEAD)"
 expect_failure key verify_command
 
 write_fixture
+ORIGINAL_MODEL_MANIFEST="$TEMP_ROOT/original-model-$FIXTURE_INDEX.json"
+cp "$MODEL_MANIFEST" "$ORIGINAL_MODEL_MANIFEST"
 printf ' ' >>"$FIXTURE_REPO/models/manifests/gigaam-v3-rnnt-v1.json"
+/usr/bin/git -C "$FIXTURE_REPO" add models/manifests/gigaam-v3-rnnt-v1.json
+/usr/bin/git -C "$FIXTURE_REPO" commit -qm changed-model
+SOURCE_COMMIT="$(/usr/bin/git -C "$FIXTURE_REPO" rev-parse HEAD)"
+MODEL_MANIFEST="$ORIGINAL_MODEL_MANIFEST"
 expect_failure model verify_command
 
 write_fixture
@@ -337,6 +387,30 @@ expect_failure identity verify_command
 write_fixture
 TEST_SOURCE_COMMIT=0000000000000000000000000000000000000000 \
     expect_failure git verify_command
+
+write_fixture
+/usr/bin/git -C "$FIXTURE_REPO" commit --allow-empty -qm newer-existing-commit
+NEW_SOURCE_COMMIT="$(/usr/bin/git -C "$FIXTURE_REPO" rev-parse HEAD)"
+plutil -replace PTT2meSourceCommit -string "$NEW_SOURCE_COMMIT" \
+    "$IMAGE_ROOT/full/PTT2me.app/Contents/Info.plist"
+plutil -replace PTT2meSourceCommit -string "$NEW_SOURCE_COMMIT" \
+    "$IMAGE_ROOT/update/PTT2me.app/Contents/Info.plist"
+TEST_SOURCE_COMMIT="$NEW_SOURCE_COMMIT" expect_failure identity verify_command
+
+write_fixture
+MALICIOUS_VERIFIER="$TEMP_ROOT/malicious-verifier-$FIXTURE_INDEX"
+printf '%s\n' \
+    '#!/bin/bash' \
+    'printf "version=1.1.0\nsource_commit=%s\n" "$FAKE_SIGNED_SOURCE_COMMIT"' \
+    >"$MALICIOUS_VERIFIER"
+chmod 755 "$MALICIOUS_VERIFIER"
+PTT2ME_MANIFEST_VERIFIER="$MALICIOUS_VERIFIER" \
+    FAKE_SIGNED_SOURCE_COMMIT="$SOURCE_COMMIT" \
+    expect_failure environment verify_command
+
+write_fixture
+PTT2ME_MANIFEST_LIBRARY_PATH="$TEMP_ROOT/untrusted-library-path" \
+    expect_failure environment verify_command
 
 write_fixture
 /usr/bin/git -C "$FIXTURE_REPO" tag -d v1.1.0 >/dev/null
@@ -363,6 +437,24 @@ expect_detach_logged update
 expect_no_mounts
 
 write_fixture
+plutil -replace CFBundleShortVersionString -string 1.2.0 \
+    "$IMAGE_ROOT/full/PTT2me.app/Contents/Info.plist"
+expect_failure identity verify_command
+expect_no_mounts
+
+write_fixture
+plutil -replace CFBundleVersion -string 202608111201 \
+    "$IMAGE_ROOT/full/PTT2me.app/Contents/Info.plist"
+expect_failure identity verify_command
+expect_no_mounts
+
+write_fixture
+plutil -replace PTT2meSourceCommit -string 1111111111111111111111111111111111111111 \
+    "$IMAGE_ROOT/update/PTT2me.app/Contents/Info.plist"
+expect_failure identity verify_command
+expect_no_mounts
+
+write_fixture
 FAKE_HDIUTIL_FAIL=verify-full expect_failure dmg verify_command
 
 write_fixture
@@ -383,7 +475,7 @@ expect_detach_logged update
 expect_no_mounts
 
 write_fixture
-FAKE_SMOKE_FAIL=1 expect_failure smoke verify_command
+FAKE_SMOKE_FAIL=1 expect_failure bundle verify_command
 expect_detach_logged full
 expect_detach_logged update
 expect_no_mounts

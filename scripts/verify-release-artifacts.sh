@@ -115,6 +115,10 @@ done
 if [[ -n "$EXPECTED_TAG" && "$EXPECTED_TAG" != "v$VERSION" ]]; then
     fail arguments "expected tag must be exactly v$VERSION: $EXPECTED_TAG"
 fi
+[[ -z "${PTT2ME_MANIFEST_VERIFIER:-}" ]] ||
+    fail environment "PTT2ME_MANIFEST_VERIFIER must be unset for production verification"
+[[ -z "${PTT2ME_MANIFEST_LIBRARY_PATH:-}" ]] ||
+    fail environment "PTT2ME_MANIFEST_LIBRARY_PATH must be unset for production verification"
 
 for command_name in awk base64 cmp find git hdiutil plutil readlink shasum stat tr wc; do
     command -v "$command_name" >/dev/null 2>&1 ||
@@ -159,6 +163,12 @@ COMMITTED_PUBLIC_KEY="$REPO_ROOT/updates/public-key.txt"
     fail key "committed public key is unavailable: $COMMITTED_PUBLIC_KEY"
 git -C "$REPO_ROOT" cat-file -e "$SOURCE_COMMIT^{commit}" 2>/dev/null ||
     fail git "expected source commit is unavailable in the verifier repository: $SOURCE_COMMIT"
+HEAD_COMMIT="$(git -C "$REPO_ROOT" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" ||
+    fail git "could not resolve exact verifier git HEAD"
+[[ "$HEAD_COMMIT" == "$SOURCE_COMMIT" ]] ||
+    fail git "verifier git HEAD must equal the expected source commit: $SOURCE_COMMIT"
+[[ -z "$(git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all)" ]] ||
+    fail git "verifier source tree must be clean: $REPO_ROOT"
 git -C "$REPO_ROOT" cat-file -e "$SOURCE_COMMIT:updates/public-key.txt" 2>/dev/null ||
     fail key "expected source commit does not contain updates/public-key.txt"
 git -C "$REPO_ROOT" diff --quiet "$SOURCE_COMMIT" -- updates/public-key.txt ||
@@ -295,6 +305,30 @@ verify_mounted_root Full "$FULL_MOUNT"
 verify_mounted_root Update "$UPDATE_MOUNT"
 FULL_APP="$FULL_MOUNT/$PRODUCT.app"
 UPDATE_APP="$UPDATE_MOUNT/$PRODUCT.app"
+
+verify_bundle_identity() {
+    local label="$1"
+    local app="$2"
+    local plist="$app/Contents/Info.plist"
+    local bundle_version bundle_build bundle_source_commit
+    [[ -f "$plist" && ! -L "$plist" ]] ||
+        fail identity "$label bundle has no real Info.plist"
+    bundle_version="$(plutil -extract CFBundleShortVersionString raw -expect string -o - -- "$plist" 2>/dev/null)" ||
+        fail identity "$label bundle has no valid CFBundleShortVersionString"
+    bundle_build="$(plutil -extract CFBundleVersion raw -expect string -o - -- "$plist" 2>/dev/null)" ||
+        fail identity "$label bundle has no valid CFBundleVersion"
+    bundle_source_commit="$(plutil -extract PTT2meSourceCommit raw -expect string -o - -- "$plist" 2>/dev/null)" ||
+        fail identity "$label bundle has no valid PTT2meSourceCommit"
+    [[ "$bundle_version" == "$VERSION" ]] ||
+        fail identity "$label bundle version does not match signed version: $bundle_version"
+    [[ "$bundle_build" == "$PAYLOAD_BUILD" ]] ||
+        fail identity "$label bundle build does not match signed build: $bundle_build"
+    [[ "$bundle_source_commit" == "$SOURCE_COMMIT" ]] ||
+        fail identity "$label bundle source commit does not match signed source commit: $bundle_source_commit"
+}
+
+verify_bundle_identity Full "$FULL_APP"
+verify_bundle_identity Update "$UPDATE_APP"
 "$SCRIPT_DIR/check-bundle.sh" --variant full --model-manifest "$MODEL_MANIFEST" "$FULL_APP" ||
     fail bundle "Full bundle recheck failed"
 "$SCRIPT_DIR/check-bundle.sh" --variant update --model-manifest "$MODEL_MANIFEST" "$UPDATE_APP" ||
@@ -311,9 +345,6 @@ for relative in \
     "$SCRIPT_DIR/compare-macho-payload.sh" "$FULL_APP/$relative" "$UPDATE_APP/$relative" ||
         fail parity "Full and Update unsigned Mach-O payloads differ: $relative"
 done
-
-"$FULL_APP/Contents/MacOS/$PRODUCT" --smoke-model ||
-    fail smoke "bundled Full model smoke failed or exceeded its internal watchdog"
 
 hdiutil detach "$UPDATE_MOUNT" -quiet >/dev/null ||
     fail cleanup "could not detach Update DMG mount: $UPDATE_MOUNT"

@@ -57,6 +57,7 @@ for text in \
 done
 
 for text in \
+    'bash scripts/test-shell-contracts.sh' \
     'scripts/release-preflight.sh' \
     'scripts/build-release-artifacts.sh' \
     'scripts/verify-release-artifacts.sh' \

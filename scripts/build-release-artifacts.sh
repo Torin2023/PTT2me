@@ -137,10 +137,17 @@ readonly MODEL_MANIFEST MODEL_SOURCE PUBLIC_KEY PRIVATE_KEY OUTPUT_DIR
     --published-at "$PUBLISHED_AT" \
     --output-dir "$OUTPUT_DIR"
 
+[[ -z "$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+    fail "output directory must remain empty after release preflight"
+
 PRIVATE_MODE="$(stat -f '%Lp' "$PRIVATE_KEY" 2>/dev/null)" ||
     fail "could not inspect production private key permissions"
 [[ "$PRIVATE_MODE" =~ ^[0-7]{3,4}$ && $((8#$PRIVATE_MODE & 077)) -eq 0 ]] ||
     fail "production private key permissions must deny group and other access"
+PRIVATE_ACL="$(/bin/ls -lde "$PRIVATE_KEY" 2>/dev/null)" ||
+    fail "could not inspect production private key ACL"
+[[ "$(printf '%s\n' "$PRIVATE_ACL" | wc -l | tr -d ' ')" == "1" ]] ||
+    fail "production private key must not have ACL entries"
 
 cd -- "$REPO_ROOT"
 GIT_COMMON_RAW="$(git rev-parse --git-common-dir 2>/dev/null)" ||
@@ -210,12 +217,22 @@ TEMP_ROOT="$(mktemp -d "$OUTPUT_DIR/.ptt2me-$VERSION-release.XXXXXX")" ||
     fail "could not create private release workspace"
 chmod 700 "$TEMP_ROOT"
 PUBLISHED_PATHS=()
+PUBLISHED_SOURCES=()
+IN_FLIGHT_SOURCE=""
+IN_FLIGHT_DESTINATION=""
 BUILD_SUCCEEDED=false
 cleanup() {
     if [[ "$BUILD_SUCCEEDED" != true ]]; then
+        if [[ -n "$IN_FLIGHT_SOURCE" && -n "$IN_FLIGHT_DESTINATION" && \
+            -e "$IN_FLIGHT_DESTINATION" && "$IN_FLIGHT_SOURCE" -ef "$IN_FLIGHT_DESTINATION" ]]; then
+            rm -f "$IN_FLIGHT_DESTINATION"
+        fi
         if (( ${#PUBLISHED_PATHS[@]} > 0 )); then
-            for path in "${PUBLISHED_PATHS[@]}"; do
-                rm -f "$path"
+            for index in "${!PUBLISHED_PATHS[@]}"; do
+                if [[ -e "${PUBLISHED_PATHS[$index]}" && \
+                    "${PUBLISHED_SOURCES[$index]}" -ef "${PUBLISHED_PATHS[$index]}" ]]; then
+                    rm -f "${PUBLISHED_PATHS[$index]}"
+                fi
             done
         fi
     fi
@@ -287,8 +304,12 @@ printf '%s\n' \
     "{\"channel\":\"stable\",\"version\":\"$VERSION\",\"build\":$BUILD,\"source_commit\":\"$SOURCE_COMMIT\",\"minimum_macos\":\"13.0\",\"architecture\":\"arm64\",\"required_model\":{\"id\":\"$MODEL_ID\",\"manifest_sha256\":\"$MODEL_SHA\"},\"fresh_install\":{\"url\":\"https://github.com/Torin2023/PTT2me/releases/download/v$VERSION/$FULL_DMG_NAME\",\"sha256\":\"$FULL_SHA\",\"size\":$FULL_SIZE},\"application_update\":{\"url\":\"https://github.com/Torin2023/PTT2me/releases/download/v$VERSION/$UPDATE_DMG_NAME\",\"sha256\":\"$UPDATE_SHA\",\"size\":$UPDATE_SIZE},\"published_at\":\"$PUBLISHED_AT\"}" \
     >"$PAYLOAD"
 
-"$SCRIPT_DIR/sign-update-manifest.sh" "$PRIVATE_KEY" "$PAYLOAD" "$SIGNED_MANIFEST"
+SIGNER_BINARY="$REPO_ROOT/target/$TARGET/release/ptt2me-update-signer"
+[[ -x "$SIGNER_BINARY" ]] || fail "pinned release manifest signer is unavailable"
+PTT2ME_MANIFEST_SIGNER="$SIGNER_BINARY" \
+    "$SCRIPT_DIR/sign-update-manifest.sh" "$PRIVATE_KEY" "$PAYLOAD" "$SIGNED_MANIFEST"
 PTT2ME_MANIFEST_VERIFIER="$FULL_APP/Contents/MacOS/$PRODUCT" \
+    PTT2ME_MANIFEST_LIBRARY_PATH= \
     "$SCRIPT_DIR/validate-update-manifest.sh" \
     "$PUBLIC_KEY" "$SIGNED_MANIFEST" "$FULL_DMG" "$UPDATE_DMG" "$MODEL_MANIFEST"
 
@@ -297,8 +318,13 @@ for source in \
     "$UPDATE_DMG" "$UPDATE_DMG.sha256" \
     "$SIGNED_MANIFEST"; do
     destination="$OUTPUT_DIR/$(basename -- "$source")"
+    IN_FLIGHT_SOURCE="$source"
+    IN_FLIGHT_DESTINATION="$destination"
     ln "$source" "$destination" || fail "could not publish release output without overwrite"
     PUBLISHED_PATHS+=("$destination")
+    PUBLISHED_SOURCES+=("$source")
+    IN_FLIGHT_SOURCE=""
+    IN_FLIGHT_DESTINATION=""
 done
 BUILD_SUCCEEDED=true
 

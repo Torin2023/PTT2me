@@ -155,6 +155,7 @@ main-thread NSPasteboard round trip), denies Clippy warnings, and audits locked
 Rust dependencies:
 
 ```bash
+bash scripts/test-shell-contracts.sh
 cargo fmt --all -- --check
 cargo test --all-targets --features test-support -- --test-threads=1
 cargo clippy --all-targets --features test-support -- -D warnings
@@ -184,7 +185,7 @@ use Full only. Update is selected only inside an already installed PTT2me.
 The release coordinator requires an explicit stable version, 12-digit UTC
 build, exact clean `HEAD`, model source, committed model manifest, publication
 timestamp, and matching key pair. The private signing key must remain outside
-Git. The published package version is exactly 1.1.0.
+Git. The currently published stable package version is exactly 1.1.0.
 
 ### Reproducible release gates
 
