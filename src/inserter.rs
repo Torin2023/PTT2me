@@ -40,6 +40,7 @@ struct TemporaryWriteFailure {
 }
 
 trait PasteboardAccess {
+    fn change_count(&self) -> isize;
     fn snapshot(&mut self) -> Result<PasteboardSnapshot, InsertError>;
     fn write_temporary_text(&mut self, text: &str)
         -> Result<TemporaryWrite, TemporaryWriteFailure>;
@@ -82,6 +83,7 @@ pub enum InsertError {
     Accessibility(AccessibilityFailure),
     PasteboardSnapshot,
     PasteboardWrite,
+    PasteboardChanged,
     PasteboardRestore,
     EventSource,
     KeyboardEvent,
@@ -103,6 +105,7 @@ impl InsertError {
             Self::Accessibility(_) => "accessibility",
             Self::PasteboardSnapshot => "pasteboard_snapshot",
             Self::PasteboardWrite => "pasteboard_write",
+            Self::PasteboardChanged => "pasteboard_changed",
             Self::PasteboardRestore => "pasteboard_restore",
             Self::EventSource => "event_source",
             Self::KeyboardEvent => "keyboard_event",
@@ -145,6 +148,7 @@ impl fmt::Display for InsertError {
             ),
             Self::PasteboardSnapshot => formatter.write_str("could not snapshot the pasteboard"),
             Self::PasteboardWrite => formatter.write_str("could not write to the pasteboard"),
+            Self::PasteboardChanged => formatter.write_str("pasteboard changed before insertion"),
             Self::PasteboardRestore => formatter.write_str("could not restore the pasteboard"),
             Self::EventSource => formatter.write_str("could not create a keyboard event source"),
             Self::KeyboardEvent => formatter.write_str("could not create a paste keyboard event"),
@@ -178,6 +182,10 @@ impl SystemPasteboard {
 }
 
 impl PasteboardAccess for SystemPasteboard {
+    fn change_count(&self) -> isize {
+        unsafe { self.pasteboard.changeCount() }
+    }
+
     fn snapshot(&mut self) -> Result<PasteboardSnapshot, InsertError> {
         let Some(items) = (unsafe { self.pasteboard.pasteboardItems() }) else {
             return Ok(PasteboardSnapshot::default());
@@ -325,6 +333,11 @@ impl<P: PasteboardAccess, C: PasteCommand> InsertionTransaction<P, C> {
     }
 
     pub(crate) fn paste(&mut self) -> Result<(), InsertError> {
+        // A copy made during the settle delay belongs to the user. Never
+        // knowingly paste it as the result of this dictation transaction.
+        if self.pasteboard.change_count() != self.temporary.change_count {
+            return Err(InsertError::PasteboardChanged);
+        }
         self.command.send_command_v()
     }
 
@@ -518,6 +531,10 @@ mod tests {
     }
 
     impl PasteboardAccess for FakePasteboard {
+        fn change_count(&self) -> isize {
+            self.change_count
+        }
+
         fn snapshot(&mut self) -> Result<PasteboardSnapshot, InsertError> {
             self.snapshot_error
                 .map_or_else(|| Ok(self.current.clone()), Err)
@@ -573,20 +590,28 @@ mod tests {
 
     struct FakePasteCommand {
         result: Result<(), InsertError>,
+        calls: usize,
     }
 
     impl FakePasteCommand {
         fn succeed() -> Self {
-            Self { result: Ok(()) }
+            Self {
+                result: Ok(()),
+                calls: 0,
+            }
         }
 
         fn fail(error: InsertError) -> Self {
-            Self { result: Err(error) }
+            Self {
+                result: Err(error),
+                calls: 0,
+            }
         }
     }
 
     impl PasteCommand for FakePasteCommand {
         fn send_command_v(&mut self) -> Result<(), InsertError> {
+            self.calls += 1;
             self.result
         }
     }
@@ -606,6 +631,45 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn copy_during_settle_cancels_paste_and_preserves_new_contents() {
+        let original = snapshot(&[&[("public.utf8-plain-text", b"before")]]);
+        let newer = snapshot(&[&[("public.utf8-plain-text", b"user copy")]]);
+        let mut insertion = InsertionTransaction::begin_with(
+            "recognized",
+            FakePasteboard::with_snapshot(original),
+            FakePasteCommand::succeed(),
+        )
+        .unwrap();
+
+        insertion.pasteboard.current = newer.clone();
+        insertion.pasteboard.change_count += 1;
+        let error = insertion.paste().unwrap_err();
+
+        assert_eq!(error, InsertError::PasteboardChanged);
+        assert_eq!(insertion.command.calls, 0);
+        assert_eq!(insertion.restore_after_paste_failure(error), error);
+        assert_eq!(insertion.pasteboard.current, newer);
+        assert_eq!(insertion.pasteboard.restore_calls, 0);
+    }
+
+    #[test]
+    fn copying_the_same_text_still_transfers_pasteboard_ownership() {
+        let mut insertion = InsertionTransaction::begin_with(
+            "recognized",
+            FakePasteboard::with_snapshot(PasteboardSnapshot::default()),
+            FakePasteCommand::succeed(),
+        )
+        .unwrap();
+        let copied = insertion.pasteboard.current.clone();
+        insertion.pasteboard.change_count += 1;
+
+        assert_eq!(insertion.paste(), Err(InsertError::PasteboardChanged));
+        insertion.restore().unwrap();
+        assert_eq!(insertion.command.calls, 0);
+        assert_eq!(insertion.pasteboard.current, copied);
     }
 
     #[test]

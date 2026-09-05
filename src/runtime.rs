@@ -16,6 +16,7 @@ use objc2_app_kit::NSApplication;
 use objc2_foundation::MainThreadMarker;
 
 use crate::asr::{spawn_asr_worker, AsrCommand, AsrEvent};
+use crate::asr_task::{AsrTask, AsrTaskError};
 use crate::audio::{AudioError, AudioRecorder};
 use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS};
 use crate::hotkey::{AssignmentEpoch, HotkeyControl, HotkeyListener, HotkeySignal};
@@ -593,10 +594,7 @@ pub struct Runtime {
     hotkey: Option<HotkeyListener>,
     hotkey_sender: Sender<HotkeySignal>,
     hotkey_events: Receiver<HotkeySignal>,
-    asr_commands: Sender<AsrCommand>,
-    asr_events: Receiver<AsrEvent>,
-    asr_worker: Option<JoinHandle<()>>,
-    asr_connected: bool,
+    asr: AsrTask,
     model_preparation: Option<ModelPreparationTask>,
     permission_migration: Option<PermissionMigrationTask>,
     prepared_model_paths: Option<ModelPaths>,
@@ -642,9 +640,7 @@ impl Runtime {
     ) -> Pin<Box<Self>> {
         let (hotkey_sender, hotkey_events) = mpsc::channel();
         let (menu_sender, menu_commands) = mpsc::channel();
-        let (asr_commands, asr_command_receiver) = mpsc::channel();
-        let (asr_event_sender, asr_events) = mpsc::channel();
-        let asr_worker = spawn_asr_worker(asr_command_receiver, asr_event_sender);
+        let asr = AsrTask::spawn();
         let (model_preparation_events, model_preparation_worker) = spawn_model_preparation_worker();
         let model_preparation =
             ModelPreparationTask::new(model_preparation_events, model_preparation_worker);
@@ -677,10 +673,7 @@ impl Runtime {
             hotkey: None,
             hotkey_sender,
             hotkey_events,
-            asr_commands,
-            asr_events,
-            asr_worker: Some(asr_worker),
-            asr_connected: true,
+            asr,
             model_preparation: Some(model_preparation),
             permission_migration: None,
             prepared_model_paths: None,
@@ -819,26 +812,29 @@ impl Runtime {
             self.drain_hotkey_events();
         }
 
-        loop {
-            match self.asr_events.try_recv() {
+        while let Some(result) = self.asr.poll(Instant::now()) {
+            match result {
                 Ok(AsrEvent::Loaded(result)) => self.dispatch(AppEvent::ModelLoaded(result)),
                 Ok(AsrEvent::Recognized(result)) => {
                     self.dispatch(AppEvent::RecognitionFinished(result));
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    if self.asr_connected {
-                        self.asr_connected = false;
-                        tracing::error!(error_category = "asr_worker_disconnected");
-                        self.dispatch(AppEvent::ModelLoaded(Err(
-                            "ASR worker unavailable".to_owned()
-                        )));
-                    }
+                Err(error) => {
+                    self.handle_asr_error(error);
                     break;
                 }
             }
         }
         self.try_orderly_quit();
+    }
+
+    fn handle_asr_error(&mut self, error: AsrTaskError) {
+        tracing::error!(error_category = "asr_worker", error = ?error);
+        match error {
+            AsrTaskError::TimedOut(_) => self.dispatch(AppEvent::AsrTimedOut),
+            AsrTaskError::Disconnected | AsrTaskError::UnexpectedOperation => {
+                self.dispatch(AppEvent::ModelLoaded(Err("ASR worker unavailable".to_owned())));
+            }
+        }
     }
 
     fn drain_model_preparation(&mut self) {
@@ -932,14 +928,11 @@ impl Runtime {
                 };
                 self.dispatch(AppEvent::PermissionMigrationCompleted);
                 self.start_permission_setup();
-                if self
-                    .asr_commands
-                    .send(AsrCommand::Load(result.paths))
-                    .is_err()
+                if let Err(error) = self
+                    .asr
+                    .send(AsrCommand::Load(result.paths), Instant::now())
                 {
-                    self.dispatch(AppEvent::ModelLoaded(Err(
-                        "ASR worker unavailable".to_owned()
-                    )));
+                    self.handle_asr_error(error);
                 }
             }
             Err(error) => {
@@ -1298,15 +1291,11 @@ impl Runtime {
                     sample_count = samples.len(),
                     lifecycle = "recognition_started"
                 );
-                if self
-                    .asr_commands
-                    .send(AsrCommand::Transcribe(samples))
-                    .is_err()
+                if let Err(error) = self
+                    .asr
+                    .send(AsrCommand::Transcribe(samples), Instant::now())
                 {
-                    tracing::warn!(error_category = "asr_channel");
-                    self.dispatch(AppEvent::RecognitionFinished(Err(
-                        "ASR worker unavailable".to_owned()
-                    )));
+                    self.handle_asr_error(error);
                 }
             }
             Effect::InsertText(text) => {
@@ -1479,10 +1468,7 @@ impl Drop for Runtime {
         }
         self.recorder.abort();
         self.hotkey.take();
-        let _ = self.asr_commands.send(AsrCommand::Shutdown);
-        if let Some(worker) = self.asr_worker.take() {
-            let _ = worker.join();
-        }
+        self.asr.stop();
         self.model_preparation.take();
         self.permission_migration.take();
         self.updater.take();

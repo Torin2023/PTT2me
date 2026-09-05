@@ -57,11 +57,21 @@ the captured phrase, and inserts a
 non-empty result into whichever editable field owns the cursor at that moment.
 A capture ends automatically after 25 seconds.
 
+Loading the recognition engine has a 180-second deadline; each transcription
+has a 60-second deadline. If either expires, PTT2me stops accepting dictation
+and asks you to restart the app. Late results are discarded, and quitting
+does not wait for a blocked recognition thread. The timeout does not forcibly
+interrupt native inference inside the current process.
+
 Insertion uses Accessibility to inspect the focused field and rejects secure
 text fields. For ordinary text, PTT2me temporarily uses the full macOS
 pasteboard and Command-V so browser and web-based editors receive a normal
 paste event, then performs a guarded restore after one second. A newer
 pasteboard change is never overwritten.
+
+Immediately before Command-V, PTT2me also checks that the temporary pasteboard
+still belongs to the current insertion. A copy made during the settle delay
+cancels insertion and keeps the newer clipboard contents.
 
 A short press is preserved: PTT2me replays it once to macOS, so the normal
 Fn/Globe input-source action still works. The same applies to a short press of
