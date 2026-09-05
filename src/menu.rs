@@ -168,26 +168,33 @@ impl UpdaterMenuProjection {
             UpdaterState::Opening { release, .. } => {
                 Self::information(format!("Открытие обновления {}…", release.version))
             }
-            UpdaterState::Failed { retry, .. } => match retry {
-                RetryAction::ManualCheck => Self::information_and_action(
-                    "Не удалось проверить обновления".to_owned(),
-                    "Повторить проверку".to_owned(),
-                    UpdaterMenuAction::RetryUpdate,
-                    true,
-                ),
-                RetryAction::Download => Self::information_and_action(
-                    "Не удалось загрузить обновление".to_owned(),
-                    "Повторить загрузку".to_owned(),
-                    UpdaterMenuAction::RetryUpdate,
-                    true,
-                ),
-                RetryAction::ModelRecheck => Self::information_and_action(
-                    "Не удалось проверить модель".to_owned(),
-                    "Повторить".to_owned(),
-                    UpdaterMenuAction::RetryUpdate,
-                    true,
-                ),
-            },
+            UpdaterState::Failed { failure, retry, .. } => {
+                let mut projection = match retry {
+                    RetryAction::ManualCheck => Self::information_and_action(
+                        "Не удалось проверить обновления".to_owned(),
+                        "Повторить проверку".to_owned(),
+                        UpdaterMenuAction::RetryUpdate,
+                        true,
+                    ),
+                    RetryAction::Download => Self::information_and_action(
+                        "Не удалось загрузить обновление".to_owned(),
+                        "Повторить загрузку".to_owned(),
+                        UpdaterMenuAction::RetryUpdate,
+                        true,
+                    ),
+                    RetryAction::ModelRecheck => Self::information_and_action(
+                        "Не удалось проверить модель".to_owned(),
+                        "Повторить".to_owned(),
+                        UpdaterMenuAction::RetryUpdate,
+                        true,
+                    ),
+                };
+                if *failure == crate::updater::UpdateFailure::WorkerStopped {
+                    projection.information_title =
+                        "Обработчик обновлений остановился. Повторите попытку".to_owned();
+                }
+                projection
+            }
         }
     }
 }

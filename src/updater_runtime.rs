@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 
 use objc2_foundation::NSProcessInfo;
@@ -303,6 +304,18 @@ pub(crate) enum UpdaterWorkerResult {
 }
 
 impl UpdaterWorkerResult {
+    fn operation_id(&self) -> OperationId {
+        match self {
+            Self::CachedManifestReceived { operation_id, .. }
+            | Self::ManifestReceived { operation_id, .. }
+            | Self::ManifestFailed { operation_id, .. }
+            | Self::ModelRechecked { operation_id, .. }
+            | Self::DownloadVerified { operation_id, .. }
+            | Self::DownloadFailed { operation_id, .. }
+            | Self::OpenCompleted { operation_id, .. } => *operation_id,
+        }
+    }
+
     fn into_event(self) -> UpdaterEvent {
         match self {
             Self::CachedManifestReceived {
@@ -370,6 +383,7 @@ pub(crate) struct UpdaterWorkerTask {
     requests: Sender<UpdaterWorkerRequest>,
     results: Receiver<UpdaterWorkerResult>,
     worker: Option<JoinHandle<()>>,
+    pending: HashMap<OperationId, UpdaterEvent>,
 }
 
 impl UpdaterWorkerTask {
@@ -389,15 +403,39 @@ impl UpdaterWorkerTask {
             requests: request_sender,
             results: result_receiver,
             worker: Some(worker),
+            pending: HashMap::new(),
         }
     }
 
-    pub(crate) fn send(&self, request: UpdaterWorkerRequest) -> Result<(), UpdaterWorkerRequest> {
-        self.requests.send(request).map_err(|error| error.0)
+    pub(crate) fn send(
+        &mut self,
+        request: UpdaterWorkerRequest,
+    ) -> Result<(), UpdaterWorkerRequest> {
+        let failure = worker_disconnect_event(&request);
+        self.requests.send(request).map_err(|error| error.0)?;
+        if let Some((operation_id, event)) = failure {
+            self.pending.insert(operation_id, event);
+        }
+        Ok(())
     }
 
-    fn drain_results(&self) -> Vec<UpdaterWorkerResult> {
-        self.results.try_iter().collect()
+    fn drain_results(&mut self) -> (Vec<UpdaterEvent>, bool) {
+        let mut events = Vec::new();
+        loop {
+            match self.results.try_recv() {
+                Ok(result) => {
+                    self.pending.remove(&result.operation_id());
+                    events.push(result.into_event());
+                }
+                Err(TryRecvError::Empty) => return (events, false),
+                Err(TryRecvError::Disconnected) => {
+                    // Buffered completions win over failures. Only requests without
+                    // a result belong to the dead worker; new operation IDs remain safe.
+                    events.extend(self.pending.drain().map(|(_, event)| event));
+                    return (events, true);
+                }
+            }
+        }
     }
 }
 
@@ -529,29 +567,30 @@ pub(crate) struct UpdaterLane<R: RawUpdateScheduleStore, C: UpdateClock> {
     schedule: UpdateScheduleRepository<R>,
     clock: C,
     launch_at: u64,
-    worker: UpdaterWorkerTask,
+    worker: Option<UpdaterWorkerTask>,
+    worker_factory: Box<dyn FnMut() -> UpdaterWorkerTask>,
 }
 
 pub(crate) type SystemUpdaterLane = UpdaterLane<SystemUpdateScheduleStore, SystemClock>;
 
 impl UpdaterLane<SystemUpdateScheduleStore, SystemClock> {
     pub(crate) fn production(config: UpdaterLaunchConfig) -> Self {
-        let worker = ProductionUpdaterWorker::new(&config);
+        let worker_config = config.clone();
         Self::with_boundaries(
             config,
             SystemUpdateScheduleStore::standard(),
             SystemClock,
-            worker,
+            move || ProductionUpdaterWorker::new(&worker_config),
         )
     }
 }
 
 impl<R: RawUpdateScheduleStore, C: UpdateClock> UpdaterLane<R, C> {
-    pub(crate) fn with_boundaries(
+    pub(crate) fn with_boundaries<B: UpdaterWorkerBoundary>(
         config: UpdaterLaunchConfig,
         schedule: R,
         clock: C,
-        worker: impl UpdaterWorkerBoundary,
+        mut worker_factory: impl FnMut() -> B + 'static,
     ) -> Self {
         let launch_at = clock.now();
         Self {
@@ -559,7 +598,8 @@ impl<R: RawUpdateScheduleStore, C: UpdateClock> UpdaterLane<R, C> {
             schedule: UpdateScheduleRepository::new(schedule),
             clock,
             launch_at,
-            worker: UpdaterWorkerTask::spawn(worker),
+            worker: Some(UpdaterWorkerTask::spawn(worker_factory())),
+            worker_factory: Box::new(move || UpdaterWorkerTask::spawn(worker_factory())),
         }
     }
 
@@ -604,11 +644,20 @@ impl<R: RawUpdateScheduleStore, C: UpdateClock> UpdaterLane<R, C> {
     }
 
     pub(crate) fn drain_worker_results(&mut self) -> (Vec<UpdaterRuntimeEffect>, bool) {
-        let results = self.worker.drain_results();
-        let handled = !results.is_empty();
+        let Some(worker) = &mut self.worker else {
+            return (Vec::new(), false);
+        };
+        let (events, disconnected) = worker.drain_results();
+        let handled = disconnected || !events.is_empty();
+        if disconnected {
+            tracing::warn!(error_category = "updater_worker_stopped");
+            // Retire before dispatch: a buffered result can queue the next stage.
+            // Recreate lazily for that stage or the next explicit/scheduled request.
+            self.worker = None;
+        }
         let mut effects = Vec::new();
-        for result in results {
-            effects.extend(self.handle_event(result.into_event()));
+        for event in events {
+            effects.extend(self.handle_event(event));
         }
         (effects, handled)
     }
@@ -701,49 +750,56 @@ impl<R: RawUpdateScheduleStore, C: UpdateClock> UpdaterLane<R, C> {
     }
 
     fn queue_worker(&mut self, request: UpdaterWorkerRequest) -> Vec<UpdaterRuntimeEffect> {
-        match self.worker.send(request) {
+        let worker = self.worker.get_or_insert_with(&mut self.worker_factory);
+        match worker.send(request) {
             Ok(()) => Vec::new(),
-            Err(request) => worker_disconnect_event(request)
-                .map_or_else(Vec::new, |event| self.handle_event(event)),
+            Err(request) => worker_disconnect_event(&request)
+                .map_or_else(Vec::new, |(_, event)| self.handle_event(event)),
         }
     }
 }
 
-fn worker_disconnect_event(request: UpdaterWorkerRequest) -> Option<UpdaterEvent> {
-    match request {
-        UpdaterWorkerRequest::LoadCachedManifest { operation_id } => {
-            Some(UpdaterEvent::CachedManifestReceived {
-                operation_id,
+fn worker_disconnect_event(request: &UpdaterWorkerRequest) -> Option<(OperationId, UpdaterEvent)> {
+    let (operation_id, event) = match request {
+        UpdaterWorkerRequest::LoadCachedManifest { operation_id } => (
+            *operation_id,
+            UpdaterEvent::CachedManifestReceived {
+                operation_id: *operation_id,
                 bytes: Vec::new(),
                 model: ModelAvailability::Invalid,
-            })
-        }
-        UpdaterWorkerRequest::StoreVerifiedManifest { .. } => None,
-        UpdaterWorkerRequest::FetchManifest { operation_id, .. } => {
-            Some(UpdaterEvent::ManifestFailed {
-                operation_id,
-                failure: UpdateFailure::Network,
-            })
-        }
-        UpdaterWorkerRequest::RecheckModel { operation_id, .. } => {
-            Some(UpdaterEvent::ModelRecheckFailed {
-                operation_id,
-                failure: UpdateFailure::Network,
-            })
-        }
-        UpdaterWorkerRequest::DownloadAndVerify { operation_id, .. } => {
-            Some(UpdaterEvent::DownloadFailed {
-                operation_id,
-                failure: UpdateFailure::Network,
-            })
-        }
-        UpdaterWorkerRequest::VerifyAndOpenDmg { operation_id, .. } => {
-            Some(UpdaterEvent::OpenCompleted {
-                operation_id,
-                result: Err(UpdateFailure::Network),
-            })
-        }
-    }
+            },
+        ),
+        UpdaterWorkerRequest::StoreVerifiedManifest { .. } => return None,
+        UpdaterWorkerRequest::FetchManifest { operation_id, .. } => (
+            *operation_id,
+            UpdaterEvent::ManifestFailed {
+                operation_id: *operation_id,
+                failure: UpdateFailure::WorkerStopped,
+            },
+        ),
+        UpdaterWorkerRequest::RecheckModel { operation_id, .. } => (
+            *operation_id,
+            UpdaterEvent::ModelRecheckFailed {
+                operation_id: *operation_id,
+                failure: UpdateFailure::WorkerStopped,
+            },
+        ),
+        UpdaterWorkerRequest::DownloadAndVerify { operation_id, .. } => (
+            *operation_id,
+            UpdaterEvent::DownloadFailed {
+                operation_id: *operation_id,
+                failure: UpdateFailure::WorkerStopped,
+            },
+        ),
+        UpdaterWorkerRequest::VerifyAndOpenDmg { operation_id, .. } => (
+            *operation_id,
+            UpdaterEvent::OpenCompleted {
+                operation_id: *operation_id,
+                result: Err(UpdateFailure::WorkerStopped),
+            },
+        ),
+    };
+    Some((operation_id, event))
 }
 
 #[cfg(test)]
@@ -946,6 +1002,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct RecordingWorker {
         timeline: Arc<Mutex<Vec<String>>>,
     }
@@ -1024,8 +1081,12 @@ mod tests {
         let worker = RecordingWorker {
             timeline: Arc::clone(&timeline),
         };
-        let mut lane =
-            UpdaterLane::with_boundaries(launch_config(&temp), schedule, clock.clone(), worker);
+        let mut lane = UpdaterLane::with_boundaries(
+            launch_config(&temp),
+            schedule,
+            clock.clone(),
+            move || worker.clone(),
+        );
 
         assert_eq!(lane.launch(), vec![UpdaterRuntimeEffect::ScheduleAt(1_060)]);
         wait_for_timeline(&mut lane, &timeline, 1);
@@ -1077,8 +1138,12 @@ mod tests {
         let worker = RecordingWorker {
             timeline: Arc::clone(&timeline),
         };
-        let mut lane =
-            UpdaterLane::with_boundaries(launch_config(&temp), schedule, clock.clone(), worker);
+        let mut lane = UpdaterLane::with_boundaries(
+            launch_config(&temp),
+            schedule,
+            clock.clone(),
+            move || worker.clone(),
+        );
         let _ = lane.launch();
         wait_for_timeline(&mut lane, &timeline, 1);
 
@@ -1097,9 +1162,317 @@ mod tests {
         );
     }
 
+    fn crash_lane() -> UpdaterLane<RecordingSchedule, FixedClock> {
+        let temp = tempfile::tempdir().unwrap();
+        UpdaterLane::with_boundaries(
+            launch_config(&temp),
+            RecordingSchedule {
+                last_attempt: None,
+                fail_writes: false,
+                timeline: Arc::new(Mutex::new(Vec::new())),
+            },
+            FixedClock::new(1_000),
+            || PanickingWorker,
+        )
+    }
+
+    fn join_crashed_worker(lane: &mut UpdaterLane<RecordingSchedule, FixedClock>) {
+        assert!(lane
+            .worker
+            .as_mut()
+            .unwrap()
+            .worker
+            .take()
+            .unwrap()
+            .join()
+            .is_err());
+    }
+
+    #[test]
+    fn empty_live_channel_does_not_report_a_crash() {
+        let mut lane = crash_lane();
+        assert_eq!(lane.drain_worker_results(), (Vec::new(), false));
+        assert_eq!(lane.state(), &UpdaterState::Idle);
+        assert!(lane.worker.is_some());
+    }
+
+    #[test]
+    fn cache_crash_is_silent_and_retired_once() {
+        let mut lane = crash_lane();
+        lane.launch();
+        join_crashed_worker(&mut lane);
+        assert_eq!(lane.drain_worker_results(), (Vec::new(), true));
+        assert_eq!(lane.state(), &UpdaterState::Idle);
+        assert_eq!(lane.drain_worker_results(), (Vec::new(), false));
+        assert!(lane.worker.is_none());
+    }
+
+    #[test]
+    fn send_failure_before_polling_does_not_get_overwritten_by_stale_cache_failure() {
+        let mut lane = crash_lane();
+        lane.launch();
+        join_crashed_worker(&mut lane);
+        // The UI can request a check before the timer observes the dead channel.
+        lane.manual_check();
+        lane.drain_worker_results();
+        assert!(matches!(
+            lane.state(),
+            UpdaterState::Failed {
+                failure: UpdateFailure::WorkerStopped,
+                retry: crate::updater::RetryAction::ManualCheck,
+                context: None,
+            }
+        ));
+        assert!(lane.worker.is_none());
+    }
+
+    struct RecoveringCheckWorker {
+        crash: bool,
+    }
+
+    impl UpdaterWorkerBoundary for RecoveringCheckWorker {
+        fn execute(&mut self, request: UpdaterWorkerRequest) -> Option<UpdaterWorkerResult> {
+            assert!(!self.crash, "injected crash on first worker generation");
+            let UpdaterWorkerRequest::FetchManifest { operation_id, .. } = request else {
+                panic!("unexpected recovery request");
+            };
+            Some(UpdaterWorkerResult::ManifestFailed {
+                operation_id,
+                failure: UpdateFailure::HttpStatus,
+            })
+        }
+    }
+
+    #[test]
+    fn failed_check_can_complete_again_on_a_recreated_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut generation = 0;
+        let mut lane = UpdaterLane::with_boundaries(
+            launch_config(&temp),
+            RecordingSchedule {
+                last_attempt: None,
+                fail_writes: false,
+                timeline: Arc::new(Mutex::new(Vec::new())),
+            },
+            FixedClock::new(1_000),
+            move || {
+                generation += 1;
+                RecoveringCheckWorker {
+                    crash: generation == 1,
+                }
+            },
+        );
+        lane.manual_check();
+        join_crashed_worker(&mut lane);
+        lane.drain_worker_results();
+        assert!(matches!(
+            lane.state(),
+            UpdaterState::Failed {
+                failure: UpdateFailure::WorkerStopped,
+                ..
+            }
+        ));
+
+        lane.manual_check();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while matches!(lane.state(), UpdaterState::Checking { .. }) {
+            assert!(
+                Instant::now() < deadline,
+                "recreated worker never completed the check"
+            );
+            lane.drain_worker_results();
+            thread::yield_now();
+        }
+        assert!(matches!(
+            lane.state(),
+            UpdaterState::Failed {
+                failure: UpdateFailure::HttpStatus,
+                ..
+            }
+        ));
+        assert!(lane.worker.is_some());
+    }
+
+    #[test]
+    fn automatic_check_crash_preserves_silent_failure_policy() {
+        let mut lane = crash_lane();
+        lane.clock.set(1_060);
+        lane.automatic_check_due();
+        join_crashed_worker(&mut lane);
+        lane.drain_worker_results();
+        assert_eq!(lane.state(), &UpdaterState::Idle);
+        assert!(!lane.manual_check().is_empty());
+        join_crashed_worker(&mut lane);
+        lane.drain_worker_results();
+        assert!(matches!(
+            lane.state(),
+            UpdaterState::Failed {
+                failure: UpdateFailure::WorkerStopped,
+                ..
+            }
+        ));
+    }
+
+    struct CompleteThenCrash;
+
+    impl UpdaterWorkerBoundary for CompleteThenCrash {
+        fn execute(&mut self, request: UpdaterWorkerRequest) -> Option<UpdaterWorkerResult> {
+            match request {
+                UpdaterWorkerRequest::FetchManifest { operation_id, .. } => {
+                    Some(UpdaterWorkerResult::ManifestFailed {
+                        operation_id,
+                        failure: UpdateFailure::HttpStatus,
+                    })
+                }
+                _ => panic!("injected crash after buffered completion"),
+            }
+        }
+    }
+
+    #[test]
+    fn buffered_completion_wins_and_next_check_uses_a_fresh_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let starts = Arc::new(AtomicU64::new(0));
+        let factory_starts = starts.clone();
+        let mut lane = UpdaterLane::with_boundaries(
+            launch_config(&temp),
+            RecordingSchedule {
+                last_attempt: None,
+                fail_writes: false,
+                timeline: Arc::new(Mutex::new(Vec::new())),
+            },
+            FixedClock::new(1_000),
+            move || {
+                factory_starts.fetch_add(1, Ordering::SeqCst);
+                CompleteThenCrash
+            },
+        );
+        for expected_starts in 1..=2 {
+            lane.manual_check();
+            lane.queue_worker(UpdaterWorkerRequest::StoreVerifiedManifest { bytes: vec![] });
+            join_crashed_worker(&mut lane);
+            lane.drain_worker_results();
+            assert!(matches!(
+                lane.state(),
+                UpdaterState::Failed {
+                    failure: UpdateFailure::HttpStatus,
+                    ..
+                }
+            ));
+            assert_eq!(starts.load(Ordering::SeqCst), expected_starts);
+            assert!(lane.worker.is_none());
+        }
+    }
+
+    #[test]
+    fn disconnected_worker_reports_every_unanswered_stage_with_its_operation_id() {
+        let release = Box::new(VerifiedRelease {
+            version: semver::Version::new(1, 0, 6),
+            build: 1,
+            source_commit: "0".repeat(40),
+            minimum_macos: MacOsVersion::parse("13.0").unwrap(),
+            required_model: RequiredModel {
+                id: "test".into(),
+                manifest_sha256: "0".repeat(64),
+            },
+            fresh_install: ArtifactDescriptor {
+                url: "https://example.test/full.dmg".into(),
+                sha256: "1".repeat(64),
+                size: 10,
+            },
+            application_update: ArtifactDescriptor {
+                url: "https://example.test/update.dmg".into(),
+                sha256: "2".repeat(64),
+                size: 5,
+            },
+            published_at: "2026-09-05T00:00:00Z".into(),
+        });
+        let artifact = SelectedArtifact {
+            kind: crate::updater::ArtifactKind::Full,
+            descriptor: release.fresh_install.clone(),
+        };
+        let requests = [
+            UpdaterWorkerRequest::RecheckModel {
+                operation_id: OperationId(11),
+                required_model: release.required_model.clone(),
+            },
+            UpdaterWorkerRequest::DownloadAndVerify {
+                operation_id: OperationId(12),
+                release: release.clone(),
+                artifact: artifact.clone(),
+            },
+            UpdaterWorkerRequest::VerifyAndOpenDmg {
+                operation_id: OperationId(13),
+                release,
+                artifact,
+                expected_path: PathBuf::from("/unused/test.dmg"),
+            },
+        ];
+        let expected = [
+            UpdaterEvent::ModelRecheckFailed {
+                operation_id: OperationId(11),
+                failure: UpdateFailure::WorkerStopped,
+            },
+            UpdaterEvent::DownloadFailed {
+                operation_id: OperationId(12),
+                failure: UpdateFailure::WorkerStopped,
+            },
+            UpdaterEvent::OpenCompleted {
+                operation_id: OperationId(13),
+                result: Err(UpdateFailure::WorkerStopped),
+            },
+        ];
+        for (request, expected) in requests.into_iter().zip(expected) {
+            let mut worker = UpdaterWorkerTask::spawn(PanickingWorker);
+            worker.send(request).unwrap();
+            assert!(worker.worker.take().unwrap().join().is_err());
+            assert_eq!(worker.drain_results(), (vec![expected], true));
+        }
+    }
+
     struct BlockingWorker {
         started: mpsc::Sender<()>,
         release: mpsc::Receiver<()>,
+    }
+
+    struct PanickingWorker;
+
+    impl UpdaterWorkerBoundary for PanickingWorker {
+        fn execute(&mut self, _: UpdaterWorkerRequest) -> Option<UpdaterWorkerResult> {
+            panic!("injected updater worker crash");
+        }
+    }
+
+    #[test]
+    fn worker_crash_finishes_the_active_manual_check() {
+        let temp = tempfile::tempdir().unwrap();
+        let schedule = RecordingSchedule {
+            last_attempt: None,
+            fail_writes: false,
+            timeline: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut lane = UpdaterLane::with_boundaries(
+            launch_config(&temp),
+            schedule,
+            FixedClock::new(1_000),
+            || PanickingWorker,
+        );
+        lane.manual_check();
+        assert!(lane
+            .worker
+            .as_mut()
+            .unwrap()
+            .worker
+            .take()
+            .unwrap()
+            .join()
+            .is_err());
+
+        let (effects, handled) = lane.drain_worker_results();
+
+        assert!(handled, "a disconnected worker must trigger a menu refresh");
+        assert!(effects.is_empty());
+        assert!(matches!(lane.state(), UpdaterState::Failed { .. }));
     }
 
     impl UpdaterWorkerBoundary for BlockingWorker {
@@ -1120,7 +1493,7 @@ mod tests {
     fn dropping_an_active_updater_worker_detaches_without_joining() {
         let (started_sender, started_receiver) = mpsc::channel();
         let (release_sender, release_receiver) = mpsc::channel();
-        let worker = UpdaterWorkerTask::spawn(BlockingWorker {
+        let mut worker = UpdaterWorkerTask::spawn(BlockingWorker {
             started: started_sender,
             release: release_receiver,
         });

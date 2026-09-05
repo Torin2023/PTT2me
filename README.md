@@ -251,6 +251,12 @@ The preflight, builder, and verifier do not publish GitHub Release or the Pages 
 Publication is a separate owner-authorized workflow after Gate A, Gate B,
 Gate C, and the manual P0 gate all pass.
 
+The controlled [AppKit/WebKit insertion fixture](docs/testing/INSERTION_GUI.md)
+checks final field contents, focus changes, password rejection, and clipboard
+preservation through the production insertion modules. CI builds the fixture;
+execution requires a macOS GUI session with Accessibility and event-posting
+access. The manual P0 checklist also includes a short ChatGPT draft check.
+
 ## Updating (PTT2me 1.1.2)
 
 Preview 1.0.5 cannot discover this release. Versions 1.1.0 and 1.1.1 can check

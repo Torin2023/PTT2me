@@ -36,6 +36,9 @@ jobs:
       - name: Run shell contract tests
         run: bash scripts/test-shell-contracts.sh
 
+      - name: Build AppKit and WebKit insertion fixture
+        run: bash scripts/test-insertion-gui.sh --build-only
+
       - name: Deny Clippy warnings
         run: cargo clippy --all-targets --features test-support -- -D warnings
 
