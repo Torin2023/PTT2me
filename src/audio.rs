@@ -383,7 +383,9 @@ mod tests {
         let samples = recorder.stop().unwrap().unwrap();
 
         assert_eq!(samples.len(), 1_600);
-        assert!(samples[160..1_440].iter().all(|sample| sample.abs() < 0.001));
+        assert!(samples[160..1_440]
+            .iter()
+            .all(|sample| sample.abs() < 0.001));
     }
 
     #[test]
