@@ -69,6 +69,7 @@ pub enum AppEvent {
     PermissionMigrationCompleted,
     PermissionMigrationFailed,
     ModelLoaded(Result<(), String>),
+    AsrTimedOut,
     PermissionsChanged(PermissionSnapshot),
     TriggerPressed,
     TriggerReleased { short: bool },
@@ -149,6 +150,14 @@ impl AppController {
             AppEvent::ModelLoaded(Ok(())) => {
                 self.model_ready = true;
                 self.enter_idle_state()
+            }
+            AppEvent::AsrTimedOut => {
+                self.model_ready = false;
+                self.status = AppStatus::Error {
+                    message: "Распознавание не отвечает. Перезапустите PTT2me",
+                    recoverable: false,
+                };
+                Vec::new()
             }
             AppEvent::ModelLoaded(Err(_)) => {
                 self.model_ready = false;
@@ -518,6 +527,30 @@ mod tests {
             .handle(AppEvent::RecognitionFinished(Ok(" \n\t ".into())))
             .is_empty());
         assert_eq!(c.status(), &AppStatus::Ready);
+    }
+
+    #[test]
+    fn asr_timeout_blocks_new_dictation_and_cannot_be_reset_by_permissions() {
+        let mut c = AppController::recognizing_for_test();
+        assert!(c.handle(AppEvent::AsrTimedOut).is_empty());
+        let timed_out = c.status().clone();
+        assert!(matches!(
+            timed_out,
+            AppStatus::Error {
+                recoverable: false,
+                ..
+            }
+        ));
+        for event in [
+            AppEvent::ErrorTimerFired,
+            AppEvent::TriggerPressed,
+            AppEvent::PermissionsChanged(PermissionSnapshot::all()),
+            AppEvent::RecognitionFinished(Ok("late result".into())),
+            AppEvent::EventTapRestored,
+        ] {
+            assert!(c.handle(event).is_empty());
+            assert_eq!(c.status(), &timed_out);
+        }
     }
 
     #[test]
