@@ -832,7 +832,9 @@ impl Runtime {
         match error {
             AsrTaskError::TimedOut(_) => self.dispatch(AppEvent::AsrTimedOut),
             AsrTaskError::Disconnected | AsrTaskError::UnexpectedOperation => {
-                self.dispatch(AppEvent::ModelLoaded(Err("ASR worker unavailable".to_owned())));
+                self.dispatch(AppEvent::ModelLoaded(Err(
+                    "ASR worker unavailable".to_owned()
+                )));
             }
         }
     }

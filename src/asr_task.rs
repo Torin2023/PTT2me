@@ -185,7 +185,10 @@ mod tests {
         assert_eq!(task.poll(later), None);
         task.send(AsrCommand::Transcribe(vec![0.25]), later)
             .unwrap();
-        assert!(matches!(commands.recv().unwrap(), AsrCommand::Transcribe(_)));
+        assert!(matches!(
+            commands.recv().unwrap(),
+            AsrCommand::Transcribe(_)
+        ));
         events
             .send(AsrEvent::Recognized(Ok("привет".into())))
             .unwrap();
