@@ -55,10 +55,31 @@ trait PasteCommand {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AccessibilityFailure {
+    stage: &'static str,
+    attribute: Option<&'static str>,
+    error_code: Option<i32>,
+}
+
+impl AccessibilityFailure {
+    const fn new(
+        stage: &'static str,
+        attribute: Option<&'static str>,
+        error_code: Option<i32>,
+    ) -> Self {
+        Self {
+            stage,
+            attribute,
+            error_code,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InsertError {
     EmptyText,
     SecureField,
-    Accessibility,
+    Accessibility(AccessibilityFailure),
     PasteboardSnapshot,
     PasteboardWrite,
     PasteboardRestore,
@@ -66,18 +87,68 @@ pub enum InsertError {
     KeyboardEvent,
 }
 
+impl InsertError {
+    pub(crate) const fn accessibility(
+        stage: &'static str,
+        attribute: Option<&'static str>,
+        error_code: Option<i32>,
+    ) -> Self {
+        Self::Accessibility(AccessibilityFailure::new(stage, attribute, error_code))
+    }
+
+    pub(crate) const fn kind(self) -> &'static str {
+        match self {
+            Self::EmptyText => "empty_text",
+            Self::SecureField => "secure_field",
+            Self::Accessibility(_) => "accessibility",
+            Self::PasteboardSnapshot => "pasteboard_snapshot",
+            Self::PasteboardWrite => "pasteboard_write",
+            Self::PasteboardRestore => "pasteboard_restore",
+            Self::EventSource => "event_source",
+            Self::KeyboardEvent => "keyboard_event",
+        }
+    }
+
+    pub(crate) const fn diagnostic_stage(self) -> Option<&'static str> {
+        match self {
+            Self::Accessibility(failure) => Some(failure.stage),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn ax_attribute(self) -> Option<&'static str> {
+        match self {
+            Self::Accessibility(failure) => failure.attribute,
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn ax_error_code(self) -> Option<i32> {
+        match self {
+            Self::Accessibility(failure) => failure.error_code,
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for InsertError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::EmptyText => "cannot insert empty text",
-            Self::SecureField => "cannot insert into a secure text field",
-            Self::Accessibility => "could not inspect the focused field through Accessibility",
-            Self::PasteboardSnapshot => "could not snapshot the pasteboard",
-            Self::PasteboardWrite => "could not write to the pasteboard",
-            Self::PasteboardRestore => "could not restore the pasteboard",
-            Self::EventSource => "could not create a keyboard event source",
-            Self::KeyboardEvent => "could not create a paste keyboard event",
-        })
+        match self {
+            Self::EmptyText => formatter.write_str("cannot insert empty text"),
+            Self::SecureField => formatter.write_str("cannot insert into a secure text field"),
+            Self::Accessibility(failure) => write!(
+                formatter,
+                "could not inspect the focused field through Accessibility (stage={}, attribute={:?}, ax_error={:?})",
+                failure.stage,
+                failure.attribute,
+                failure.error_code
+            ),
+            Self::PasteboardSnapshot => formatter.write_str("could not snapshot the pasteboard"),
+            Self::PasteboardWrite => formatter.write_str("could not write to the pasteboard"),
+            Self::PasteboardRestore => formatter.write_str("could not restore the pasteboard"),
+            Self::EventSource => formatter.write_str("could not create a keyboard event source"),
+            Self::KeyboardEvent => formatter.write_str("could not create a paste keyboard event"),
+        }
     }
 }
 
