@@ -57,6 +57,13 @@ the captured phrase, and inserts a
 non-empty result into whichever editable field owns the cursor at that moment.
 A capture ends automatically after 25 seconds.
 
+Completed microphone captures are converted to mono 16 kHz for GigaAM. When
+the device rate differs, a windowed-sinc filter prevents high-frequency noise
+from folding into the speech band during conversion. Native 16 kHz audio is
+passed through unchanged. See [audio quality checks](docs/audio-quality.md)
+for the signal tests and the listening/recognition comparison still required
+on a Mac; signal fidelity alone does not establish a reduction in word errors.
+
 Insertion uses Accessibility to inspect the focused field and rejects secure
 text fields. For ordinary text, PTT2me temporarily uses the full macOS
 pasteboard and Command-V so browser and web-based editors receive a normal

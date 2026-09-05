@@ -8,6 +8,8 @@ use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS, SAMPLE_RATE};
 
+mod resampler;
+
 // The runtime still stops a capture at 25 seconds. Storage also covers the
 // release tail and delayed timer delivery so a valid near-limit capture is not
 // misclassified as overflow.
@@ -340,34 +342,16 @@ fn normalize_u16(sample: u16) -> f32 {
 }
 
 fn prepare_capture(samples: Vec<f32>, source_rate: u32) -> Option<Vec<f32>> {
-    (!samples.is_empty()).then(|| resample_linear(&samples, source_rate, SAMPLE_RATE))
-}
-
-fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
-    if samples.is_empty() || source_rate == 0 || target_rate == 0 {
-        return Vec::new();
-    }
-    if source_rate == target_rate {
-        return samples.to_vec();
-    }
-
-    let output_len = samples.len() * target_rate as usize / source_rate as usize;
-    (0..output_len)
-        .map(|index| {
-            let position = index as f64 * source_rate as f64 / target_rate as f64;
-            let left = position as usize;
-            let right = (left + 1).min(samples.len() - 1);
-            let fraction = (position - left as f64) as f32;
-            samples[left] + (samples[right] - samples[left]) * fraction
-        })
-        .collect()
+    // Capture has stopped: no filtering or allocation runs in the CPAL callback.
+    let samples = resampler::resample(samples, source_rate, SAMPLE_RATE);
+    (!samples.is_empty()).then_some(samples)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         append_frames, capture_buffer, capture_capacity, normalize_i16, normalize_u16,
-        prepare_capture, resample_linear, AudioError, AudioRecorder,
+        prepare_capture, AudioError, AudioRecorder,
     };
     use crate::runtime::capture_result_event;
     use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
@@ -385,7 +369,21 @@ mod tests {
     #[test]
     fn resample_48k_to_16k_has_expected_length() {
         let input = vec![0.25; 48_000];
-        assert_eq!(resample_linear(&input, 48_000, 16_000).len(), 16_000);
+        assert_eq!(prepare_capture(input, 48_000).unwrap().len(), 16_000);
+    }
+
+    #[test]
+    fn stop_filters_high_frequency_noise_before_recognition() {
+        let frames = (0..4_800)
+            .map(|index| (std::f64::consts::TAU * 12_000.0 * index as f64 / 48_000.0).cos() as f32)
+            .collect();
+        let mut recorder = AudioRecorder::with_test_frames(frames, 48_000, 1);
+        recorder.start().unwrap();
+
+        let samples = recorder.stop().unwrap().unwrap();
+
+        assert_eq!(samples.len(), 1_600);
+        assert!(samples[160..1_440].iter().all(|sample| sample.abs() < 0.001));
     }
 
     #[test]
@@ -434,6 +432,7 @@ mod tests {
     #[test]
     fn empty_capture_returns_none() {
         assert_eq!(prepare_capture(Vec::new(), 48_000), None);
+        assert_eq!(prepare_capture(vec![0.25], 48_000), None);
     }
 
     #[test]
