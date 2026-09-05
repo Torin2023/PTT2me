@@ -1,4 +1,12 @@
-import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  cp,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 
@@ -20,6 +28,48 @@ function normalizeBasePath(basePath) {
     throw new Error("GitHub Pages base path must start with /");
   }
   return basePath.replace(/\/+$/, "");
+}
+
+function hoistStreamedHeadMetadata(html) {
+  const metadata = [];
+  let rewritten = html.replace(
+    /<div\b(?=[^>]*\bid=(["'])S:\d+\1)[^>]*>\s*<div\b(?=[^>]*\bhidden\b)[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi,
+    (segment, _quote, markup) => {
+      const metadataMarkup = markup.replace(
+        /<script\b[^>]*>[\s\S]*?<\/script\s*>/gi,
+        "",
+      );
+      const nonMetadataMarkup = metadataMarkup
+        .replace(/<title\b[^>]*>[\s\S]*?<\/title\s*>/gi, "")
+        .replace(/<(?:base|link|meta)\b[^>]*\/?\s*>/gi, "")
+        .trim();
+
+      if (nonMetadataMarkup !== "") {
+        return segment;
+      }
+
+      metadata.push(metadataMarkup);
+      return "";
+    },
+  );
+
+  if (metadata.length > 0) {
+    if (!/<\/head\s*>/i.test(rewritten)) {
+      throw new Error("Rendered site contains streamed metadata without a head");
+    }
+    rewritten = rewritten.replace(
+      /<\/head\s*>/i,
+      `${metadata.join("")}</head>`,
+    );
+  }
+
+  return rewritten
+    .replace(
+      /<div\b[^>]*>\s*<!--\$\?-->\s*<template\b(?=[^>]*\bid=(["'])B:\d+\1)[^>]*>\s*<\/template>\s*<!--\/\$-->\s*<\/div>/gi,
+      "",
+    )
+    .replace(/<!--(?:\$|\$\?|\/\$)-->/g, "")
+    .replace(/\sdata-vinext-streamed-icon=(["'])[^"']*\1/gi, "");
 }
 
 export function rewritePageHtml(html, { basePath, origin }) {
@@ -50,7 +100,40 @@ export function rewritePageHtml(html, { basePath, origin }) {
     );
   }
 
-  return rewritten;
+  rewritten = hoistStreamedHeadMetadata(rewritten);
+
+  return rewritten
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
+    .replace(
+      /<link\b[^>]*\brel=(["'])modulepreload\1[^>]*\/?\s*>/gi,
+      "",
+    )
+    .replace(
+      /<link\b(?=[^>]*\brel=(["'])preload\1)(?=[^>]*\bas=(["'])script\2)[^>]*\/?\s*>/gi,
+      "",
+    );
+}
+
+async function removeJavaScriptAssets(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+
+  await Promise.all(
+    entries.map(async (entry) => {
+      const path = resolve(directory, entry.name);
+
+      if (entry.isDirectory()) {
+        await removeJavaScriptAssets(path);
+        if ((await readdir(path)).length === 0) {
+          await rm(path, { recursive: true });
+        }
+        return;
+      }
+
+      if (/\.(?:c|m)?js(?:\.map)?$/i.test(entry.name)) {
+        await rm(path);
+      }
+    }),
+  );
 }
 
 export async function exportGitHubPages({
@@ -74,6 +157,7 @@ export async function exportGitHubPages({
     rm(resolve(outputDirectory, "_headers"), { force: true }),
     rm(resolve(outputDirectory, ".assetsignore"), { force: true }),
   ]);
+  await removeJavaScriptAssets(outputDirectory);
 
   const workerUrl = pathToFileURL(workerPath);
   workerUrl.searchParams.set("github-pages-export", `${process.pid}-${Date.now()}`);
