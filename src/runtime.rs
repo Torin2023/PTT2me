@@ -446,7 +446,7 @@ impl PasteInsertion for PendingTextInsertion {
 
 trait PasteFlowBoundary {
     fn schedule(&mut self, kind: TimerKind, delay_ms: u64);
-    fn finish_and_drain_hotkeys(&mut self, result: Result<(), String>);
+    fn finish_and_drain_hotkeys(&mut self, result: Result<(), InsertError>);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,17 +480,14 @@ impl<I: PasteInsertion> PasteFlow<I> {
                             .schedule(TimerKind::RestorePasteboard, PASTEBOARD_RESTORE_DELAY_MS);
                     }
                     Err(primary) => {
-                        let _ = self.insertion.restore_after_paste_failure(primary);
+                        let error = self.insertion.restore_after_paste_failure(primary);
                         self.state = PasteFlowState::Finished;
-                        boundary.finish_and_drain_hotkeys(Err("insert failed".to_owned()));
+                        boundary.finish_and_drain_hotkeys(Err(error));
                     }
                 }
             }
             (PasteFlowState::AwaitingRestore, TimerKind::RestorePasteboard) => {
-                let result = self
-                    .insertion
-                    .restore()
-                    .map_err(|_| "insert failed".to_owned());
+                let result = self.insertion.restore();
                 self.state = PasteFlowState::Finished;
                 boundary.finish_and_drain_hotkeys(result);
             }
@@ -1318,8 +1315,8 @@ impl Runtime {
                         let flow = PasteFlow::begin(insertion, self);
                         self.pending_insertion = Some(flow);
                     }
-                    Err(_) => {
-                        tracing::warn!(error_category = "text_insertion");
+                    Err(error) => {
+                        log_text_insertion_error(error);
                         self.dispatch(AppEvent::PasteFinished(Err("insert failed".to_owned())));
                     }
                 }
@@ -1432,18 +1429,31 @@ impl PasteFlowBoundary for Runtime {
         self.replace_insertion_timer(kind, delay_ms);
     }
 
-    fn finish_and_drain_hotkeys(&mut self, result: Result<(), String>) {
+    fn finish_and_drain_hotkeys(&mut self, result: Result<(), InsertError>) {
         cancel_timer(&self.run_loop, &mut self.insertion_timer);
         if result.is_ok() {
             tracing::debug!(method = "clipboard", lifecycle = "text_inserted");
-        } else {
-            tracing::warn!(error_category = "text_insertion");
+        } else if let Err(error) = result {
+            log_text_insertion_error(error);
         }
-        self.dispatch(AppEvent::PasteFinished(result));
+        self.dispatch(AppEvent::PasteFinished(
+            result.map_err(|_| "insert failed".to_owned()),
+        ));
         self.drain_menu_commands();
         self.drain_hotkey_events();
         self.try_orderly_quit();
     }
+}
+
+fn log_text_insertion_error(error: InsertError) {
+    tracing::warn!(
+        error_category = "text_insertion",
+        error_kind = error.kind(),
+        diagnostic_stage = ?error.diagnostic_stage(),
+        ax_attribute = ?error.ax_attribute(),
+        ax_error_code = ?error.ax_error_code(),
+        error = %error,
+    );
 }
 
 pub(crate) fn capture_result_event(result: Result<Option<Vec<f32>>, AudioError>) -> AppEvent {
@@ -2115,7 +2125,7 @@ mod tests {
                 }
             }
 
-            fn finish_and_drain_hotkeys(&mut self, result: Result<(), String>) {
+            fn finish_and_drain_hotkeys(&mut self, result: Result<(), InsertError>) {
                 assert_eq!(result, Ok(()));
                 self.events.borrow_mut().push("finish");
                 self.events.borrow_mut().push("drain_hotkeys");
@@ -2147,6 +2157,47 @@ mod tests {
                 "drain_hotkeys",
             ]
         );
+    }
+
+    #[test]
+    fn paste_flow_preserves_insert_error_for_runtime_diagnostics() {
+        struct FailingInsertion;
+
+        impl PasteInsertion for FailingInsertion {
+            fn paste(&mut self) -> Result<(), InsertError> {
+                Err(InsertError::KeyboardEvent)
+            }
+
+            fn restore(&mut self) -> Result<(), InsertError> {
+                Ok(())
+            }
+
+            fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {
+                primary
+            }
+        }
+
+        struct RecordingBoundary {
+            result: Rc<RefCell<Option<Result<(), InsertError>>>>,
+        }
+
+        impl PasteFlowBoundary for RecordingBoundary {
+            fn schedule(&mut self, _kind: TimerKind, _delay_ms: u64) {}
+
+            fn finish_and_drain_hotkeys(&mut self, result: Result<(), InsertError>) {
+                *self.result.borrow_mut() = Some(result);
+            }
+        }
+
+        let result = Rc::new(RefCell::new(None));
+        let mut boundary = RecordingBoundary {
+            result: Rc::clone(&result),
+        };
+        let mut flow = PasteFlow::begin(FailingInsertion, &mut boundary);
+
+        flow.handle_timer(TimerKind::PasteCommand, &mut boundary);
+
+        assert_eq!(*result.borrow(), Some(Err(InsertError::KeyboardEvent)));
     }
 
     #[test]
@@ -2201,7 +2252,7 @@ mod tests {
                 }
             }
 
-            fn finish_and_drain_hotkeys(&mut self, _result: Result<(), String>) {
+            fn finish_and_drain_hotkeys(&mut self, _result: Result<(), InsertError>) {
                 panic!("paste flow must not finish after scheduling panic");
             }
         }

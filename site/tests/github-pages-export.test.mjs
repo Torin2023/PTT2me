@@ -31,10 +31,7 @@ test("rewrites local site assets for the GitHub Pages project path", () => {
 
   assert.match(rewritten, /href="\/PTT2me\/assets\/site\.css"/);
   assert.match(rewritten, /url\(\/PTT2me\/assets\/font\.woff2\)/);
-  assert.match(
-    rewritten,
-    /src="\/PTT2me\/_next\/static\/chunks\/site\.js"/,
-  );
+  assert.doesNotMatch(rewritten, /<script\b/i);
   assert.match(
     rewritten,
     /url\(\/PTT2me\/_next\/static\/_vinext_fonts\/geist\/font\.woff2\)/,
@@ -59,6 +56,64 @@ test("rewrites local site assets for the GitHub Pages project path", () => {
   );
 });
 
+test("removes client JavaScript from the static GitHub Pages HTML", () => {
+  const html = [
+    '<link rel="stylesheet" href="/_next/static/css/site.css">',
+    '<link rel="modulepreload" href="/_next/static/chunks/site.js">',
+    '<link rel="preload" as="script" href="/_next/static/chunks/runtime.js">',
+    '<script src="/_next/static/chunks/runtime.js" type="module"></script>',
+    '<script>self.__next_f.push([1,"payload"])</script>',
+    '<main><h1>Говорите — текст уже там.</h1></main>',
+  ].join("");
+
+  const rewritten = rewritePageHtml(html, {
+    basePath: "/PTT2me",
+    origin: "https://torin2023.github.io",
+  });
+
+  assert.doesNotMatch(rewritten, /<script\b/i);
+  assert.doesNotMatch(rewritten, /rel="modulepreload"/i);
+  assert.doesNotMatch(rewritten, /rel="preload"[^>]*as="script"/i);
+  assert.match(
+    rewritten,
+    /href="\/PTT2me\/_next\/static\/css\/site\.css"/,
+  );
+  assert.match(rewritten, /<main><h1>Говорите — текст уже там\.<\/h1><\/main>/);
+});
+
+test("moves streamed metadata into head and removes streaming scaffolding", () => {
+  const html = [
+    "<!DOCTYPE html><html><head>",
+    '<meta charSet="utf-8"/>',
+    "</head><body><main>PTT2me</main>",
+    '<div hidden=""><!--$?--><template id="B:0"></template><!--/$--></div>',
+    '<div hidden id="S:0"><div hidden="">',
+    "<title>PTT2me — локальная диктовка для macOS</title>",
+    '<meta name="description" content="Локальная диктовка.">',
+    '<meta property="og:title" content="PTT2me">',
+    '<meta name="twitter:card" content="summary_large_image">',
+    '<link data-vinext-streamed-icon="/:test:0" rel="icon" href="/favicon.svg">',
+    "<script>document.head.append(document.querySelector('link[rel=icon]'))</script>",
+    "</div></div></body></html>",
+  ].join("");
+
+  const rewritten = rewritePageHtml(html, {
+    basePath: "/PTT2me",
+    origin: "https://torin2023.github.io",
+  });
+  const head = rewritten.match(/<head>([\s\S]*?)<\/head>/i)?.[1] ?? "";
+
+  assert.match(head, /<title>PTT2me — локальная диктовка для macOS<\/title>/);
+  assert.match(head, /<meta name="description" content="Локальная диктовка\.">/);
+  assert.match(head, /<meta property="og:title" content="PTT2me">/);
+  assert.match(head, /<meta name="twitter:card" content="summary_large_image">/);
+  assert.match(head, /<link rel="icon" href="\/PTT2me\/favicon\.svg">/);
+  assert.doesNotMatch(rewritten, /\bid="S:\d+"/i);
+  assert.doesNotMatch(rewritten, /\bid="B:\d+"/i);
+  assert.doesNotMatch(rewritten, /data-vinext-streamed-icon/i);
+  assert.doesNotMatch(rewritten, /<!--\$\??-->|<!--\/\$-->/);
+});
+
 test("exports a deployable static site without the server bundle", async () => {
   const outputDirectory = await mkdtemp(join(tmpdir(), "ptt2me-pages-test-"));
 
@@ -73,12 +128,26 @@ test("exports a deployable static site without the server bundle", async () => {
     const html = await readFile(join(outputDirectory, "index.html"), "utf8");
     assert.match(html, /Preview 1\.1\.2/);
     assert.match(html, /\/PTT2me\/_next\/static\//);
+    assert.doesNotMatch(html, /<script\b/i);
+    assert.doesNotMatch(html, /rel="modulepreload"/i);
+    assert.doesNotMatch(html, /rel="preload"[^>]*as="script"/i);
     assert.doesNotMatch(html, /http:\/\/localhost/);
     assert.doesNotMatch(html, /\/\.vinext\/fonts\//);
     assert.doesNotMatch(html, /\/(?:private|Users|home)\/[^"'()\s]+/);
+    const head = html.match(/<head>([\s\S]*?)<\/head>/i)?.[1] ?? "";
+    assert.match(head, /<title>PTT2me — локальная диктовка для macOS<\/title>/);
+    assert.match(head, /<meta name="description"/);
+    assert.match(head, /<meta property="og:title"/);
+    assert.match(head, /<meta name="twitter:card"/);
+    assert.match(head, /<link[^>]*rel="icon"/);
+    assert.doesNotMatch(html, /\bid="S:\d+"/i);
+    assert.doesNotMatch(html, /\bid="B:\d+"/i);
+    assert.doesNotMatch(html, /data-vinext-streamed-icon/i);
 
     await access(join(outputDirectory, ".nojekyll"));
-    await access(join(outputDirectory, "_next", "static", "chunks"));
+    await assert.rejects(
+      access(join(outputDirectory, "_next", "static", "chunks")),
+    );
     await access(
       join(outputDirectory, "_next", "static", "_vinext_fonts"),
     );

@@ -10,11 +10,18 @@ type AXUIElementRef = *const c_void;
 type AXError = i32;
 
 const AX_SUCCESS: AXError = 0;
+const AX_ERROR_ATTRIBUTE_UNSUPPORTED: AXError = -25205;
 const AX_ERROR_NO_VALUE: AXError = -25212;
 const AX_FOCUSED_UI_ELEMENT_ATTRIBUTE: &str = "AXFocusedUIElement";
 const AX_ROLE_ATTRIBUTE: &str = "AXRole";
 const AX_SUBROLE_ATTRIBUTE: &str = "AXSubrole";
 const AX_SECURE_TEXT_FIELD_SUBROLE: &str = "AXSecureTextField";
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AxAttributeRequirement {
+    Required,
+    Optional,
+}
 
 pub(crate) trait AccessibilityProbe {
     fn ensure_not_secure(&mut self) -> Result<(), InsertError>;
@@ -51,32 +58,45 @@ impl AccessibilityProbe for SystemAccessibility {
     fn ensure_not_secure(&mut self) -> Result<(), InsertError> {
         let system = unsafe { AXUIElementCreateSystemWide() };
         if system.is_null() {
-            return Err(InsertError::Accessibility);
+            return Err(InsertError::accessibility("create_system_wide", None, None));
         }
         let system = unsafe { CFType::wrap_under_create_rule(system.cast()) };
-        let focused_attribute = CFString::from_static_string(AX_FOCUSED_UI_ELEMENT_ATTRIBUTE);
 
         let focused = copy_ax_attribute(
             system.as_CFTypeRef().cast(),
-            focused_attribute.as_concrete_TypeRef(),
+            AX_FOCUSED_UI_ELEMENT_ATTRIBUTE,
+            AxAttributeRequirement::Required,
         )?
-        .ok_or(InsertError::Accessibility)?;
+        .ok_or_else(|| {
+            InsertError::accessibility(
+                "missing_attribute",
+                Some(AX_FOCUSED_UI_ELEMENT_ATTRIBUTE),
+                None,
+            )
+        })?;
         let focused_ref = focused.as_CFTypeRef().cast();
 
-        let role_attribute = CFString::from_static_string(AX_ROLE_ATTRIBUTE);
-        let role = copy_ax_attribute(focused_ref, role_attribute.as_concrete_TypeRef())?
-            .ok_or(InsertError::Accessibility)?
-            .downcast_into::<CFString>()
-            .ok_or(InsertError::Accessibility)?;
+        let role = copy_ax_attribute(
+            focused_ref,
+            AX_ROLE_ATTRIBUTE,
+            AxAttributeRequirement::Required,
+        )?
+        .ok_or_else(|| {
+            InsertError::accessibility("missing_attribute", Some(AX_ROLE_ATTRIBUTE), None)
+        })?
+        .downcast_into::<CFString>()
+        .ok_or_else(|| {
+            InsertError::accessibility("decode_attribute", Some(AX_ROLE_ATTRIBUTE), None)
+        })?;
 
-        let subrole_attribute = CFString::from_static_string(AX_SUBROLE_ATTRIBUTE);
-        let subrole = match copy_ax_attribute(focused_ref, subrole_attribute.as_concrete_TypeRef())?
-        {
-            Some(value) => Some(
-                value
-                    .downcast_into::<CFString>()
-                    .ok_or(InsertError::Accessibility)?,
-            ),
+        let subrole = match copy_ax_attribute(
+            focused_ref,
+            AX_SUBROLE_ATTRIBUTE,
+            AxAttributeRequirement::Optional,
+        )? {
+            Some(value) => Some(value.downcast_into::<CFString>().ok_or_else(|| {
+                InsertError::accessibility("decode_attribute", Some(AX_SUBROLE_ATTRIBUTE), None)
+            })?),
             None => None,
         };
         let role = role.to_string();
@@ -94,21 +114,46 @@ fn is_secure_ax_field(role: &str, subrole: Option<&str>) -> bool {
 
 fn copy_ax_attribute(
     element: AXUIElementRef,
-    attribute: CFStringRef,
+    attribute: &'static str,
+    requirement: AxAttributeRequirement,
 ) -> Result<Option<CFType>, InsertError> {
+    let attribute_name = CFString::from_static_string(attribute);
     let mut value: CFTypeRef = null();
-    let status = unsafe { AXUIElementCopyAttributeValue(element, attribute, &mut value) };
-    match ax_attribute_has_value(status, value.is_null())? {
+    let status = unsafe {
+        AXUIElementCopyAttributeValue(element, attribute_name.as_concrete_TypeRef(), &mut value)
+    };
+    match classify_ax_attribute(status, value.is_null(), attribute, requirement)? {
         true => Ok(Some(unsafe { CFType::wrap_under_create_rule(value) })),
-        false => Ok(None),
+        false => {
+            tracing::debug!(
+                lifecycle = "accessibility_optional_attribute_unavailable",
+                diagnostic_stage = "copy_attribute",
+                ax_attribute = attribute,
+                ax_error_code = status,
+            );
+            Ok(None)
+        }
     }
 }
 
-fn ax_attribute_has_value(status: AXError, value_is_null: bool) -> Result<bool, InsertError> {
-    match (status, value_is_null) {
-        (AX_SUCCESS, false) => Ok(true),
-        (AX_ERROR_NO_VALUE, true) => Ok(false),
-        _ => Err(InsertError::Accessibility),
+fn classify_ax_attribute(
+    status: AXError,
+    value_is_null: bool,
+    attribute: &'static str,
+    requirement: AxAttributeRequirement,
+) -> Result<bool, InsertError> {
+    match (status, value_is_null, requirement) {
+        (AX_SUCCESS, false, _) => Ok(true),
+        (
+            AX_ERROR_ATTRIBUTE_UNSUPPORTED | AX_ERROR_NO_VALUE,
+            true,
+            AxAttributeRequirement::Optional,
+        ) => Ok(false),
+        _ => Err(InsertError::accessibility(
+            "copy_attribute",
+            Some(attribute),
+            Some(status),
+        )),
     }
 }
 
@@ -181,8 +226,10 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        ax_attribute_has_value, begin_with, is_secure_ax_field, paste_with, AccessibilityProbe,
-        ClipboardInsertion, ClipboardPaste, AX_ERROR_NO_VALUE, AX_SUCCESS,
+        begin_with, classify_ax_attribute, is_secure_ax_field, paste_with, AccessibilityProbe,
+        AxAttributeRequirement, ClipboardInsertion, ClipboardPaste, AX_ERROR_ATTRIBUTE_UNSUPPORTED,
+        AX_ERROR_NO_VALUE, AX_ROLE_ATTRIBUTE, AX_SECURE_TEXT_FIELD_SUBROLE, AX_SUBROLE_ATTRIBUTE,
+        AX_SUCCESS,
     };
     use crate::inserter::InsertError;
 
@@ -282,11 +329,12 @@ mod tests {
 
     #[test]
     fn accessibility_probe_error_is_terminal() {
-        let (mut ax, mut clipboard, calls, _texts) = boundaries(Err(InsertError::Accessibility));
+        let error = InsertError::accessibility("test_probe", None, None);
+        let (mut ax, mut clipboard, calls, _texts) = boundaries(Err(error));
 
         let outcome = begin_with("текст", false, &mut ax, &mut clipboard);
 
-        assert_eq!(outcome, Err(InsertError::Accessibility));
+        assert_eq!(outcome, Err(error));
         assert_eq!(calls.borrow().as_slice(), ["ax"]);
     }
 
@@ -325,16 +373,45 @@ mod tests {
 
     #[test]
     fn ax_attribute_errors_are_not_treated_as_missing_values() {
-        assert_eq!(ax_attribute_has_value(AX_SUCCESS, false), Ok(true));
-        assert_eq!(ax_attribute_has_value(AX_ERROR_NO_VALUE, true), Ok(false));
+        let optional = AxAttributeRequirement::Optional;
         assert_eq!(
-            ax_attribute_has_value(-25204, true),
-            Err(InsertError::Accessibility)
+            classify_ax_attribute(AX_SUCCESS, false, AX_SUBROLE_ATTRIBUTE, optional),
+            Ok(true)
         );
         assert_eq!(
-            ax_attribute_has_value(AX_SUCCESS, true),
-            Err(InsertError::Accessibility)
+            classify_ax_attribute(AX_ERROR_NO_VALUE, true, AX_SUBROLE_ATTRIBUTE, optional),
+            Ok(false)
         );
+        assert!(classify_ax_attribute(-25204, true, AX_SUBROLE_ATTRIBUTE, optional).is_err());
+        assert!(classify_ax_attribute(AX_SUCCESS, true, AX_SUBROLE_ATTRIBUTE, optional).is_err());
+    }
+
+    #[test]
+    fn unsupported_optional_ax_attribute_is_treated_as_missing() {
+        assert_eq!(
+            classify_ax_attribute(
+                AX_ERROR_ATTRIBUTE_UNSUPPORTED,
+                true,
+                AX_SUBROLE_ATTRIBUTE,
+                AxAttributeRequirement::Optional,
+            ),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn unsupported_required_ax_attribute_keeps_attribute_and_error_code() {
+        let error = classify_ax_attribute(
+            AX_ERROR_ATTRIBUTE_UNSUPPORTED,
+            true,
+            AX_ROLE_ATTRIBUTE,
+            AxAttributeRequirement::Required,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.diagnostic_stage(), Some("copy_attribute"));
+        assert_eq!(error.ax_attribute(), Some(AX_ROLE_ATTRIBUTE));
+        assert_eq!(error.ax_error_code(), Some(AX_ERROR_ATTRIBUTE_UNSUPPORTED));
     }
 
     #[test]
@@ -350,6 +427,7 @@ mod tests {
 
     #[test]
     fn secure_text_field_is_detected_from_ax_subrole() {
+        assert!(is_secure_ax_field(AX_SECURE_TEXT_FIELD_SUBROLE, None));
         assert!(is_secure_ax_field("AXTextField", Some("AXSecureTextField")));
         assert!(!is_secure_ax_field("AXTextField", None));
         assert!(!is_secure_ax_field("AXTextArea", Some("AXStandardWindow")));
