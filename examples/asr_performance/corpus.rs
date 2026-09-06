@@ -299,6 +299,30 @@ mod tests {
         (directory, manifest_path)
     }
 
+    fn read_manifest(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    fn write_manifest(path: &Path, manifest: &serde_json::Value) {
+        fs::write(path, serde_json::to_vec(manifest).unwrap()).unwrap();
+    }
+
+    fn update_single_case_manifest(
+        path: &Path,
+        update: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) {
+        let mut manifest = read_manifest(path);
+        let entry = manifest
+            .as_array_mut()
+            .unwrap()
+            .first_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        update(entry);
+        write_manifest(path, &manifest);
+    }
+
     #[test]
     fn decodes_only_mono_16khz_pcm16_wav() {
         let decoded = decode_mono_pcm16_wav(&wav(1, 16_000, 16, &[-32_768, 0, 32_767])).unwrap();
@@ -346,5 +370,122 @@ mod tests {
 
         fs::write(&manifest, vec![b' '; MAX_MANIFEST_BYTES as usize + 1]).unwrap();
         assert!(load(&manifest).is_err());
+    }
+
+    #[test]
+    fn rejects_manifest_and_wav_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, manifest) = corpus_fixture();
+        let manifest_link = directory.path().join("corpus-link.json");
+        symlink(&manifest, &manifest_link).unwrap();
+        assert_eq!(
+            load(&manifest_link).err().unwrap(),
+            "corpus manifest must be a regular non-symlink file"
+        );
+
+        let wav_link = directory.path().join("sample-link.wav");
+        symlink(directory.path().join("sample.wav"), &wav_link).unwrap();
+        update_single_case_manifest(&manifest, |entry| {
+            entry.insert("wav".into(), "sample-link.wav".into());
+        });
+        assert_eq!(
+            load(&manifest).err().unwrap(),
+            "WAV file must be a regular non-symlink file"
+        );
+    }
+
+    #[test]
+    fn accepts_exact_maximum_wav_bytes_and_frames() {
+        const EXPECTED_MAX_AUDIO_FRAMES: usize = 418_880;
+        const EXPECTED_MAX_WAV_BYTES: usize = 841_856;
+
+        let (directory, manifest) = corpus_fixture();
+        let mut bytes = wav(1, 16_000, 16, &vec![0; EXPECTED_MAX_AUDIO_FRAMES]);
+        let extra_bytes = EXPECTED_MAX_WAV_BYTES - bytes.len();
+        assert!(extra_bytes >= 8 && (extra_bytes - 8).is_multiple_of(2));
+        let mut junk = Vec::with_capacity(extra_bytes);
+        junk.extend_from_slice(b"JUNK");
+        junk.extend_from_slice(&((extra_bytes - 8) as u32).to_le_bytes());
+        junk.resize(extra_bytes, 0);
+        bytes.splice(36..36, junk);
+        let riff_size = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        assert_eq!(bytes.len(), EXPECTED_MAX_WAV_BYTES);
+
+        fs::write(directory.path().join("sample.wav"), &bytes).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        update_single_case_manifest(&manifest, |entry| {
+            entry.insert(
+                "duration_seconds".into(),
+                (EXPECTED_MAX_AUDIO_FRAMES as f64 / 16_000.0).into(),
+            );
+            entry.insert("sha256".into(), digest.into());
+            entry.insert("frames".into(), EXPECTED_MAX_AUDIO_FRAMES.into());
+        });
+
+        let corpus = load(&manifest).unwrap();
+        assert_eq!(corpus[0].samples.len(), EXPECTED_MAX_AUDIO_FRAMES);
+    }
+
+    #[test]
+    fn rejects_duplicate_and_invalid_case_ids() {
+        let (_directory, manifest) = corpus_fixture();
+        let original = read_manifest(&manifest);
+        let duplicate = serde_json::Value::Array(vec![
+            original.as_array().unwrap()[0].clone(),
+            original.as_array().unwrap()[0].clone(),
+        ]);
+        write_manifest(&manifest, &duplicate);
+        assert_eq!(
+            load(&manifest).err().unwrap(),
+            "corpus case ids must be unique bounded ASCII identifiers"
+        );
+
+        for invalid_id in [String::new(), "bad/id".into(), "x".repeat(65)] {
+            write_manifest(&manifest, &original);
+            update_single_case_manifest(&manifest, |entry| {
+                entry.insert("id".into(), invalid_id.into());
+            });
+            assert_eq!(
+                load(&manifest).err().unwrap(),
+                "corpus case ids must be unique bounded ASCII identifiers"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_source_labels() {
+        let (_directory, manifest) = corpus_fixture();
+        let original = read_manifest(&manifest);
+        for invalid_source in [String::new(), "two\nlines".into(), "x".repeat(257)] {
+            write_manifest(&manifest, &original);
+            update_single_case_manifest(&manifest, |entry| {
+                entry.insert("source".into(), invalid_source.into());
+            });
+            assert_eq!(
+                load(&manifest).err().unwrap(),
+                "corpus source labels must be non-empty bounded single-line text"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_riff_and_chunk_lengths() {
+        let valid = wav(1, 16_000, 16, &[0, 1]);
+
+        let mut wrong_riff_size = valid.clone();
+        wrong_riff_size[4..8].copy_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(
+            decode_mono_pcm16_wav(&wrong_riff_size).err().unwrap(),
+            "RIFF size does not match file size"
+        );
+
+        let mut truncated_data = valid;
+        truncated_data[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            decode_mono_pcm16_wav(&truncated_data).err().unwrap(),
+            "truncated WAV chunk"
+        );
     }
 }

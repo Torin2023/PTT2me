@@ -100,6 +100,7 @@ pub(super) struct ConfigurationReport {
     pub(super) cpu_threads: i32,
     pub(super) native_recognizer_load_ms: f64,
     pub(super) configuration_wall_ms: f64,
+    pub(super) configuration_wall_scope: &'static str,
     pub(super) cpu_delta: CpuDelta,
     pub(super) cases: Vec<CasePerformance>,
 }

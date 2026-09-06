@@ -3626,7 +3626,13 @@ mod tests {
             if !matches!(event, AppEvent::TriggerReleased { short: true }) {
                 controller.handle(AppEvent::TriggerReleased { short: false });
             }
-            controller.handle(event);
+            let effects = controller.handle(event);
+            assert!(
+                effects
+                    .iter()
+                    .all(|effect| !matches!(effect, Effect::InsertText(_))),
+                "empty, failed, or cancelled cycle must not request insertion"
+            );
             capture.abandon_unless_active(controller.status());
             let before = controller.status().clone();
             let generation = capture.generation;
@@ -3640,11 +3646,6 @@ mod tests {
                 assert_eq!(controller.status(), &before);
                 assert_eq!(capture.generation, generation);
             }
-            let mut queue = super::InsertionQueue::default();
-            assert!(
-                queue.take_if_unblocked(false).is_none(),
-                "empty/failed cycle produces no insertion"
-            );
         }
     }
 

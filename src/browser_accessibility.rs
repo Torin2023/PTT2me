@@ -14,12 +14,13 @@ const MAX_NODES: usize = 128;
 const MAX_DEPTH: usize = 12;
 static PREPARING: AtomicBool = AtomicBool::new(false);
 
-/// Chromium 152 enables native AX on application AXRole, and web AX on the web
-/// contents container AXRole. A system-wide AXFocusedUIElement query alone does
-/// neither. Start the read-only warm-up while audio is being captured so the
-/// supported app has time to publish its renderer tree. Never move focus or use
-/// a discovered node as the insertion target; text_inserter still checks the
-/// current system focus and secure status at both begin and paste time.
+/// Controlled Chrome 152 fixtures observed native and renderer AX metadata
+/// becoming available after reading the application and web-content AXRole;
+/// their initial cold system-wide AXFocusedUIElement query returned no value.
+/// Start the read-only warm-up while audio is being captured so a supported app
+/// can publish its renderer tree. Never move focus or use a discovered node as
+/// the insertion target; text_inserter still checks the current system focus
+/// and secure status at both begin and paste time.
 pub(crate) fn prepare_focused_browser() {
     let Some(application) = (unsafe { NSWorkspace::sharedWorkspace().frontmostApplication() })
     else {
@@ -229,8 +230,8 @@ mod tests {
         assert!(!requested);
     }
 
-    // Mirrors Chrome 152: application AXRole enables native accessibility;
-    // the web contents container AXRole enables renderer accessibility.
+    // Models the transition observed in the controlled Chrome 152 fixtures:
+    // application AXRole exposed native AX, then web-content AXRole exposed AX.
     struct LazyBrowser {
         native_enabled: bool,
         web_enabled: bool,

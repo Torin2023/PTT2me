@@ -807,23 +807,28 @@ mod tests {
 
         assert_eq!(ensure_not_secure_with(&mut access, &clock), Ok(()));
 
-        let timeouts = access
-            .calls
-            .iter()
-            .filter_map(|call| match call {
-                AxCall::SetTimeout(_, attribute, timeout) => Some((*attribute, *timeout)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
-            timeouts,
+            access.calls,
             [
-                (AX_FOCUSED_UI_ELEMENT_ATTRIBUTE, AX_COPY_TIMEOUT),
-                (AX_ROLE_ATTRIBUTE, AX_COPY_TIMEOUT),
-                (AX_SUBROLE_ATTRIBUTE, Duration::from_millis(100)),
+                AxCall::CreateSystemWide,
+                AxCall::SetTimeout(
+                    FakeElement::System,
+                    AX_FOCUSED_UI_ELEMENT_ATTRIBUTE,
+                    AX_COPY_TIMEOUT,
+                ),
+                AxCall::Copy(FakeElement::System, AX_FOCUSED_UI_ELEMENT_ATTRIBUTE),
+                AxCall::DecodeElement,
+                AxCall::SetTimeout(FakeElement::Focused, AX_ROLE_ATTRIBUTE, AX_COPY_TIMEOUT),
+                AxCall::Copy(FakeElement::Focused, AX_ROLE_ATTRIBUTE),
+                AxCall::DecodeString(AX_ROLE_ATTRIBUTE),
+                AxCall::SetTimeout(
+                    FakeElement::Focused,
+                    AX_SUBROLE_ATTRIBUTE,
+                    Duration::from_millis(100),
+                ),
+                AxCall::Copy(FakeElement::Focused, AX_SUBROLE_ATTRIBUTE),
             ]
         );
-        assert!(timeouts.iter().all(|(_, timeout)| !timeout.is_zero()));
     }
 
     #[test]

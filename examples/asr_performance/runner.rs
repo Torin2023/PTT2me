@@ -85,10 +85,11 @@ pub(super) fn execute(arguments: Arguments) -> Result<(BenchmarkReport, File), S
             cpu_threads: threads,
             native_recognizer_load_ms,
             configuration_wall_ms: milliseconds(configuration_started.elapsed()),
+            configuration_wall_scope: "recognizer load, warmups, measured transcriptions, and per-case quantile/RTF report bookkeeping through the final resource snapshot",
             cpu_delta: CpuDelta {
                 user_ms: (usage_after.user_ms - usage_before.user_ms).max(0.0),
                 system_ms: (usage_after.system_ms - usage_before.system_ms).max(0.0),
-                scope: "delta for recognizer load, warmups, and measured transcriptions in this configuration",
+                scope: "delta for recognizer load, warmups, measured transcriptions, and per-case quantile/RTF report bookkeeping through the final resource snapshot",
             },
             cases,
         });
