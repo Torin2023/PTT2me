@@ -6,14 +6,9 @@ use std::sync::{
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS, SAMPLE_RATE};
+use crate::constants::{CAPTURE_BUFFER_MARGIN_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS, SAMPLE_RATE};
 
 mod resampler;
-
-// The runtime still stops a capture at 25 seconds. Storage also covers the
-// release tail and delayed timer delivery so a valid near-limit capture is not
-// misclassified as overflow.
-const CAPTURE_BUFFER_MARGIN_MS: u64 = 1_000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AudioError {
@@ -56,6 +51,29 @@ impl CallbackFailures {
         let active = self.active_generation.swap(0, Ordering::AcqRel);
         let failed = self.failed_generation.swap(0, Ordering::AcqRel);
         active == generation && failed == generation
+    }
+}
+
+/// Frozen capture: no stream, callback flags or main-thread-only owners cross
+/// the preparation boundary. The producer has stopped before this is created.
+pub(crate) struct CompletedCapture {
+    consumer: Option<Consumer<f32>>,
+    source_rate: u32,
+}
+
+impl CompletedCapture {
+    pub(crate) fn native_sample_count(&self) -> usize {
+        self.consumer.as_ref().map_or(0, Consumer::slots)
+    }
+
+    pub(crate) fn prepare(self) -> Option<Vec<f32>> {
+        let mut samples = Vec::with_capacity(self.native_sample_count());
+        if let Some(mut consumer) = self.consumer {
+            while let Ok(sample) = consumer.pop() {
+                samples.push(sample);
+            }
+        }
+        prepare_capture(samples, self.source_rate)
     }
 }
 
@@ -185,43 +203,41 @@ impl AudioRecorder {
         result
     }
 
+    /// Synchronous compatibility for smoke callers and signal-level tests.
     pub fn stop(&mut self) -> Result<Option<Vec<f32>>, AudioError> {
-        self.stream.take();
+        self.finish().map(CompletedCapture::prepare)
+    }
+
+    /// Stop/drop CPAL on the caller (AppKit) thread, without draining or filtering.
+    pub(crate) fn finish(&mut self) -> Result<CompletedCapture, AudioError> {
+        stop_stream(&mut self.stream);
         self.active = false;
         let callback_failed = self
             .active_generation
             .take()
             .is_some_and(|generation| self.callback_failures.finish(generation));
         let overflowed = self.overflowed.swap(false, Ordering::AcqRel);
-        let samples = self.take_samples();
+        let consumer = self.consumer.take();
         if callback_failed {
             return Err(AudioError::StreamCallbackFailed);
         }
         if overflowed {
             return Err(AudioError::BufferOverflow);
         }
-        Ok(prepare_capture(samples, self.source_rate))
+        Ok(CompletedCapture {
+            consumer,
+            source_rate: self.source_rate,
+        })
     }
 
     pub fn abort(&mut self) {
-        self.stream.take();
+        stop_stream(&mut self.stream);
         self.active = false;
         if let Some(generation) = self.active_generation.take() {
             self.callback_failures.finish(generation);
         }
         self.consumer = None;
         self.overflowed.store(false, Ordering::Release);
-    }
-
-    fn take_samples(&mut self) -> Vec<f32> {
-        let Some(mut consumer) = self.consumer.take() else {
-            return Vec::new();
-        };
-        let mut samples = Vec::with_capacity(consumer.slots());
-        while let Ok(sample) = consumer.pop() {
-            samples.push(sample);
-        }
-        samples
     }
 
     #[cfg(test)]
@@ -254,6 +270,12 @@ impl Default for AudioRecorder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// Keep destruction synchronous and shared by finish/abort. Generic ownership
+// permits testing the drop-thread boundary without opening a real microphone.
+fn stop_stream<T>(stream: &mut Option<T>) {
+    drop(stream.take());
 }
 
 fn capture_buffer(capacity: usize) -> (Producer<f32>, Consumer<f32>) {
@@ -347,6 +369,15 @@ fn prepare_capture(samples: Vec<f32>, source_rate: u32) -> Option<Vec<f32>> {
     (!samples.is_empty()).then_some(samples)
 }
 
+/// Uses the production capture preparation path for the explicit performance tool.
+#[doc(hidden)]
+pub fn prepare_samples_for_performance_measurement(
+    samples: Vec<f32>,
+    source_rate: u32,
+) -> Option<Vec<f32>> {
+    prepare_capture(samples, source_rate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -364,6 +395,83 @@ mod tests {
         controller.handle(AppEvent::TriggerReleased { short: false });
         assert_eq!(controller.status(), &AppStatus::Recognizing);
         controller
+    }
+
+    #[test]
+    fn stream_stop_drops_owner_on_caller_thread_before_preparation() {
+        struct DropProbe(std::sync::mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.send(std::thread::current().id()).unwrap();
+            }
+        }
+        let (stopped, stop_events) = std::sync::mpsc::channel();
+        let mut stream = Some(DropProbe(stopped));
+        super::stop_stream(&mut stream);
+        assert!(stream.is_none());
+        assert_eq!(stop_events.try_recv().unwrap(), std::thread::current().id());
+    }
+
+    #[test]
+    fn background_preparation_matches_synchronous_signal_contract_exactly() {
+        for rate in [8_000, 16_000, 44_100, 48_000, 96_000] {
+            let frames: Vec<_> = (0..rate / 20)
+                .flat_map(|i| {
+                    let sample = ((std::f64::consts::TAU * 1500.0 * f64::from(i) / f64::from(rate))
+                        .sin()
+                        * 0.0001
+                        + 0.125) as f32;
+                    [sample, sample * 0.5]
+                })
+                .collect();
+            let mut sync = AudioRecorder::with_test_frames(frames.clone(), rate, 2);
+            let mut background = AudioRecorder::with_test_frames(frames, rate, 2);
+            sync.start().unwrap();
+            background.start().unwrap();
+            let expected = sync.stop().unwrap();
+            let completed = background.finish().unwrap();
+            let actual = std::thread::spawn(move || completed.prepare())
+                .join()
+                .unwrap();
+            assert_eq!(actual, expected, "different PCM at {rate} Hz");
+        }
+    }
+
+    #[test]
+    fn finish_transfers_undrained_capture_and_freezes_callback_outcome() {
+        let mut recorder = AudioRecorder::with_test_frames(vec![0.25; 480], 48_000, 1);
+        recorder.start().unwrap();
+        let old_generation = recorder.active_generation.unwrap();
+        let completed = recorder.finish().unwrap();
+        assert!(!recorder.active);
+        assert!(recorder.consumer.is_none());
+        assert_eq!(completed.native_sample_count(), 480);
+        recorder.start().unwrap();
+        recorder.callback_failures.report(old_generation);
+        let samples = std::thread::spawn(move || completed.prepare())
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(samples, prepare_capture(vec![0.25; 480], 48_000).unwrap());
+        assert!(recorder.stop().unwrap().is_some());
+    }
+
+    #[test]
+    fn finish_discards_failed_buffers_before_background_transfer() {
+        let mut recorder =
+            AudioRecorder::with_test_frames_and_capacity(vec![0.25; 3], 48_000, 1, 2);
+        recorder.start().unwrap();
+        assert!(matches!(recorder.finish(), Err(AudioError::BufferOverflow)));
+        assert!(recorder.consumer.is_none());
+        recorder.start().unwrap();
+        recorder
+            .callback_failures
+            .report(recorder.active_generation.unwrap());
+        assert!(matches!(
+            recorder.finish(),
+            Err(AudioError::StreamCallbackFailed)
+        ));
+        assert!(recorder.consumer.is_none());
     }
 
     #[test]

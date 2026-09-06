@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
@@ -983,6 +983,207 @@ fn artifact_cache_paths(
     (final_path, partial_path)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CachedReleaseIdentity {
+    version: semver::Version,
+    build: u64,
+}
+
+impl CachedReleaseIdentity {
+    fn from_release(release: &VerifiedRelease) -> Self {
+        Self {
+            version: release.version.clone(),
+            build: release.build,
+        }
+    }
+}
+
+struct DirectoryStream(*mut libc::DIR);
+
+impl DirectoryStream {
+    fn from_directory(directory: &File) -> Result<Self, UpdateFailure> {
+        let scan_fd = unsafe { libc::dup(directory.as_raw_fd()) };
+        if scan_fd < 0 {
+            return Err(UpdateFailure::Storage);
+        }
+        if unsafe { libc::fcntl(scan_fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            unsafe { libc::close(scan_fd) };
+            return Err(UpdateFailure::Storage);
+        }
+        let stream = unsafe { libc::fdopendir(scan_fd) };
+        if stream.is_null() {
+            unsafe { libc::close(scan_fd) };
+            return Err(UpdateFailure::Storage);
+        }
+        Ok(Self(stream))
+    }
+
+    fn next_name(&mut self) -> Result<Option<CString>, UpdateFailure> {
+        unsafe { *libc::__error() = 0 };
+        let entry = unsafe { libc::readdir(self.0) };
+        if entry.is_null() {
+            return if io::Error::last_os_error().raw_os_error() == Some(0) {
+                Ok(None)
+            } else {
+                Err(UpdateFailure::Storage)
+            };
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        CString::new(name.to_bytes())
+            .map(Some)
+            .map_err(|_| UpdateFailure::Storage)
+    }
+}
+
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+fn parse_completed_cache_name(name: &CStr) -> Option<CachedReleaseIdentity> {
+    let name = name.to_str().ok()?;
+    let release = name.strip_prefix("PTT2me-")?;
+    let release = release
+        .strip_suffix("-full-macos-arm64.dmg")
+        .or_else(|| release.strip_suffix("-update-macos-arm64.dmg"))?;
+    let (version_text, build) = release.rsplit_once('-')?;
+    let version = semver::Version::parse(version_text).ok()?;
+    if !version.pre.is_empty() || !version.build.is_empty() || version.to_string() != version_text {
+        return None;
+    }
+    let parsed_build = build.parse::<u64>().ok()?;
+    if parsed_build == 0 || parsed_build.to_string() != build {
+        return None;
+    }
+    Some(CachedReleaseIdentity {
+        version,
+        build: parsed_build,
+    })
+}
+
+fn read_cache_entry_stat(
+    directory_fd: RawFd,
+    name: &CStr,
+) -> Result<Option<libc::stat>, UpdateFailure> {
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            directory_fd,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        return Ok(Some(unsafe { stat.assume_init() }));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        Ok(None)
+    } else {
+        Err(UpdateFailure::Storage)
+    }
+}
+
+fn remove_cache_entry(directory_fd: RawFd, name: &CStr) -> Result<bool, UpdateFailure> {
+    if unsafe { libc::unlinkat(directory_fd, name.as_ptr(), 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        Ok(false)
+    } else {
+        Err(UpdateFailure::Storage)
+    }
+}
+
+fn retain_completed_downloads(
+    cache_root: &Path,
+    current_release: &VerifiedRelease,
+    active_path: &Path,
+) -> Result<(), UpdateFailure> {
+    retain_completed_downloads_with_barrier(cache_root, current_release, active_path, || Ok(()))
+}
+
+fn retain_completed_downloads_with_barrier<Barrier>(
+    cache_root: &Path,
+    current_release: &VerifiedRelease,
+    active_path: &Path,
+    before_delete: Barrier,
+) -> Result<(), UpdateFailure>
+where
+    Barrier: FnOnce() -> io::Result<()>,
+{
+    if !cache_root.is_absolute() {
+        return Err(UpdateFailure::Storage);
+    }
+    let (current_full, _) = artifact_cache_paths(cache_root, current_release, ArtifactKind::Full);
+    let (current_update, _) =
+        artifact_cache_paths(cache_root, current_release, ArtifactKind::Update);
+    if active_path != current_full && active_path != current_update {
+        return Err(UpdateFailure::Storage);
+    }
+    let active_name = CString::new(
+        active_path
+            .file_name()
+            .ok_or(UpdateFailure::Storage)?
+            .as_bytes(),
+    )
+    .map_err(|_| UpdateFailure::Storage)?;
+
+    let directory = open_controlled_directory(cache_root)?;
+    validate_controlled_directory(&read_fd_stat(directory.as_raw_fd())?)?;
+    let current_identity = CachedReleaseIdentity::from_release(current_release);
+    let mut stream = DirectoryStream::from_directory(&directory)?;
+    let mut completed = Vec::new();
+    while let Some(name) = stream.next_name()? {
+        if name.as_bytes() == b"." || name.as_bytes() == b".." {
+            continue;
+        }
+        let Some(identity) = parse_completed_cache_name(&name) else {
+            continue;
+        };
+        let Some(stat) = read_cache_entry_stat(directory.as_raw_fd(), &name)? else {
+            continue;
+        };
+        if stat.st_mode & libc::S_IFMT == libc::S_IFREG {
+            completed.push((name, identity, stat));
+        }
+    }
+    drop(stream);
+    before_delete().map_err(|_| UpdateFailure::Storage)?;
+
+    let previous_identity = completed
+        .iter()
+        .map(|(_, identity, _)| identity)
+        .filter(|identity| *identity < &current_identity)
+        .max()
+        .cloned();
+    let mut removed_any = false;
+    for (name, identity, original_stat) in completed {
+        if name.as_c_str() == active_name.as_c_str()
+            || identity == current_identity
+            || previous_identity.as_ref() == Some(&identity)
+        {
+            continue;
+        }
+        let Some(current_stat) = read_cache_entry_stat(directory.as_raw_fd(), &name)? else {
+            continue;
+        };
+        if current_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+            || !same_file_identity(&original_stat, &current_stat)
+        {
+            continue;
+        }
+        removed_any |= remove_cache_entry(directory.as_raw_fd(), &name)?;
+    }
+    if removed_any {
+        directory.sync_all().map_err(|_| UpdateFailure::Storage)?;
+    }
+    Ok(())
+}
+
 fn lookup_verified_download(
     cache_root: &Path,
     release: &VerifiedRelease,
@@ -1160,6 +1361,12 @@ pub trait UpdateStorage: Send + Sync {
     ) -> Result<PathBuf, UpdateFailure>;
 
     fn discard(&self, path: &Path) -> Result<(), UpdateFailure>;
+
+    fn retain_completed(
+        &self,
+        current_release: &VerifiedRelease,
+        active_path: &Path,
+    ) -> Result<(), UpdateFailure>;
 }
 
 pub trait UpdateClock: Send + Sync {
@@ -1206,7 +1413,7 @@ where
         artifact: &ArtifactDescriptor,
     ) -> Result<VerifiedDownload, UpdateFailure> {
         if let Some(path) = self.storage.lookup_verified(release, kind, artifact)? {
-            return self.finish_download(path);
+            return self.finish_download(release, path);
         }
         let mut response = self.fetch.fetch_artifact(artifact)?;
         let path = self.storage.store_verified(
@@ -1216,12 +1423,26 @@ where
             response.reader.as_mut(),
             response.content_length,
         )?;
-        self.finish_download(path)
+        self.finish_download(release, path)
     }
 
-    fn finish_download(&self, path: PathBuf) -> Result<VerifiedDownload, UpdateFailure> {
+    fn finish_download(
+        &self,
+        release: &VerifiedRelease,
+        path: PathBuf,
+    ) -> Result<VerifiedDownload, UpdateFailure> {
         match self.quarantine.has_quarantine(&path) {
-            Ok(true) => Ok(VerifiedDownload::from_verified_path(path)),
+            Ok(true) => {
+                let download = VerifiedDownload::from_verified_path(path);
+                if self
+                    .storage
+                    .retain_completed(release, download.path())
+                    .is_err()
+                {
+                    tracing::warn!(error_category = "update_artifact_cache_retention");
+                }
+                Ok(download)
+            }
             Ok(false) => {
                 self.storage.discard(&path)?;
                 Err(UpdateFailure::QuarantineMissing)
@@ -1281,6 +1502,15 @@ impl UpdateStorage for FileUpdateStorage {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(UpdateFailure::Storage),
         }
+    }
+
+    fn retain_completed(
+        &self,
+        current_release: &VerifiedRelease,
+        active_path: &Path,
+    ) -> Result<(), UpdateFailure> {
+        ensure_background_thread()?;
+        retain_completed_downloads(&self.cache_root, current_release, active_path)
     }
 }
 

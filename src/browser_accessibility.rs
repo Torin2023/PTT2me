@@ -1,4 +1,4 @@
-//! Warm up Chrome's lazy accessibility tree before recognition finishes.
+//! Warm up supported Chromium apps' lazy accessibility trees before recognition finishes.
 
 use std::ffi::c_void;
 use std::ptr::null;
@@ -14,12 +14,13 @@ const MAX_NODES: usize = 128;
 const MAX_DEPTH: usize = 12;
 static PREPARING: AtomicBool = AtomicBool::new(false);
 
-/// Chrome 152 enables native AX on application AXRole, and web AX on the
-/// web contents container AXRole. A system-wide AXFocusedUIElement query alone
-/// does neither. Start the read-only warm-up while audio is being captured so
-/// Chrome has time to publish its renderer tree. Never move focus or use a
-/// discovered node as the insertion target; text_inserter still checks the
-/// current system focus and secure status at both begin and paste time.
+/// Controlled Chrome 152 fixtures observed native and renderer AX metadata
+/// becoming available after reading the application and web-content AXRole;
+/// their initial cold system-wide AXFocusedUIElement query returned no value.
+/// Start the read-only warm-up while audio is being captured so a supported app
+/// can publish its renderer tree. Never move focus or use a discovered node as
+/// the insertion target; text_inserter still checks the current system focus
+/// and secure status at both begin and paste time.
 pub(crate) fn prepare_focused_browser() {
     let Some(application) = (unsafe { NSWorkspace::sharedWorkspace().frontmostApplication() })
     else {
@@ -28,10 +29,22 @@ pub(crate) fn prepare_focused_browser() {
     let Some(identifier) = (unsafe { application.bundleIdentifier() }) else {
         return;
     };
-    if !is_chrome(&identifier.to_string()) {
-        return;
+    dispatch_preparation(&identifier.to_string(), || {
+        let pid: libc::pid_t = unsafe { objc2::msg_send![&*application, processIdentifier] };
+        request_preparation(pid);
+    });
+}
+
+fn dispatch_preparation<F>(identifier: &str, request: F)
+where
+    F: FnOnce(),
+{
+    if is_supported_chromium_app(identifier) {
+        request();
     }
-    let pid: libc::pid_t = unsafe { objc2::msg_send![&*application, processIdentifier] };
+}
+
+fn request_preparation(pid: libc::pid_t) {
     if PREPARING.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -62,13 +75,14 @@ pub(crate) fn prepare_focused_browser() {
         });
 }
 
-fn is_chrome(identifier: &str) -> bool {
+fn is_supported_chromium_app(identifier: &str) -> bool {
     matches!(
         identifier,
         "com.google.Chrome"
             | "com.google.Chrome.beta"
             | "com.google.Chrome.dev"
             | "com.google.Chrome.canary"
+            | "com.openai.codex"
     )
 }
 
@@ -188,10 +202,36 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
-    use super::{prime_tree, AccessibilityTree};
+    use super::{dispatch_preparation, prime_tree, AccessibilityTree};
 
-    // Mirrors Chrome 152: application AXRole enables native accessibility;
-    // the web contents container AXRole enables renderer accessibility.
+    #[test]
+    fn supported_chromium_apps_request_accessibility_preparation() {
+        for identifier in [
+            "com.google.Chrome",
+            "com.google.Chrome.beta",
+            "com.google.Chrome.dev",
+            "com.google.Chrome.canary",
+            "com.openai.codex",
+        ] {
+            let mut requested = false;
+
+            dispatch_preparation(identifier, || requested = true);
+
+            assert!(requested, "bundle ID: {identifier}");
+        }
+    }
+
+    #[test]
+    fn unrelated_apps_do_not_request_accessibility_preparation() {
+        let mut requested = false;
+
+        dispatch_preparation("com.example.native-editor", || requested = true);
+
+        assert!(!requested);
+    }
+
+    // Models the transition observed in the controlled Chrome 152 fixtures:
+    // application AXRole exposed native AX, then web-content AXRole exposed AX.
     struct LazyBrowser {
         native_enabled: bool,
         web_enabled: bool,

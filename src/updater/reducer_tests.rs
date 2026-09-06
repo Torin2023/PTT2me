@@ -7,6 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -15,12 +16,12 @@ use serde_json::json;
 
 use super::{
     cache_verified_download, cache_verified_download_with_promoter, descriptor_has_quarantine,
-    file_url_for_path, next_automatic_check_at, read_bounded_manifest,
-    validate_http_response_metadata, verify_and_open_dmg_with, ArtifactKind, ArtifactWorker,
-    CheckReason, DownloadResponse, FileUpdateStorage, OperationId, QuarantineChecker, RetryAction,
-    RetryContext, SelectedArtifact, UpdateFailure, UpdateFetch, Updater, UpdaterCommand,
-    UpdaterEvent, UpdaterState, VerifiedDownload, AUTOMATIC_CHECK_INTERVAL_SECONDS,
-    FIRST_AUTOMATIC_CHECK_DELAY_SECONDS,
+    file_url_for_path, next_automatic_check_at, read_bounded_manifest, retain_completed_downloads,
+    retain_completed_downloads_with_barrier, validate_http_response_metadata,
+    verify_and_open_dmg_with, ArtifactKind, ArtifactWorker, CheckReason, DownloadResponse,
+    FileUpdateStorage, OperationId, QuarantineChecker, RetryAction, RetryContext, SelectedArtifact,
+    UpdateFailure, UpdateFetch, UpdateStorage, Updater, UpdaterCommand, UpdaterEvent, UpdaterState,
+    VerifiedDownload, AUTOMATIC_CHECK_INTERVAL_SECONDS, FIRST_AUTOMATIC_CHECK_DELAY_SECONDS,
 };
 use crate::constants::MAX_UPDATE_ARTIFACT_BYTES;
 use crate::update_manifest::{
@@ -1230,6 +1231,16 @@ fn verified_release() -> VerifiedRelease {
     verify_envelope(&bytes, &key).unwrap()
 }
 
+fn verified_release_at(version: &str, build: u64) -> VerifiedRelease {
+    let (bytes, key) = manifest(
+        version,
+        build,
+        "0123456789abcdef0123456789abcdef01234567",
+        "13.0",
+    );
+    verify_envelope(&bytes, &key).unwrap()
+}
+
 #[derive(Clone)]
 struct CountingReader {
     bytes: Cursor<Vec<u8>>,
@@ -1460,6 +1471,173 @@ fn final_path_is_reopened_and_failed_post_rename_verification_is_cleaned_up() {
 }
 
 #[test]
+fn completed_cache_retains_current_and_one_previous_release_group() {
+    let cache = tempfile::tempdir().unwrap();
+    let current = verified_release_at("1.0.6", 2);
+    let names = [
+        "PTT2me-1.0.7-1-full-macos-arm64.dmg",
+        "PTT2me-1.0.7-1-update-macos-arm64.dmg",
+        "PTT2me-1.0.6-2-full-macos-arm64.dmg",
+        "PTT2me-1.0.6-2-update-macos-arm64.dmg",
+        "PTT2me-1.0.6-1-full-macos-arm64.dmg",
+        "PTT2me-1.0.6-1-update-macos-arm64.dmg",
+        "PTT2me-1.0.5-999-full-macos-arm64.dmg",
+        "PTT2me-1.0.5-999-update-macos-arm64.dmg",
+    ];
+    for name in names {
+        fs::write(cache.path().join(name), name).unwrap();
+    }
+    let active = cache.path().join("PTT2me-1.0.6-2-update-macos-arm64.dmg");
+
+    retain_completed_downloads(cache.path(), &current, &active).unwrap();
+
+    for retained in [
+        "PTT2me-1.0.6-2-full-macos-arm64.dmg",
+        "PTT2me-1.0.6-2-update-macos-arm64.dmg",
+        "PTT2me-1.0.6-1-full-macos-arm64.dmg",
+        "PTT2me-1.0.6-1-update-macos-arm64.dmg",
+    ] {
+        assert!(cache.path().join(retained).is_file(), "missing {retained}");
+    }
+    for removed in [
+        "PTT2me-1.0.7-1-full-macos-arm64.dmg",
+        "PTT2me-1.0.7-1-update-macos-arm64.dmg",
+        "PTT2me-1.0.5-999-full-macos-arm64.dmg",
+        "PTT2me-1.0.5-999-update-macos-arm64.dmg",
+    ] {
+        assert!(!cache.path().join(removed).exists(), "retained {removed}");
+    }
+}
+
+#[test]
+fn completed_cache_sweep_leaves_partials_unrelated_entries_and_symlinks_untouched() {
+    let cache = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let current = verified_release_at("1.0.6", 2);
+    let active = cache.path().join("PTT2me-1.0.6-2-update-macos-arm64.dmg");
+    fs::write(&active, b"active").unwrap();
+    fs::write(
+        cache.path().join("PTT2me-1.0.5-1-update-macos-arm64.dmg"),
+        b"previous",
+    )
+    .unwrap();
+    let obsolete = cache.path().join("PTT2me-1.0.4-1-update-macos-arm64.dmg");
+    fs::write(&obsolete, b"obsolete").unwrap();
+
+    let partial = cache
+        .path()
+        .join("PTT2me-1.0.4-1-full-macos-arm64.dmg.part");
+    fs::write(&partial, b"in progress").unwrap();
+    let unrelated = cache.path().join("notes.txt");
+    fs::write(&unrelated, b"unrelated").unwrap();
+    let malformed = cache.path().join("PTT2me-1.0.3-0001-full-macos-arm64.dmg");
+    fs::write(&malformed, b"malformed").unwrap();
+
+    let nested = cache.path().join("PTT2me-1.0.3-1-full-macos-arm64.dmg");
+    fs::create_dir(&nested).unwrap();
+    let nested_file = nested.join("PTT2me-1.0.2-1-full-macos-arm64.dmg");
+    fs::write(&nested_file, b"nested").unwrap();
+
+    let external_file = external.path().join("external.dmg");
+    fs::write(&external_file, b"external").unwrap();
+    let symlink = cache.path().join("PTT2me-1.0.2-1-update-macos-arm64.dmg");
+    std::os::unix::fs::symlink(&external_file, &symlink).unwrap();
+
+    retain_completed_downloads(cache.path(), &current, &active).unwrap();
+
+    assert!(!obsolete.exists());
+    assert!(active.is_file());
+    assert!(partial.is_file());
+    assert!(unrelated.is_file());
+    assert!(malformed.is_file());
+    assert!(nested.is_dir());
+    assert!(nested_file.is_file());
+    assert!(fs::symlink_metadata(&symlink)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read(external_file).unwrap(), b"external");
+}
+
+#[test]
+fn completed_cache_sweep_rejects_a_symlinked_root_without_deleting_external_files() {
+    let parent = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let cache_link = parent.path().join("artifacts");
+    std::os::unix::fs::symlink(external.path(), &cache_link).unwrap();
+    let external_file = external.path().join("PTT2me-1.0.4-1-full-macos-arm64.dmg");
+    fs::write(&external_file, b"external").unwrap();
+    let current = verified_release_at("1.0.6", 2);
+    let active = cache_link.join("PTT2me-1.0.6-2-update-macos-arm64.dmg");
+
+    assert_eq!(
+        retain_completed_downloads(&cache_link, &current, &active),
+        Err(UpdateFailure::Storage)
+    );
+    assert_eq!(fs::read(external_file).unwrap(), b"external");
+}
+
+#[test]
+fn completed_cache_sweep_stays_on_the_opened_directory_after_root_substitution() {
+    let parent = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let cache = parent.path().join("artifacts");
+    let detached_cache = parent.path().join("opened-artifacts");
+    fs::create_dir(&cache).unwrap();
+    let current = verified_release_at("1.0.6", 2);
+    let active_name = "PTT2me-1.0.6-2-update-macos-arm64.dmg";
+    let previous_name = "PTT2me-1.0.5-1-update-macos-arm64.dmg";
+    let obsolete_name = "PTT2me-1.0.4-1-update-macos-arm64.dmg";
+    let active = cache.join(active_name);
+    fs::write(&active, b"active").unwrap();
+    fs::write(cache.join(previous_name), b"previous").unwrap();
+    fs::write(cache.join(obsolete_name), b"obsolete").unwrap();
+    let external_obsolete = external.path().join(obsolete_name);
+    fs::write(&external_obsolete, b"external").unwrap();
+
+    retain_completed_downloads_with_barrier(&cache, &current, &active, || {
+        fs::rename(&cache, &detached_cache)?;
+        std::os::unix::fs::symlink(external.path(), &cache)
+    })
+    .unwrap();
+
+    assert!(detached_cache.join(active_name).is_file());
+    assert!(detached_cache.join(previous_name).is_file());
+    assert!(!detached_cache.join(obsolete_name).exists());
+    assert_eq!(fs::read(external_obsolete).unwrap(), b"external");
+}
+
+#[test]
+fn completed_cache_sweep_skips_an_entry_replaced_by_a_symlink_before_unlink() {
+    let cache = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let current = verified_release_at("1.0.6", 2);
+    let active = cache.path().join("PTT2me-1.0.6-2-update-macos-arm64.dmg");
+    fs::write(&active, b"active").unwrap();
+    fs::write(
+        cache.path().join("PTT2me-1.0.5-1-update-macos-arm64.dmg"),
+        b"previous",
+    )
+    .unwrap();
+    let obsolete = cache.path().join("PTT2me-1.0.4-1-update-macos-arm64.dmg");
+    fs::write(&obsolete, b"obsolete").unwrap();
+    let external_file = external.path().join("external.dmg");
+    fs::write(&external_file, b"external").unwrap();
+
+    retain_completed_downloads_with_barrier(cache.path(), &current, &active, || {
+        fs::remove_file(&obsolete)?;
+        std::os::unix::fs::symlink(&external_file, &obsolete)
+    })
+    .unwrap();
+
+    assert!(fs::symlink_metadata(&obsolete)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read(external_file).unwrap(), b"external");
+}
+
+#[test]
 fn bounded_manifest_reader_rejects_the_sixty_four_kibibyte_plus_one_byte() {
     let (reader, consumed) = CountingReader::new(vec![b'x'; 70_000]);
 
@@ -1534,6 +1712,57 @@ impl QuarantineChecker for FixedQuarantine {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct RetentionCall {
+    version: String,
+    build: u64,
+    active_path: PathBuf,
+}
+
+struct RetentionFailureStorage {
+    cached_path: PathBuf,
+    call: Arc<Mutex<Option<RetentionCall>>>,
+}
+
+impl UpdateStorage for RetentionFailureStorage {
+    fn lookup_verified(
+        &self,
+        _release: &VerifiedRelease,
+        _kind: ArtifactKind,
+        _artifact: &ArtifactDescriptor,
+    ) -> Result<Option<PathBuf>, UpdateFailure> {
+        Ok(Some(self.cached_path.clone()))
+    }
+
+    fn store_verified(
+        &self,
+        _release: &VerifiedRelease,
+        _kind: ArtifactKind,
+        _artifact: &ArtifactDescriptor,
+        _reader: &mut (dyn Read + Send),
+        _content_length: Option<u64>,
+    ) -> Result<PathBuf, UpdateFailure> {
+        panic!("cache hit must not store")
+    }
+
+    fn discard(&self, _path: &Path) -> Result<(), UpdateFailure> {
+        panic!("accepted verified download must not be discarded")
+    }
+
+    fn retain_completed(
+        &self,
+        current_release: &VerifiedRelease,
+        active_path: &Path,
+    ) -> Result<(), UpdateFailure> {
+        *self.call.lock().unwrap() = Some(RetentionCall {
+            version: current_release.version.to_string(),
+            build: current_release.build,
+            active_path: active_path.to_owned(),
+        });
+        Err(UpdateFailure::Storage)
+    }
+}
+
 #[test]
 fn artifact_worker_requires_quarantine_before_reporting_a_ready_path() {
     let release = verified_release();
@@ -1557,6 +1786,14 @@ fn artifact_worker_requires_quarantine_before_reporting_a_ready_path() {
         .is_none());
 
     let accepted_cache = tempfile::tempdir().unwrap();
+    let previous = accepted_cache
+        .path()
+        .join("PTT2me-1.0.5-1-full-macos-arm64.dmg");
+    let obsolete = accepted_cache
+        .path()
+        .join("PTT2me-1.0.4-1-full-macos-arm64.dmg");
+    fs::write(&previous, b"previous").unwrap();
+    fs::write(&obsolete, b"obsolete").unwrap();
     let accepted = ArtifactWorker::new(
         FixtureFetch {
             body: b"verified PTT2me update dmg fixture".to_vec(),
@@ -1569,6 +1806,42 @@ fn artifact_worker_requires_quarantine_before_reporting_a_ready_path() {
         .download(&release, ArtifactKind::Update, &release.application_update)
         .unwrap();
     assert!(download.path().is_file());
+    assert!(previous.is_file());
+    assert!(!obsolete.exists());
+}
+
+#[test]
+fn artifact_worker_keeps_verified_download_when_best_effort_retention_fails() {
+    let cache = tempfile::tempdir().unwrap();
+    let release = verified_release();
+    let active = cache
+        .path()
+        .join("PTT2me-1.0.6-202608011200-update-macos-arm64.dmg");
+    fs::write(&active, b"verified cached artifact").unwrap();
+    let call = Arc::new(Mutex::new(None));
+    let worker = ArtifactWorker::new(
+        OfflineFetch,
+        RetentionFailureStorage {
+            cached_path: active.clone(),
+            call: call.clone(),
+        },
+        FixedQuarantine(true),
+    );
+
+    let download = worker
+        .download(&release, ArtifactKind::Update, &release.application_update)
+        .unwrap();
+
+    assert_eq!(download.path(), active);
+    assert_eq!(fs::read(&active).unwrap(), b"verified cached artifact");
+    assert_eq!(
+        *call.lock().unwrap(),
+        Some(RetentionCall {
+            version: "1.0.6".to_owned(),
+            build: 202608011200,
+            active_path: active,
+        })
+    );
 }
 
 #[test]
@@ -1586,6 +1859,10 @@ fn artifact_worker_uses_quarantined_cache_before_network_and_cleans_stale_partia
     .unwrap();
     let partial_path = final_path.with_extension("dmg.part");
     fs::write(&partial_path, b"stale interrupted body").unwrap();
+    let previous = cache.path().join("PTT2me-1.0.5-1-update-macos-arm64.dmg");
+    let obsolete = cache.path().join("PTT2me-1.0.4-1-update-macos-arm64.dmg");
+    fs::write(&previous, b"previous").unwrap();
+    fs::write(&obsolete, b"obsolete").unwrap();
 
     let worker = ArtifactWorker::new(
         OfflineFetch,
@@ -1598,6 +1875,8 @@ fn artifact_worker_uses_quarantined_cache_before_network_and_cleans_stale_partia
 
     assert_eq!(reused.path(), final_path);
     assert!(!partial_path.exists());
+    assert!(previous.is_file());
+    assert!(!obsolete.exists());
 }
 
 #[test]
@@ -1613,6 +1892,10 @@ fn offline_cache_hit_still_fails_closed_when_quarantine_is_missing() {
         Some(32),
     )
     .unwrap();
+    let previous = cache.path().join("PTT2me-1.0.5-1-update-macos-arm64.dmg");
+    let obsolete = cache.path().join("PTT2me-1.0.4-1-update-macos-arm64.dmg");
+    fs::write(&previous, b"previous").unwrap();
+    fs::write(&obsolete, b"obsolete").unwrap();
     let worker = ArtifactWorker::new(
         OfflineFetch,
         FileUpdateStorage::new(cache.path().to_owned()),
@@ -1624,6 +1907,8 @@ fn offline_cache_hit_still_fails_closed_when_quarantine_is_missing() {
         Err(UpdateFailure::QuarantineMissing)
     );
     assert!(!final_path.exists());
+    assert!(previous.is_file());
+    assert!(obsolete.is_file());
 }
 
 fn cached_update(

@@ -14,6 +14,11 @@ The previous pasteboard is restored unless newer contents appeared meanwhile.
 - Apple Silicon (`arm64`) Mac
 - macOS 13 Ventura or newer
 
+The repository source is prepared as the 1.3.0 release candidate. It is not a
+published release: the public stable download, signed update channel, and menu
+snapshot documented below remain Preview 1.2.1 until the 1.3.0 release gates
+and publication complete.
+
 ## Cloud development without Codespaces
 
 Repository work can be delegated to Codex Cloud from a browser or mobile
@@ -58,10 +63,14 @@ non-empty result into whichever editable field owns the cursor at that moment.
 A capture ends automatically after 25 seconds.
 
 Loading the recognition engine has a 180-second deadline; each transcription
-has a 60-second deadline. If either expires, PTT2me stops accepting dictation
-and asks you to restart the app. Late results are discarded, and quitting
-does not wait for a blocked recognition thread. The timeout does not forcibly
-interrupt native inference inside the current process.
+has a 60-second deadline. Recognition runs in one supervised child process. If
+a deadline expires, PTT2me rejects late results, blocks new dictation, and
+kills and reaps that child before a replacement can start. It attempts one
+bounded automatic reload; if recovery fails, the menu offers
+`Повторить запуск распознавания` after cleanup ownership is resolved. Quitting
+uses the same cleanup path. If cleanup exceeds three seconds, the app stays
+responsive and retains ownership until the child is actually reaped instead
+of abandoning it.
 
 Completed microphone captures are converted to mono 16 kHz for GigaAM. When
 the device rate differs, a windowed-sinc filter prevents high-frequency noise

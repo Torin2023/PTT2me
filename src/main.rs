@@ -5,12 +5,13 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::MainThreadMarker;
 use ptt2me::permissions::prime_microphone_and_exit;
 use ptt2me::release_manifest::verify_release_files;
-use ptt2me::runtime::{smoke_bundled_model, smoke_bundled_model_child, Runtime};
+use ptt2me::runtime::{finish_after_run, smoke_bundled_model, smoke_bundled_model_child, Runtime};
 use ptt2me::single_instance::InstanceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LaunchMode {
     App,
+    AsrWorker,
     PrimeMicrophone,
     SmokeModel,
     SmokeModelChild,
@@ -55,6 +56,10 @@ fn main() -> ExitCode {
         };
     }
 
+    if mode == LaunchMode::AsrWorker {
+        return ExitCode::from(ptt2me::run_asr_worker_process() as u8);
+    }
+
     ptt2me::logging::init();
     match mode {
         LaunchMode::PrimeMicrophone => {
@@ -67,7 +72,7 @@ fn main() -> ExitCode {
             return ExitCode::from(smoke_bundled_model_child() as u8);
         }
         LaunchMode::App => {}
-        LaunchMode::VerifyUpdateManifest { .. } => unreachable!(),
+        LaunchMode::VerifyUpdateManifest { .. } | LaunchMode::AsrWorker => unreachable!(),
     }
 
     let Ok(_instance_lock) = InstanceLock::acquire() else {
@@ -83,8 +88,9 @@ fn main() -> ExitCode {
         tracing::error!(error_category = "app_activation_policy");
         return ExitCode::FAILURE;
     }
-    let _runtime = Runtime::start(main_thread);
+    let mut runtime = Runtime::start(main_thread);
     unsafe { application.run() };
+    finish_after_run(&mut runtime);
     ExitCode::SUCCESS
 }
 
@@ -94,6 +100,7 @@ fn parse_launch_mode(
     let arguments = arguments.into_iter().collect::<Vec<_>>();
     match arguments.as_slice() {
         [] => Ok(LaunchMode::App),
+        [argument] if argument == "--asr-worker" => Ok(LaunchMode::AsrWorker),
         [argument] if argument == "--prime-microphone-and-exit" => Ok(LaunchMode::PrimeMicrophone),
         [argument] if argument == "--smoke-model" => Ok(LaunchMode::SmokeModel),
         [argument] if argument == "--smoke-model-child" => Ok(LaunchMode::SmokeModelChild),

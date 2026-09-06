@@ -406,7 +406,7 @@ fn is_utc_timestamp(value: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::Cursor;
 
     use base64::engine::general_purpose::STANDARD;
@@ -424,7 +424,7 @@ mod tests {
         0x0e, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45,
         0x23, 0x01,
     ];
-    const TEST_PUBLIC_KEY: [u8; 32] = [
+    pub(crate) const TEST_PUBLIC_KEY: [u8; 32] = [
         0xca, 0xde, 0x19, 0x2a, 0xa1, 0xee, 0x6d, 0xbb, 0x06, 0x00, 0xbb, 0x4a, 0x6d, 0x89, 0xf7,
         0x16, 0x2a, 0xfc, 0x7d, 0x02, 0x7e, 0x85, 0xfb, 0x9a, 0x14, 0xa3, 0xfb, 0x8b, 0xe0, 0xd2,
         0x3f, 0x8a,
@@ -432,7 +432,7 @@ mod tests {
     const FULL_ARTIFACT: &[u8] = b"verified PTT2me full dmg fixture";
     const UPDATE_ARTIFACT: &[u8] = b"verified PTT2me update dmg fixture";
     const SIGNED_PAYLOAD: &[u8] = b"{\"channel\":\"stable\",\"version\":\"1.0.6\",\"build\":202608011200,\"source_commit\":\"0123456789abcdef0123456789abcdef01234567\",\"minimum_macos\":\"13.0\",\"architecture\":\"arm64\",\"required_model\":{\"id\":\"gigaam-v3-rnnt-v1\",\"manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"fresh_install\":{\"url\":\"https://github.com/Torin2023/PTT2me/releases/download/v1.0.6/PTT2me-1.0.6-full-macos-arm64.dmg\",\"sha256\":\"80530994d8ca7568fcba045b34d82b6f0c31188a07aae38de1fede676e08a1a4\",\"size\":32},\"application_update\":{\"url\":\"https://github.com/Torin2023/PTT2me/releases/download/v1.0.6/PTT2me-1.0.6-update-macos-arm64.dmg\",\"sha256\":\"79a45998882238cd19dfefda21805a21e2769e6750a8bffab9f3443101d2b5f6\",\"size\":34},\"published_at\":\"2026-08-01T12:00:00Z\"}\n";
-    const SIGNED_ENVELOPE: &[u8] = br#"{"schema":1,"payload":"eyJjaGFubmVsIjoic3RhYmxlIiwidmVyc2lvbiI6IjEuMC42IiwiYnVpbGQiOjIwMjYwODAxMTIwMCwic291cmNlX2NvbW1pdCI6IjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1NjciLCJtaW5pbXVtX21hY29zIjoiMTMuMCIsImFyY2hpdGVjdHVyZSI6ImFybTY0IiwicmVxdWlyZWRfbW9kZWwiOnsiaWQiOiJnaWdhYW0tdjMtcm5udC12MSIsIm1hbmlmZXN0X3NoYTI1NiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEifSwiZnJlc2hfaW5zdGFsbCI6eyJ1cmwiOiJodHRwczovL2dpdGh1Yi5jb20vVG9yaW4yMDIzL1BUVDJtZS9yZWxlYXNlcy9kb3dubG9hZC92MS4wLjYvUFRUMm1lLTEuMC42LWZ1bGwtbWFjb3MtYXJtNjQuZG1nIiwic2hhMjU2IjoiODA1MzA5OTRkOGNhNzU2OGZjYmEwNDViMzRkODJiNmYwYzMxMTg4YTA3YWFlMzhkZTFmZWRlNjc2ZTA4YTFhNCIsInNpemUiOjMyfSwiYXBwbGljYXRpb25fdXBkYXRlIjp7InVybCI6Imh0dHBzOi8vZ2l0aHViLmNvbS9Ub3JpbjIwMjMvUFRUMm1lL3JlbGVhc2VzL2Rvd25sb2FkL3YxLjAuNi9QVFQybWUtMS4wLjYtdXBkYXRlLW1hY29zLWFybTY0LmRtZyIsInNoYTI1NiI6Ijc5YTQ1OTk4ODgyMjM4Y2QxOWRmZWZkYTIxODA1YTIxZTI3NjllNjc1MGE4YmZmYWI5ZjM0NDMxMDFkMmI1ZjYiLCJzaXplIjozNH0sInB1Ymxpc2hlZF9hdCI6IjIwMjYtMDgtMDFUMTI6MDA6MDBaIn0K","signature":"pzYWjkXXLXUNYd6oqqlrmEsbKTpR0v4QAtKjLWO8jpXbrrOzF2xYFlR/Hzi99WMaS8I+aCqV1Ac+yFY9pzj/Cw=="}"#;
+    pub(crate) const SIGNED_ENVELOPE: &[u8] = br#"{"schema":1,"payload":"eyJjaGFubmVsIjoic3RhYmxlIiwidmVyc2lvbiI6IjEuMC42IiwiYnVpbGQiOjIwMjYwODAxMTIwMCwic291cmNlX2NvbW1pdCI6IjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1NjciLCJtaW5pbXVtX21hY29zIjoiMTMuMCIsImFyY2hpdGVjdHVyZSI6ImFybTY0IiwicmVxdWlyZWRfbW9kZWwiOnsiaWQiOiJnaWdhYW0tdjMtcm5udC12MSIsIm1hbmlmZXN0X3NoYTI1NiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEifSwiZnJlc2hfaW5zdGFsbCI6eyJ1cmwiOiJodHRwczovL2dpdGh1Yi5jb20vVG9yaW4yMDIzL1BUVDJtZS9yZWxlYXNlcy9kb3dubG9hZC92MS4wLjYvUFRUMm1lLTEuMC42LWZ1bGwtbWFjb3MtYXJtNjQuZG1nIiwic2hhMjU2IjoiODA1MzA5OTRkOGNhNzU2OGZjYmEwNDViMzRkODJiNmYwYzMxMTg4YTA3YWFlMzhkZTFmZWRlNjc2ZTA4YTFhNCIsInNpemUiOjMyfSwiYXBwbGljYXRpb25fdXBkYXRlIjp7InVybCI6Imh0dHBzOi8vZ2l0aHViLmNvbS9Ub3JpbjIwMjMvUFRUMm1lL3JlbGVhc2VzL2Rvd25sb2FkL3YxLjAuNi9QVFQybWUtMS4wLjYtdXBkYXRlLW1hY29zLWFybTY0LmRtZyIsInNoYTI1NiI6Ijc5YTQ1OTk4ODgyMjM4Y2QxOWRmZWZkYTIxODA1YTIxZTI3NjllNjc1MGE4YmZmYWI5ZjM0NDMxMDFkMmI1ZjYiLCJzaXplIjozNH0sInB1Ymxpc2hlZF9hdCI6IjIwMjYtMDgtMDFUMTI6MDA6MDBaIn0K","signature":"pzYWjkXXLXUNYd6oqqlrmEsbKTpR0v4QAtKjLWO8jpXbrrOzF2xYFlR/Hzi99WMaS8I+aCqV1Ac+yFY9pzj/Cw=="}"#;
 
     fn sign_payload(payload: &[u8]) -> Vec<u8> {
         let signing_key = SigningKey::from_bytes(&TEST_PRIVATE_KEY);

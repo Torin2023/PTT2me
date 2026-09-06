@@ -1,3 +1,4 @@
+use crate::event_wake::EventNotifier;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -379,29 +380,66 @@ pub(crate) trait UpdaterWorkerBoundary: Send + 'static {
     fn execute(&mut self, request: UpdaterWorkerRequest) -> Option<UpdaterWorkerResult>;
 }
 
+// Terminal state is independent of buffered results. Publish it before the
+// request receiver becomes unusable, then notify only after both endpoints
+// have been destroyed. A preexisting result wake can race with this teardown.
+struct UpdaterWorkerEndpoints {
+    terminal: Option<Sender<()>>,
+    requests: Option<Receiver<UpdaterWorkerRequest>>,
+    results: Option<Sender<UpdaterWorkerResult>>,
+    notifier: EventNotifier,
+}
+impl UpdaterWorkerEndpoints {
+    fn publish_terminal(&mut self) {
+        drop(self.terminal.take());
+    }
+}
+impl Drop for UpdaterWorkerEndpoints {
+    fn drop(&mut self) {
+        self.publish_terminal();
+        drop(self.requests.take());
+        drop(self.results.take());
+        self.notifier.notify();
+    }
+}
+
 pub(crate) struct UpdaterWorkerTask {
     requests: Sender<UpdaterWorkerRequest>,
     results: Receiver<UpdaterWorkerResult>,
+    terminal: Receiver<()>,
     worker: Option<JoinHandle<()>>,
     pending: HashMap<OperationId, UpdaterEvent>,
 }
 
 impl UpdaterWorkerTask {
-    pub(crate) fn spawn(mut boundary: impl UpdaterWorkerBoundary) -> Self {
+    #[cfg(test)]
+    pub(crate) fn spawn(boundary: impl UpdaterWorkerBoundary) -> Self {
+        Self::spawn_notified(boundary, EventNotifier::default())
+    }
+    fn spawn_notified(mut boundary: impl UpdaterWorkerBoundary, notifier: EventNotifier) -> Self {
         let (request_sender, request_receiver) = mpsc::channel();
         let (result_sender, result_receiver) = mpsc::channel();
+        let (terminal_sender, terminal) = mpsc::channel();
         let worker = thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
+            let endpoints = UpdaterWorkerEndpoints {
+                terminal: Some(terminal_sender),
+                requests: Some(request_receiver),
+                results: Some(result_sender),
+                notifier: notifier.clone(),
+            };
+            while let Ok(request) = endpoints.requests.as_ref().unwrap().recv() {
                 if let Some(result) = boundary.execute(request) {
-                    if result_sender.send(result).is_err() {
+                    if endpoints.results.as_ref().unwrap().send(result).is_err() {
                         break;
                     }
+                    notifier.notify();
                 }
             }
         });
         Self {
             requests: request_sender,
             results: result_receiver,
+            terminal,
             worker: Some(worker),
             pending: HashMap::new(),
         }
@@ -419,9 +457,17 @@ impl UpdaterWorkerTask {
         Ok(())
     }
 
+    fn is_terminal(&self) -> bool {
+        matches!(self.terminal.try_recv(), Err(TryRecvError::Disconnected))
+    }
+
+    #[cfg(test)]
     fn drain_results(&mut self) -> (Vec<UpdaterEvent>, bool) {
+        self.drain_results_limit(usize::MAX)
+    }
+    fn drain_results_limit(&mut self, limit: usize) -> (Vec<UpdaterEvent>, bool) {
         let mut events = Vec::new();
-        loop {
+        while events.len() < limit {
             match self.results.try_recv() {
                 Ok(result) => {
                     self.pending.remove(&result.operation_id());
@@ -431,11 +477,18 @@ impl UpdaterWorkerTask {
                 Err(TryRecvError::Disconnected) => {
                     // Buffered completions win over failures. Only requests without
                     // a result belong to the dead worker; new operation IDs remain safe.
-                    events.extend(self.pending.drain().map(|(_, event)| event));
+                    if let Some(id) = self.pending.keys().next().copied() {
+                        events.push(self.pending.remove(&id).unwrap());
+                        if limit == 1 {
+                            return (events, false);
+                        }
+                        events.extend(self.pending.drain().map(|(_, event)| event));
+                    }
                     return (events, true);
                 }
             }
         }
+        (events, false)
     }
 }
 
@@ -568,29 +621,49 @@ pub(crate) struct UpdaterLane<R: RawUpdateScheduleStore, C: UpdateClock> {
     clock: C,
     launch_at: u64,
     worker: Option<UpdaterWorkerTask>,
+    // One terminal worker may still own buffered completions/failures. Drain
+    // it first, under the same lane quota, before inspecting active results.
+    retired_worker: Option<UpdaterWorkerTask>,
     worker_factory: Box<dyn FnMut() -> UpdaterWorkerTask>,
 }
 
 pub(crate) type SystemUpdaterLane = UpdaterLane<SystemUpdateScheduleStore, SystemClock>;
 
 impl UpdaterLane<SystemUpdateScheduleStore, SystemClock> {
-    pub(crate) fn production(config: UpdaterLaunchConfig) -> Self {
+    pub(crate) fn production(config: UpdaterLaunchConfig, notifier: EventNotifier) -> Self {
         let worker_config = config.clone();
-        Self::with_boundaries(
+        Self::with_notifier(
             config,
             SystemUpdateScheduleStore::standard(),
             SystemClock,
             move || ProductionUpdaterWorker::new(&worker_config),
+            notifier,
         )
     }
 }
 
 impl<R: RawUpdateScheduleStore, C: UpdateClock> UpdaterLane<R, C> {
+    #[cfg(test)]
     pub(crate) fn with_boundaries<B: UpdaterWorkerBoundary>(
         config: UpdaterLaunchConfig,
         schedule: R,
         clock: C,
+        worker_factory: impl FnMut() -> B + 'static,
+    ) -> Self {
+        Self::with_notifier(
+            config,
+            schedule,
+            clock,
+            worker_factory,
+            EventNotifier::default(),
+        )
+    }
+    fn with_notifier<B: UpdaterWorkerBoundary>(
+        config: UpdaterLaunchConfig,
+        schedule: R,
+        clock: C,
         mut worker_factory: impl FnMut() -> B + 'static,
+        notifier: EventNotifier,
     ) -> Self {
         let launch_at = clock.now();
         Self {
@@ -598,8 +671,14 @@ impl<R: RawUpdateScheduleStore, C: UpdateClock> UpdaterLane<R, C> {
             schedule: UpdateScheduleRepository::new(schedule),
             clock,
             launch_at,
-            worker: Some(UpdaterWorkerTask::spawn(worker_factory())),
-            worker_factory: Box::new(move || UpdaterWorkerTask::spawn(worker_factory())),
+            worker: Some(UpdaterWorkerTask::spawn_notified(
+                worker_factory(),
+                notifier.clone(),
+            )),
+            retired_worker: None,
+            worker_factory: Box::new(move || {
+                UpdaterWorkerTask::spawn_notified(worker_factory(), notifier.clone())
+            }),
         }
     }
 
@@ -643,17 +722,41 @@ impl<R: RawUpdateScheduleStore, C: UpdateClock> UpdaterLane<R, C> {
         self.handle_event(UpdaterEvent::OpenRequested)
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_worker_results(&mut self) -> (Vec<UpdaterRuntimeEffect>, bool) {
-        let Some(worker) = &mut self.worker else {
+        self.drain_worker_results_limit(usize::MAX)
+    }
+    pub(crate) fn poll_worker_result(&mut self) -> (Vec<UpdaterRuntimeEffect>, bool) {
+        self.drain_worker_results_limit(1)
+    }
+    fn drain_worker_results_limit(&mut self, limit: usize) -> (Vec<UpdaterRuntimeEffect>, bool) {
+        let draining_retired = self.retired_worker.is_some();
+        let task = if draining_retired {
+            &mut self.retired_worker
+        } else {
+            &mut self.worker
+        };
+        let Some(worker) = task else {
             return (Vec::new(), false);
         };
-        let (events, disconnected) = worker.drain_results();
-        let handled = disconnected || !events.is_empty();
-        if disconnected {
+        let (events, exhausted) = worker.drain_results_limit(limit);
+        let terminal = exhausted || worker.is_terminal();
+        // Retirement/release themselves count as consumption. Empty retired
+        // results do not: their sender may still be held during teardown.
+        let handled = exhausted || !events.is_empty() || (!draining_retired && terminal);
+        if draining_retired {
+            if exhausted {
+                self.retired_worker = None;
+            }
+        } else if terminal {
             tracing::warn!(error_category = "updater_worker_stopped");
-            // Retire before dispatch: a buffered result can queue the next stage.
-            // Recreate lazily for that stage or the next explicit/scheduled request.
-            self.worker = None;
+            // Retire BEFORE dispatching any buffered success. A follow-on
+            // stage gets a fresh active worker; old identities keep their
+            // original result/failure lane until it is exhausted.
+            let retired = self.worker.take();
+            if !exhausted {
+                self.retired_worker = retired;
+            }
         }
         let mut effects = Vec::new();
         for event in events {
@@ -1326,6 +1429,396 @@ mod tests {
                 }
                 _ => panic!("injected crash after buffered completion"),
             }
+        }
+    }
+
+    struct ChainedStageWorker {
+        instance: u64,
+        observed: mpsc::Sender<(u64, UpdaterWorkerRequest)>,
+    }
+    impl UpdaterWorkerBoundary for ChainedStageWorker {
+        fn execute(&mut self, request: UpdaterWorkerRequest) -> Option<UpdaterWorkerResult> {
+            if matches!(&request, UpdaterWorkerRequest::StoreVerifiedManifest { bytes } if bytes.is_empty())
+            {
+                panic!("synthetic termination after buffered success");
+            }
+            let result = match &request {
+                UpdaterWorkerRequest::FetchManifest { operation_id, .. } => {
+                    Some(UpdaterWorkerResult::ManifestReceived {
+                        operation_id: *operation_id,
+                        bytes: crate::update_manifest::tests::SIGNED_ENVELOPE.to_vec(),
+                        model: ModelAvailability::Missing,
+                    })
+                }
+                UpdaterWorkerRequest::RecheckModel { operation_id, .. } => {
+                    Some(UpdaterWorkerResult::ModelRechecked {
+                        operation_id: *operation_id,
+                        model: ModelAvailability::Missing,
+                    })
+                }
+                UpdaterWorkerRequest::DownloadAndVerify { operation_id, .. } => {
+                    Some(UpdaterWorkerResult::DownloadFailed {
+                        operation_id: *operation_id,
+                        failure: UpdateFailure::Network,
+                    })
+                }
+                _ => None,
+            };
+            self.observed.send((self.instance, request)).unwrap();
+            result
+        }
+    }
+
+    type ChainedStageLane = UpdaterLane<RecordingSchedule, FixedClock>;
+    type ObservedWorkerRequests = mpsc::Receiver<(u64, UpdaterWorkerRequest)>;
+
+    fn chained_stage_lane() -> (ChainedStageLane, ObservedWorkerRequests, Arc<AtomicU64>) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = launch_config(&temp);
+        config.public_key = crate::update_manifest::tests::TEST_PUBLIC_KEY;
+        let starts = Arc::new(AtomicU64::new(0));
+        let factory_starts = starts.clone();
+        let (observed, receiver) = mpsc::channel();
+        let lane = UpdaterLane::with_boundaries(
+            config,
+            RecordingSchedule {
+                last_attempt: None,
+                fail_writes: false,
+                timeline: Arc::new(Mutex::new(Vec::new())),
+            },
+            FixedClock::new(1_000),
+            move || ChainedStageWorker {
+                instance: factory_starts.fetch_add(1, Ordering::SeqCst) + 1,
+                observed: observed.clone(),
+            },
+        );
+        (lane, receiver, starts)
+    }
+
+    #[test]
+    fn production_poll_retires_buffered_model_success_before_chained_download() {
+        let (mut lane, observed, starts) = chained_stage_lane();
+        // Seed only the prerequisite offer via the real reducer, without a
+        // worker result drain that could conceal the production-path race.
+        let commands = lane.updater.handle(UpdaterEvent::Launched {
+            launch_at: 1_000,
+            now: 1_000,
+            last_attempt: None,
+        });
+        let cache_id = commands
+            .iter()
+            .find_map(|command| match command {
+                UpdaterCommand::LoadCachedManifest { operation_id } => Some(*operation_id),
+                _ => None,
+            })
+            .unwrap();
+        lane.updater.handle(UpdaterEvent::CachedManifestReceived {
+            operation_id: cache_id,
+            bytes: crate::update_manifest::tests::SIGNED_ENVELOPE.to_vec(),
+            model: ModelAvailability::Missing,
+        });
+        let UpdaterState::Available { release, artifact } = lane.state().clone() else {
+            panic!("fixture must offer an update");
+        };
+        lane.request_download();
+        let (instance, request) = observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        let UpdaterWorkerRequest::RecheckModel {
+            operation_id: recheck_id,
+            required_model,
+        } = request
+        else {
+            panic!("expected model recheck");
+        };
+        assert_eq!(instance, 1);
+        assert_eq!(required_model, release.required_model);
+        lane.queue_worker(UpdaterWorkerRequest::StoreVerifiedManifest { bytes: vec![] });
+        join_crashed_worker(&mut lane); // success is buffered; sender already gone
+        assert!(lane.poll_worker_result().1);
+        let UpdaterState::Downloading {
+            operation_id,
+            release: current_release,
+            artifact: current_artifact,
+            ..
+        } = lane.state()
+        else {
+            panic!(
+                "buffered success must advance to download, got {:?}",
+                lane.state()
+            );
+        };
+        assert_ne!(*operation_id, recheck_id);
+        assert_eq!(current_release, &release);
+        assert_eq!(current_artifact, &artifact);
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            2,
+            "follow-on needs a fresh worker before dispatch"
+        );
+        let (instance, request) = observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        let UpdaterWorkerRequest::DownloadAndVerify {
+            operation_id: queued_id,
+            release: queued_release,
+            artifact: queued_artifact,
+        } = request
+        else {
+            panic!("expected chained download");
+        };
+        assert_eq!(instance, 2);
+        assert_eq!(queued_id, *operation_id);
+        assert_eq!(queued_release, release);
+        assert_eq!(queued_artifact, artifact);
+    }
+
+    #[test]
+    fn production_poll_preserves_two_buffered_successes_and_held_terminal_teardown() {
+        use crate::event_wake::{tests::pump_until, EventSource};
+        use core_foundation::runloop::{kCFRunLoopDefaultMode, CFRunLoop};
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+        for unwind in [false, true] {
+            let source = EventSource::new(CFRunLoop::get_current());
+            let (mut lane, observed, starts) = chained_stage_lane();
+            let commands = lane.updater.handle(UpdaterEvent::Launched {
+                launch_at: 1_000,
+                now: 1_000,
+                last_attempt: None,
+            });
+            let cache_id = commands
+                .iter()
+                .find_map(|command| match command {
+                    UpdaterCommand::LoadCachedManifest { operation_id } => Some(*operation_id),
+                    _ => None,
+                })
+                .unwrap();
+            lane.updater.handle(UpdaterEvent::CachedManifestReceived {
+                operation_id: cache_id,
+                bytes: crate::update_manifest::tests::SIGNED_ENVELOPE.to_vec(),
+                model: ModelAvailability::Missing,
+            });
+            let (requests, request_receiver) = mpsc::channel();
+            let (result_sender, results) = mpsc::channel();
+            let (terminal_sender, terminal) = mpsc::channel();
+            let (buffered, buffered_ack) = mpsc::channel();
+            let (publish, may_publish) = mpsc::channel();
+            let (published, published_ack) = mpsc::channel();
+            let (finish, may_finish) = mpsc::channel();
+            let notifier = source.notifier();
+            let worker = thread::spawn(move || {
+                let mut endpoints = UpdaterWorkerEndpoints {
+                    terminal: Some(terminal_sender),
+                    requests: Some(request_receiver),
+                    results: Some(result_sender),
+                    notifier,
+                };
+                let request = endpoints.requests.as_ref().unwrap().recv().unwrap();
+                let UpdaterWorkerRequest::RecheckModel { operation_id, .. } = request else {
+                    panic!("expected model recheck");
+                };
+                for _ in 0..2 {
+                    endpoints
+                        .results
+                        .as_ref()
+                        .unwrap()
+                        .send(UpdaterWorkerResult::ModelRechecked {
+                            operation_id,
+                            model: ModelAvailability::Missing,
+                        })
+                        .unwrap();
+                    endpoints.notifier.notify();
+                }
+                buffered.send(()).unwrap();
+                may_publish.recv().unwrap();
+                // Production-shared first step of Drop, held before endpoint
+                // destruction: terminal is visible while requests still work.
+                endpoints.publish_terminal();
+                published.send(()).unwrap();
+                may_finish.recv().unwrap();
+                if unwind {
+                    panic!("synthetic unwind during terminal teardown");
+                }
+            });
+            lane.worker = Some(UpdaterWorkerTask {
+                requests,
+                results,
+                terminal,
+                worker: Some(worker),
+                pending: HashMap::new(),
+            });
+            lane.request_download();
+            buffered_ack.recv_timeout(Duration::from_secs(1)).unwrap();
+            let unanswered_id = OperationId(88);
+            lane.queue_worker(UpdaterWorkerRequest::FetchManifest {
+                operation_id: unanswered_id,
+                reason: crate::updater::CheckReason::Manual,
+            });
+            publish.send(()).unwrap();
+            published_ack.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(lane.worker.as_ref().unwrap().is_terminal());
+            assert!(!lane
+                .worker
+                .as_ref()
+                .unwrap()
+                .worker
+                .as_ref()
+                .unwrap()
+                .is_finished());
+            assert!(
+                lane.worker
+                    .as_ref()
+                    .unwrap()
+                    .requests
+                    .send(UpdaterWorkerRequest::StoreVerifiedManifest { bytes: vec![] })
+                    .is_ok(),
+                "terminal must be published before requests become unusable"
+            );
+            assert!(lane.poll_worker_result().1);
+            assert_eq!(starts.load(Ordering::SeqCst), 2);
+            assert!(matches!(lane.state(), UpdaterState::Downloading { .. }));
+            assert!(lane.retired_worker.is_some());
+            assert!(lane
+                .retired_worker
+                .as_ref()
+                .unwrap()
+                .pending
+                .contains_key(&unanswered_id));
+            let (instance, request) = observed.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(instance, 2);
+            assert!(matches!(
+                request,
+                UpdaterWorkerRequest::DownloadAndVerify { .. }
+            ));
+            // The live worker processes this probe after enqueueing its download
+            // result, making the active buffered output deterministic.
+            lane.queue_worker(UpdaterWorkerRequest::StoreVerifiedManifest { bytes: vec![1] });
+            observed.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(
+                lane.poll_worker_result().1,
+                "second buffered success is a separate consumed event"
+            );
+            assert!(lane.retired_worker.is_some());
+            assert!(
+                !lane.poll_worker_result().1,
+                "Empty during held teardown is parked, not exhausted or spinning"
+            );
+            assert!(
+                matches!(lane.state(), UpdaterState::Downloading { .. }),
+                "active buffered result must wait behind retired results"
+            );
+            // Clear the already-pending normal result wake while teardown is
+            // held. Only the final endpoint-drop wake can restart servicing.
+            source.attach();
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, Duration::ZERO, true);
+            let lane = Rc::new(RefCell::new(lane));
+            let consumer = lane.clone();
+            let callbacks = Rc::new(Cell::new(0));
+            let consumed = callbacks.clone();
+            let notifier = source.notifier();
+            source.set_handler(move || {
+                let (_, handled) = consumer.borrow_mut().poll_worker_result();
+                consumed.set(consumed.get() + 1);
+                if handled {
+                    notifier.notify();
+                }
+            });
+            finish.send(()).unwrap();
+            pump_until(|| {
+                matches!(
+                    lane.borrow().state(),
+                    UpdaterState::Failed {
+                        failure: UpdateFailure::Network,
+                        ..
+                    }
+                )
+            });
+            assert!(lane.borrow().retired_worker.is_none());
+            assert_eq!(callbacks.get(), 3, "consume original failure, release retired slot, then consume active result in separate bounded visits");
+            assert_eq!(
+                starts.load(Ordering::SeqCst),
+                2,
+                "retired failure must not restart or replace the new stage"
+            );
+            source.close();
+        }
+    }
+
+    #[test]
+    fn production_poll_retires_buffered_manifest_before_cache_command() {
+        let (mut lane, observed, starts) = chained_stage_lane();
+        lane.manual_check();
+        let (instance, request) = observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(instance, 1);
+        assert!(matches!(
+            request,
+            UpdaterWorkerRequest::FetchManifest { .. }
+        ));
+        lane.queue_worker(UpdaterWorkerRequest::StoreVerifiedManifest { bytes: vec![] });
+        join_crashed_worker(&mut lane);
+        assert!(lane.poll_worker_result().1);
+        assert!(matches!(lane.state(), UpdaterState::Available { .. }));
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            2,
+            "verified cache command must not be silently dropped"
+        );
+        let (instance, request) = observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        let UpdaterWorkerRequest::StoreVerifiedManifest { bytes } = request else {
+            panic!("expected verified manifest cache command");
+        };
+        assert_eq!(instance, 2);
+        assert_eq!(bytes, crate::update_manifest::tests::SIGNED_ENVELOPE);
+    }
+
+    #[test]
+    fn result_terminal_failure_and_recreated_worker_keep_main_wake() {
+        use core_foundation::runloop::CFRunLoop;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let source = crate::event_wake::EventSource::new(CFRunLoop::get_current());
+        let temp = tempfile::tempdir().unwrap();
+        let starts = Arc::new(AtomicU64::new(0));
+        let factory_starts = starts.clone();
+        let lane = Rc::new(RefCell::new(UpdaterLane::with_notifier(
+            launch_config(&temp),
+            RecordingSchedule {
+                last_attempt: None,
+                fail_writes: false,
+                timeline: Arc::new(Mutex::new(Vec::new())),
+            },
+            FixedClock::new(1_000),
+            move || {
+                factory_starts.fetch_add(1, Ordering::SeqCst);
+                CompleteThenCrash
+            },
+            source.notifier(),
+        )));
+        let consumer = lane.clone();
+        let notifier = source.notifier();
+        source.set_handler(move || {
+            // Production uses one event per lane visit and re-signals at quota.
+            let (_, handled) = consumer.borrow_mut().poll_worker_result();
+            if handled {
+                notifier.notify();
+            }
+        });
+        source.attach();
+        CFRunLoop::run_in_mode(
+            unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+            Duration::ZERO,
+            true,
+        );
+        for expected_starts in 1..=2 {
+            lane.borrow_mut().manual_check();
+            lane.borrow_mut()
+                .queue_worker(UpdaterWorkerRequest::StoreVerifiedManifest { bytes: vec![] });
+            crate::event_wake::tests::pump_until(|| lane.borrow().worker.is_none());
+            assert!(matches!(
+                lane.borrow().state(),
+                UpdaterState::Failed {
+                    failure: UpdateFailure::HttpStatus,
+                    ..
+                }
+            ));
+            assert_eq!(starts.load(Ordering::SeqCst), expected_starts);
         }
     }
 
