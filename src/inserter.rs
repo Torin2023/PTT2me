@@ -406,6 +406,23 @@ fn capture_snapshot<R: SnapshotReader, C: SnapshotClock>(
     Ok(PasteboardSnapshot { items })
 }
 
+fn finish_snapshot_capture<C: SnapshotClock>(
+    snapshot: PasteboardSnapshot,
+    expected_change_count: isize,
+    observed_change_count: isize,
+    budget: &SnapshotBudget,
+    clock: &C,
+) -> Result<SnapshotCapture, InsertError> {
+    if observed_change_count != expected_change_count {
+        return Err(InsertError::PasteboardChanged);
+    }
+    budget.check_deadline(clock)?;
+    Ok(SnapshotCapture {
+        snapshot,
+        change_count: expected_change_count,
+    })
+}
+
 struct NativeSnapshotReader {
     items: Retained<NSArray<NSPasteboardItem>>,
 }
@@ -509,13 +526,14 @@ impl PasteboardAccess for SystemPasteboard {
         budget.check_deadline(&clock)?;
         let items = pasteboard_items_or_error(unsafe { self.pasteboard.pasteboardItems() })?;
         let snapshot = capture_snapshot(&mut NativeSnapshotReader { items }, limits, &clock)?;
-        if self.change_count() != change_count {
-            return Err(InsertError::PasteboardChanged);
-        }
-        Ok(SnapshotCapture {
+        let observed_change_count = self.change_count();
+        finish_snapshot_capture(
             snapshot,
             change_count,
-        })
+            observed_change_count,
+            &budget,
+            &clock,
+        )
     }
 
     fn write_temporary_text(
@@ -1164,6 +1182,53 @@ mod tests {
         temporary_write_counter: Rc<Cell<usize>>,
     }
 
+    struct LateFinalOwnershipPasteboard {
+        clock: ManualSnapshotClock,
+        temporary_write_counter: Rc<Cell<usize>>,
+        restore_counter: Rc<Cell<usize>>,
+    }
+
+    impl PasteboardAccess for LateFinalOwnershipPasteboard {
+        fn change_count(&self) -> isize {
+            0
+        }
+
+        fn snapshot(&mut self) -> Result<SnapshotCapture, InsertError> {
+            let budget = SnapshotBudget::new(SnapshotLimits::default());
+            self.clock.advance(Duration::from_millis(490));
+            let snapshot = PasteboardSnapshot::default();
+            let expected_change_count = 0;
+            self.clock.advance(Duration::from_millis(20));
+            let observed_change_count = 0;
+            finish_snapshot_capture(
+                snapshot,
+                expected_change_count,
+                observed_change_count,
+                &budget,
+                &self.clock,
+            )
+        }
+
+        fn write_temporary_text(
+            &mut self,
+            _text: &str,
+            _expected_change_count: isize,
+        ) -> Result<TemporaryWrite, TemporaryWriteFailure> {
+            self.temporary_write_counter
+                .set(self.temporary_write_counter.get() + 1);
+            Ok(TemporaryWrite { change_count: 1 })
+        }
+
+        fn restore(
+            &mut self,
+            _snapshot: &PasteboardSnapshot,
+            _expected_change_count: isize,
+        ) -> Result<(), InsertError> {
+            self.restore_counter.set(self.restore_counter.get() + 1);
+            Ok(())
+        }
+    }
+
     impl PasteboardAccess for ReaderPasteboard {
         fn change_count(&self) -> isize {
             0
@@ -1441,6 +1506,28 @@ mod tests {
         );
         assert_eq!(copy_calls.get(), 0);
         assert_eq!(temporary_write_counter.get(), 0);
+    }
+
+    #[test]
+    fn late_matching_final_ownership_query_prevents_write_and_rollback() {
+        let temporary_write_counter = Rc::new(Cell::new(0));
+        let restore_counter = Rc::new(Cell::new(0));
+
+        assert_eq!(
+            InsertionTransaction::begin_with(
+                "recognized",
+                LateFinalOwnershipPasteboard {
+                    clock: ManualSnapshotClock::new(),
+                    temporary_write_counter: Rc::clone(&temporary_write_counter),
+                    restore_counter: Rc::clone(&restore_counter),
+                },
+                FakePasteCommand::succeed(),
+            )
+            .map(|_| ()),
+            Err(InsertError::PasteboardSnapshot)
+        );
+        assert_eq!(temporary_write_counter.get(), 0);
+        assert_eq!(restore_counter.get(), 0);
     }
 
     #[test]
