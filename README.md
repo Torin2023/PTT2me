@@ -90,7 +90,7 @@ The menu contains the trigger controls:
 
 ```text
 <status>
-PTT2me 1.2.0
+PTT2me 1.2.1
 Проверить обновления…
 Открыть настройки…   (only while a required permission is missing)
 Клавиша активации
@@ -106,7 +106,7 @@ PTT2me 1.2.0
 Выйти
 ```
 
-This menu snapshot describes the currently published Preview 1.2.0. The
+This menu snapshot describes the currently published Preview 1.2.1. The
 updater action changes when a signed release is available or downloaded.
 
 The status and version rows are informational. While a permission is missing,
@@ -131,19 +131,19 @@ punctuation is never added, removed, or rewritten by PTT2me.
 
 ## Published release
 
-The current public download is the Preview 1.2.0 Full DMG:
-[PTT2me-1.2.0-full-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.2.0/PTT2me-1.2.0-full-macos-arm64.dmg)
-(193,479,890 bytes / 184.5 MiB, SHA-256
-`575e55e957a0527f03f9bb21f070ae629d697635a24eb9b84c3d569931248372`).
-See the [v1.2.0 release page](https://github.com/Torin2023/PTT2me/releases/tag/v1.2.0)
+The current public download is the Preview 1.2.1 Full DMG:
+[PTT2me-1.2.1-full-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.2.1/PTT2me-1.2.1-full-macos-arm64.dmg)
+(193,485,229 bytes / 184.5 MiB, SHA-256
+`53076f0253a4f710cc0fc3fb3151802a43514110f2035d46b90c8d8f3c914fba`).
+See the [v1.2.1 release page](https://github.com/Torin2023/PTT2me/releases/tag/v1.2.1)
 for the model-free Update DMG and checksum files.
 
-This preview passed the automated macOS/AppKit, Rust, security, signed-manifest,
-model, bundle, and DMG gates. Manual P0 remains incomplete: 13 PASS,
-15 PARTIAL, and 13 BLOCKED.
-This unsigned preview is published by owner decision with that limitation
-disclosed in the release notes. Automated and fixture checks do not establish
-a complete installed-app dictation, ChatGPT/Codex, or updater GUI pass.
+This preview fixes Chrome page-field insertion by preparing the browser's
+Accessibility tree during capture. Automated macOS/AppKit, Rust, security,
+signed-manifest, model, bundle, and DMG checks passed.
+All manual checks for 1.2.1, including Manual P0, were skipped by explicit
+owner instruction. They are not reported as passed. This unsigned preview is
+published by owner decision with that limitation disclosed in the release notes.
 
 ## Build
 
@@ -210,7 +210,7 @@ use Full only. Update is selected only inside an already installed PTT2me.
 The release coordinator requires an explicit stable version, 12-digit UTC
 build, exact clean `HEAD`, model source, committed model manifest, publication
 timestamp, and matching key pair. The private signing key must remain outside
-Git. The currently published stable package version is exactly 1.2.0.
+Git. The currently published stable package version is exactly 1.2.1.
 
 ### Reproducible release gates
 
@@ -276,11 +276,11 @@ preservation through the production insertion modules. CI builds the fixture;
 execution requires a macOS GUI session with Accessibility and event-posting
 access. The manual P0 checklist also includes a short ChatGPT draft check.
 
-## Updating (PTT2me 1.2.0)
+## Updating (PTT2me 1.2.1)
 
 Preview 1.0.5 cannot discover this release. Versions 1.1.0 and 1.1.1 can check
 the signed stable channel, but their updater cannot download the build that
-contains its fix. Replace any of these versions once with the published 1.2.0
+contains its fix. Replace any of these versions once with the published 1.2.1
 Full DMG. Starting with 1.1.2, PTT2me can download subsequent signed updates
 through the flow described below.
 
