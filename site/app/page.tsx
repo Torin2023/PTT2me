@@ -1,7 +1,7 @@
 const DOWNLOAD_URL =
-  "https://github.com/Torin2023/PTT2me/releases/download/v1.2.0/PTT2me-1.2.0-full-macos-arm64.dmg";
+  "https://github.com/Torin2023/PTT2me/releases/download/v1.2.1/PTT2me-1.2.1-full-macos-arm64.dmg";
 const REPOSITORY_URL = "https://github.com/Torin2023/PTT2me";
-const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.2.0`;
+const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.2.1`;
 
 const steps = [
   ["01", "Удерживайте", "Нажмите и удерживайте выбранную клавишу."],
@@ -27,7 +27,7 @@ export default function Home() {
         </a>
         <nav aria-label="Разделы сайта">
           <a href="#how">Как работает</a>
-          <a href="#updates">Обновления 1.2.0</a>
+          <a href="#updates">Обновления 1.2.1</a>
           <a href={REPOSITORY_URL}>GitHub</a>
           <a className="button button-small" href={DOWNLOAD_URL}>
             Скачать
@@ -41,7 +41,7 @@ export default function Home() {
           <p className="eyebrow">
             <span className="eyebrow-line" aria-hidden="true" />
             Локальная диктовка для macOS
-            <span className="preview-badge">Preview 1.2.0</span>
+            <span className="preview-badge">Preview 1.2.1</span>
           </p>
           <h1>
             Говорите —
@@ -55,7 +55,7 @@ export default function Home() {
           </p>
           <div className="hero-actions">
             <a className="button" href={DOWNLOAD_URL}>
-              Скачать PTT2me 1.2.0
+              Скачать PTT2me 1.2.1
               <span aria-hidden="true">↘</span>
             </a>
             <a className="text-link" href={REPOSITORY_URL}>
@@ -223,15 +223,15 @@ export default function Home() {
 
       <section className="section updates-section" id="updates">
         <div className="section-heading">
-          <p className="eyebrow">PTT2me 1.2.0 опубликована</p>
+          <p className="eyebrow">PTT2me 1.2.1 опубликована</p>
           <div>
-            <h2>Восстановление обновлений и вставка текста.</h2>
+            <h2>Исправлена вставка текста в Chrome.</h2>
             <p className="release-boundary">
-              Версиям 1.1.0 и 1.1.1 нужен один ручной переход на 1.2.0 через
+              Версиям 1.1.0 и 1.1.1 нужен один ручной переход на 1.2.1 через
               Full DMG: прежний updater не может скачать сборку с собственным
-              исправлением. Версии начиная с 1.1.2 могут загрузить 1.2.0 через
-              меню обновлений. В 1.2.0 добавлено восстановление после сбоя
-              обработчика обновлений и исправлена проверка полей перед вставкой.
+              исправлением. Версии начиная с 1.1.2 могут загрузить 1.2.1 через
+              меню обновлений. В 1.2.1 исправлена вставка в поля страниц Chrome:
+              браузер подготавливается к вставке во время записи речи.
             </p>
           </div>
         </div>
@@ -342,11 +342,11 @@ export default function Home() {
 
       <section className="section install" id="install">
         <div className="install-copy">
-          <p className="eyebrow">PTT2me Preview 1.2.0</p>
+          <p className="eyebrow">PTT2me Preview 1.2.1</p>
           <h2>Готовы говорить?</h2>
           <p>Для Mac с Apple Silicon и macOS 13 Ventura или новее.</p>
           <p className="fine-print">
-            Полная ручная проверка этой версии не завершена.
+            Ручные проверки этой версии пропущены по решению владельца.
             {" "}<a href={RELEASE_URL}>Подробности и ограничения preview.</a>
           </p>
           <a className="button" href={DOWNLOAD_URL}>
@@ -394,11 +394,11 @@ export default function Home() {
         <p>
           SHA-256{" "}
           <code>
-            575e55e957a0527f03f9bb21f070ae629d697635a24eb9b84c3d569931248372
+            53076f0253a4f710cc0fc3fb3151802a43514110f2035d46b90c8d8f3c914fba
           </code>
         </p>
         <div>
-          <a href={RELEASE_URL}>Preview-релиз 1.2.0</a>
+          <a href={RELEASE_URL}>Preview-релиз 1.2.1</a>
           <a href={REPOSITORY_URL}>GitHub</a>
         </div>
       </footer>
