@@ -202,7 +202,7 @@ impl AsrTask {
         self.supervisor.stop();
     }
     pub fn cleanup_complete(&self) -> bool {
-        self.supervisor.cleaned()
+        self.supervisor.cleanup_complete()
     }
     pub fn cleanup_failed(&self) -> bool {
         self.supervisor.cleanup_failed()
@@ -245,10 +245,32 @@ impl Drop for AsrTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asr_process::held_after_cleanup_supervisor_for_test;
+
     #[test]
     fn production_timeouts_are_unchanged() {
         assert_eq!(AsrOperation::Load.timeout(), Duration::from_secs(180));
         assert_eq!(AsrOperation::Transcribe.timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn shutdown_completion_waits_for_supervisor_thread_return_after_acknowledgment() {
+        let (supervisor, release, acknowledged) = held_after_cleanup_supervisor_for_test();
+        let task = AsrTask::new(supervisor);
+        acknowledged.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert!(
+            !task.cleanup_complete(),
+            "cleanup acknowledgment alone must keep shutdown follow-up pending"
+        );
+
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !task.cleanup_complete() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(task.cleanup_complete());
     }
 }
 

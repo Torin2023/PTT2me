@@ -119,13 +119,13 @@ impl Supervisor {
         self.wake();
     }
     pub fn retry_ready(&self, ignored: u64) -> bool {
-        (self.cleaned() && self.worker.is_finished())
+        self.cleanup_complete()
             || (!self.cleaned()
                 && !self.control.stop.load(Ordering::Acquire)
                 && self.control.retired_through.load(Ordering::Acquire) >= ignored)
     }
     pub fn restart_if_cleaned(&mut self) -> bool {
-        if !self.cleaned() || !self.worker.is_finished() {
+        if !self.cleanup_complete() {
             return false;
         }
         let Some(spec) = self.spec.clone() else {
@@ -134,8 +134,13 @@ impl Supervisor {
         *self = Self::spawn_notified(Ok(spec), self.notifier.clone());
         true
     }
+    /// Raw cleanup acknowledgment; terminal thread teardown may still be running.
     pub fn cleaned(&self) -> bool {
         self.control.cleaned.load(Ordering::Acquire)
+    }
+    /// Requires both cleanup acknowledgment and actual supervisor thread return.
+    pub fn cleanup_complete(&self) -> bool {
+        self.cleaned() && self.worker.is_finished()
     }
     #[cfg(feature = "test-support")]
     pub fn completions_sent(&self) -> u64 {
@@ -510,23 +515,22 @@ fn wait_fds(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn explicit_supervisor_replacement_waits_for_ack_and_thread_completion() {
-        let control = Arc::new(Control::default());
-        let cloned = control.clone();
-        let (release, blocked) = mpsc::channel();
-        let (ack, acknowledged) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            acknowledge_after_cleanup(&cloned, || {});
-            ack.send(()).unwrap();
-            blocked.recv().unwrap();
-        });
-        let (commands, _requests) = mpsc::sync_channel(1);
-        let (_events, completions) = mpsc::sync_channel(2);
-        let (wake, _reader) = UnixStream::pair().unwrap();
-        let mut supervisor = Supervisor {
+pub(crate) fn held_after_cleanup_supervisor_for_test(
+) -> (Supervisor, mpsc::Sender<()>, mpsc::Receiver<()>) {
+    let control = Arc::new(Control::default());
+    let cloned = control.clone();
+    let (release, blocked) = mpsc::channel();
+    let (ack, acknowledged) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        acknowledge_after_cleanup(&cloned, || {});
+        ack.send(()).unwrap();
+        let _ = blocked.recv();
+    });
+    let (commands, _requests) = mpsc::sync_channel(1);
+    let (_events, completions) = mpsc::sync_channel(2);
+    let (wake, _reader) = UnixStream::pair().unwrap();
+    (
+        Supervisor {
             notifier: EventNotifier::default(),
             commands,
             events: completions,
@@ -537,16 +541,28 @@ mod tests {
                 program: "/bin/sleep".into(),
                 args: vec!["60".into()],
             }),
-        };
+        },
+        release,
+        acknowledged,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn explicit_supervisor_replacement_waits_for_ack_and_thread_completion() {
+        let (mut supervisor, release, acknowledged) = held_after_cleanup_supervisor_for_test();
         acknowledged.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(supervisor.cleaned());
+        assert!(!supervisor.cleanup_complete());
         assert!(
             !supervisor.restart_if_cleaned(),
             "ack alone must not replace a live supervisor"
         );
         release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !supervisor.worker.is_finished() {
+        while !supervisor.cleanup_complete() {
             assert!(Instant::now() < deadline);
             thread::yield_now();
         }
