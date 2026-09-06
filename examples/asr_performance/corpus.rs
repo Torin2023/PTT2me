@@ -429,6 +429,47 @@ mod tests {
     }
 
     #[test]
+    fn rejects_wav_one_byte_over_maximum() {
+        const FIRST_REJECTED_WAV_BYTES: usize = 841_857;
+
+        let (directory, manifest) = corpus_fixture();
+        fs::write(
+            directory.path().join("sample.wav"),
+            vec![0; FIRST_REJECTED_WAV_BYTES],
+        )
+        .unwrap();
+
+        assert_eq!(
+            load(&manifest).err().unwrap(),
+            "WAV file exceeds 841856 bytes"
+        );
+    }
+
+    #[test]
+    fn rejects_valid_wav_one_frame_over_maximum() {
+        const FIRST_REJECTED_AUDIO_FRAMES: usize = 418_881;
+
+        let (directory, manifest) = corpus_fixture();
+        let bytes = wav(1, 16_000, 16, &vec![0; FIRST_REJECTED_AUDIO_FRAMES]);
+        assert!(bytes.len() < 841_856);
+        fs::write(directory.path().join("sample.wav"), &bytes).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        update_single_case_manifest(&manifest, |entry| {
+            entry.insert(
+                "duration_seconds".into(),
+                (FIRST_REJECTED_AUDIO_FRAMES as f64 / 16_000.0).into(),
+            );
+            entry.insert("sha256".into(), digest.into());
+            entry.insert("frames".into(), FIRST_REJECTED_AUDIO_FRAMES.into());
+        });
+
+        assert_eq!(
+            load(&manifest).err().unwrap(),
+            "corpus case sample frame count mismatch or overflow"
+        );
+    }
+
+    #[test]
     fn rejects_duplicate_and_invalid_case_ids() {
         let (_directory, manifest) = corpus_fixture();
         let original = read_manifest(&manifest);
