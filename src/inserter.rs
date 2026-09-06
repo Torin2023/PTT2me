@@ -673,13 +673,22 @@ impl<P: PasteboardAccess, C: PasteCommand> InsertionTransaction<P, C> {
     }
 
     pub(crate) fn restore(&mut self) -> Result<(), InsertError> {
-        if !self.restore_required {
-            return Ok(());
-        }
-        self.pasteboard
-            .restore(&self.snapshot, self.temporary.change_count)?;
-        self.restore_required = false;
-        Ok(())
+        let started = Instant::now();
+        let result = (|| {
+            if !self.restore_required {
+                return Ok(());
+            }
+            self.pasteboard
+                .restore(&self.snapshot, self.temporary.change_count)?;
+            self.restore_required = false;
+            Ok(())
+        })();
+        crate::performance_diagnostics::log(
+            crate::performance_diagnostics::CLIPBOARD_RESTORATION,
+            started.elapsed(),
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        result
     }
 
     pub(crate) fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {

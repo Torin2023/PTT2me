@@ -4,6 +4,8 @@
 
 #[path = "../../src/inserter.rs"]
 mod inserter;
+#[path = "../../src/performance_diagnostics.rs"]
+mod performance_diagnostics;
 #[path = "../../src/text_inserter.rs"]
 mod text_inserter;
 

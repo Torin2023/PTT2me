@@ -363,7 +363,14 @@ where
     A: AccessibilityProbe,
     P: ClipboardPaste,
 {
-    accessibility.ensure_not_secure()?;
+    let started = Instant::now();
+    let security = accessibility.ensure_not_secure();
+    crate::performance_diagnostics::log(
+        crate::performance_diagnostics::INSERTION_SECURITY_PROBE,
+        started.elapsed(),
+        if security.is_ok() { "ok" } else { "error" },
+    );
+    security?;
     insertion.paste()
 }
 

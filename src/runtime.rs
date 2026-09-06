@@ -38,6 +38,7 @@ use crate::output_preferences::{
     OutputPreferenceController, OutputPreferenceError, OutputPreferenceRepository,
     RawOutputPreferenceStore, SystemOutputPreferenceStore,
 };
+use crate::performance_diagnostics;
 use crate::permission_migration::{
     persist_setup_completion_if_granted, run_system_permission_migration, BuildIdentity,
     PermissionMigrationRunError, PermissionMigrationSuccess, SystemPermissionMigrationStore,
@@ -990,6 +991,7 @@ pub struct Runtime {
     asr: AsrTask,
     asr_recovery: AsrRecovery,
     asr_generation: Option<u64>,
+    asr_phase_started: Option<(&'static str, Instant)>,
     asr_shutdown: AsrShutdown,
     model_preparation: Option<ModelPreparationTask>,
     permission_migration: Option<PermissionMigrationTask>,
@@ -1143,6 +1145,7 @@ impl Runtime {
             asr,
             asr_recovery: AsrRecovery::default(),
             asr_generation: None,
+            asr_phase_started: None,
             asr_shutdown: AsrShutdown::default(),
             model_preparation: Some(model_preparation),
             permission_migration: None,
@@ -1350,6 +1353,19 @@ impl Runtime {
         let Some(result) = self.asr.poll_one(Instant::now()) else {
             return false;
         };
+        if result.is_some() {
+            let outcome = if matches!(
+                &result,
+                Some(Ok(AsrEvent::Loaded(Ok(())) | AsrEvent::Recognized(Ok(_))))
+            ) {
+                "ok"
+            } else {
+                "error"
+            };
+            if let Some((phase, started)) = self.asr_phase_started.take() {
+                performance_diagnostics::log(phase, started.elapsed(), outcome);
+            }
+        }
         match result {
             Some(Ok(AsrEvent::Loaded(Ok(())))) => {
                 self.asr_recovery.loaded();
@@ -1411,6 +1427,7 @@ impl Runtime {
 
     fn handle_asr_error(&mut self, error: AsrTaskError) {
         tracing::error!(error_category = "asr_worker", error = ?error);
+        self.asr_phase_started = None;
         // Cleanup checks must not inherit the retired operation's (possibly
         // minutes-away) watchdog deadline.
         cancel_timer(&self.run_loop, &mut self.asr_timer);
@@ -1431,7 +1448,10 @@ impl Runtime {
             return;
         }
         self.dispatch(AppEvent::AsrRecoveryStarted);
-        if let Err(error) = self.asr.send(AsrCommand::Load(paths), Instant::now()) {
+        if let Err(error) = self.send_asr(
+            AsrCommand::Load(paths),
+            performance_diagnostics::ASR_WORKER_LOAD,
+        ) {
             tracing::error!(error_category = "asr_reload", error = ?error);
             self.asr_recovery.unavailable = true;
             self.dispatch(if self.asr.retry_ready() {
@@ -1540,10 +1560,10 @@ impl Runtime {
                 self.dispatch(AppEvent::PermissionMigrationCompleted);
                 self.start_permission_setup();
                 self.asr_recovery.paths = Some(result.paths.clone());
-                if let Err(error) = self
-                    .asr
-                    .send(AsrCommand::Load(result.paths), Instant::now())
-                {
+                if let Err(error) = self.send_asr(
+                    AsrCommand::Load(result.paths),
+                    performance_diagnostics::ASR_WORKER_LOAD,
+                ) {
                     self.handle_asr_error(error);
                 }
             }
@@ -2083,10 +2103,10 @@ impl Runtime {
                     sample_count = samples.len(),
                     lifecycle = "recognition_started"
                 );
-                if let Err(error) = self
-                    .asr
-                    .send(AsrCommand::Transcribe(samples), Instant::now())
-                {
+                if let Err(error) = self.send_asr(
+                    AsrCommand::Transcribe(samples),
+                    performance_diagnostics::ASR_WORKER_TRANSCRIPTION,
+                ) {
                     self.handle_asr_error(error);
                 }
             }
@@ -2150,6 +2170,15 @@ impl Runtime {
                     .map_or(0, Vec::len),
                 elapsed_ms = prepared.elapsed.as_millis() as u64,
                 lifecycle = "capture_prepared"
+            );
+            performance_diagnostics::log(
+                performance_diagnostics::AUDIO_PREPARATION,
+                prepared.elapsed,
+                if prepared.result.is_ok() {
+                    "ok"
+                } else {
+                    "error"
+                },
             );
             if let Err(error) = &prepared.result {
                 tracing::warn!(error_category = "audio_preparation", error = ?error);
@@ -2215,7 +2244,14 @@ impl Runtime {
         else {
             return;
         };
-        match text_inserter::begin(&queued.text, queued.append_space) {
+        let started = Instant::now();
+        let insertion = text_inserter::begin(&queued.text, queued.append_space);
+        performance_diagnostics::log(
+            performance_diagnostics::INSERTION_PREPARATION,
+            started.elapsed(),
+            if insertion.is_ok() { "ok" } else { "error" },
+        );
+        match insertion {
             Ok(insertion) => {
                 let flow = PasteFlow::begin(queued.generation, insertion, self);
                 self.pending_insertion = Some(flow);
@@ -2340,6 +2376,20 @@ impl Runtime {
 
     fn cancel_finish_timer(&mut self) {
         cancel_timer(&self.run_loop, &mut self.finish_timer);
+    }
+
+    fn send_asr(&mut self, command: AsrCommand, phase: &'static str) -> Result<(), AsrTaskError> {
+        let started = Instant::now();
+        match self.asr.send(command, started) {
+            Ok(()) => {
+                self.asr_phase_started = Some((phase, started));
+                Ok(())
+            }
+            Err(error) => {
+                performance_diagnostics::log(phase, started.elapsed(), "error");
+                Err(error)
+            }
+        }
     }
 
     fn cancel_capture_limit_timer(&mut self) {

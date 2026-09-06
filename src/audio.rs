@@ -369,6 +369,15 @@ fn prepare_capture(samples: Vec<f32>, source_rate: u32) -> Option<Vec<f32>> {
     (!samples.is_empty()).then_some(samples)
 }
 
+/// Uses the production capture preparation path for the explicit performance tool.
+#[doc(hidden)]
+pub fn prepare_samples_for_performance_measurement(
+    samples: Vec<f32>,
+    source_rate: u32,
+) -> Option<Vec<f32>> {
+    prepare_capture(samples, source_rate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
