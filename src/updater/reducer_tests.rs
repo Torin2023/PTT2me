@@ -7,6 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -19,7 +20,7 @@ use super::{
     retain_completed_downloads_with_barrier, validate_http_response_metadata,
     verify_and_open_dmg_with, ArtifactKind, ArtifactWorker, CheckReason, DownloadResponse,
     FileUpdateStorage, OperationId, QuarantineChecker, RetryAction, RetryContext, SelectedArtifact,
-    UpdateFailure, UpdateFetch, Updater, UpdaterCommand, UpdaterEvent, UpdaterState,
+    UpdateFailure, UpdateFetch, UpdateStorage, Updater, UpdaterCommand, UpdaterEvent, UpdaterState,
     VerifiedDownload, AUTOMATIC_CHECK_INTERVAL_SECONDS, FIRST_AUTOMATIC_CHECK_DELAY_SECONDS,
 };
 use crate::constants::MAX_UPDATE_ARTIFACT_BYTES;
@@ -1711,14 +1712,54 @@ impl QuarantineChecker for FixedQuarantine {
     }
 }
 
-struct RootModeFailureQuarantine {
-    cache_root: PathBuf,
+#[derive(Debug, PartialEq, Eq)]
+struct RetentionCall {
+    version: String,
+    build: u64,
+    active_path: PathBuf,
 }
 
-impl QuarantineChecker for RootModeFailureQuarantine {
-    fn has_quarantine(&self, _path: &Path) -> Result<bool, UpdateFailure> {
-        fs::set_permissions(&self.cache_root, fs::Permissions::from_mode(0o777)).unwrap();
-        Ok(true)
+struct RetentionFailureStorage {
+    cached_path: PathBuf,
+    call: Arc<Mutex<Option<RetentionCall>>>,
+}
+
+impl UpdateStorage for RetentionFailureStorage {
+    fn lookup_verified(
+        &self,
+        _release: &VerifiedRelease,
+        _kind: ArtifactKind,
+        _artifact: &ArtifactDescriptor,
+    ) -> Result<Option<PathBuf>, UpdateFailure> {
+        Ok(Some(self.cached_path.clone()))
+    }
+
+    fn store_verified(
+        &self,
+        _release: &VerifiedRelease,
+        _kind: ArtifactKind,
+        _artifact: &ArtifactDescriptor,
+        _reader: &mut (dyn Read + Send),
+        _content_length: Option<u64>,
+    ) -> Result<PathBuf, UpdateFailure> {
+        panic!("cache hit must not store")
+    }
+
+    fn discard(&self, _path: &Path) -> Result<(), UpdateFailure> {
+        panic!("accepted verified download must not be discarded")
+    }
+
+    fn retain_completed(
+        &self,
+        current_release: &VerifiedRelease,
+        active_path: &Path,
+    ) -> Result<(), UpdateFailure> {
+        *self.call.lock().unwrap() = Some(RetentionCall {
+            version: current_release.version.to_string(),
+            build: current_release.build,
+            active_path: active_path.to_owned(),
+        });
+        Err(UpdateFailure::Storage)
     }
 }
 
@@ -1773,21 +1814,18 @@ fn artifact_worker_requires_quarantine_before_reporting_a_ready_path() {
 fn artifact_worker_keeps_verified_download_when_best_effort_retention_fails() {
     let cache = tempfile::tempdir().unwrap();
     let release = verified_release();
-    let active = cache_verified_download(
-        cache.path(),
-        &release,
-        ArtifactKind::Update,
-        &release.application_update,
-        Cursor::new(b"verified PTT2me update dmg fixture"),
-        Some(34),
-    )
-    .unwrap();
+    let active = cache
+        .path()
+        .join("PTT2me-1.0.6-202608011200-update-macos-arm64.dmg");
+    fs::write(&active, b"verified cached artifact").unwrap();
+    let call = Arc::new(Mutex::new(None));
     let worker = ArtifactWorker::new(
         OfflineFetch,
-        FileUpdateStorage::new(cache.path().to_owned()),
-        RootModeFailureQuarantine {
-            cache_root: cache.path().to_owned(),
+        RetentionFailureStorage {
+            cached_path: active.clone(),
+            call: call.clone(),
         },
+        FixedQuarantine(true),
     );
 
     let download = worker
@@ -1795,8 +1833,15 @@ fn artifact_worker_keeps_verified_download_when_best_effort_retention_fails() {
         .unwrap();
 
     assert_eq!(download.path(), active);
-    assert!(active.is_file());
-    fs::set_permissions(cache.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(fs::read(&active).unwrap(), b"verified cached artifact");
+    assert_eq!(
+        *call.lock().unwrap(),
+        Some(RetentionCall {
+            version: "1.0.6".to_owned(),
+            build: 202608011200,
+            active_path: active,
+        })
+    );
 }
 
 #[test]
@@ -1814,6 +1859,10 @@ fn artifact_worker_uses_quarantined_cache_before_network_and_cleans_stale_partia
     .unwrap();
     let partial_path = final_path.with_extension("dmg.part");
     fs::write(&partial_path, b"stale interrupted body").unwrap();
+    let previous = cache.path().join("PTT2me-1.0.5-1-update-macos-arm64.dmg");
+    let obsolete = cache.path().join("PTT2me-1.0.4-1-update-macos-arm64.dmg");
+    fs::write(&previous, b"previous").unwrap();
+    fs::write(&obsolete, b"obsolete").unwrap();
 
     let worker = ArtifactWorker::new(
         OfflineFetch,
@@ -1826,6 +1875,8 @@ fn artifact_worker_uses_quarantined_cache_before_network_and_cleans_stale_partia
 
     assert_eq!(reused.path(), final_path);
     assert!(!partial_path.exists());
+    assert!(previous.is_file());
+    assert!(!obsolete.exists());
 }
 
 #[test]
