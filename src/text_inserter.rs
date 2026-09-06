@@ -228,8 +228,8 @@ mod tests {
     use super::{
         begin_with, classify_ax_attribute, is_secure_ax_field, paste_with, AccessibilityProbe,
         AxAttributeRequirement, ClipboardInsertion, ClipboardPaste, AX_ERROR_ATTRIBUTE_UNSUPPORTED,
-        AX_ERROR_NO_VALUE, AX_ROLE_ATTRIBUTE, AX_SECURE_TEXT_FIELD_SUBROLE, AX_SUBROLE_ATTRIBUTE,
-        AX_SUCCESS,
+        AX_ERROR_NO_VALUE, AX_FOCUSED_UI_ELEMENT_ATTRIBUTE, AX_ROLE_ATTRIBUTE,
+        AX_SECURE_TEXT_FIELD_SUBROLE, AX_SUBROLE_ATTRIBUTE, AX_SUCCESS,
     };
     use crate::inserter::InsertError;
 
@@ -412,6 +412,21 @@ mod tests {
         assert_eq!(error.diagnostic_stage(), Some("copy_attribute"));
         assert_eq!(error.ax_attribute(), Some(AX_ROLE_ATTRIBUTE));
         assert_eq!(error.ax_error_code(), Some(AX_ERROR_ATTRIBUTE_UNSUPPORTED));
+    }
+
+    #[test]
+    fn missing_required_focus_keeps_attribute_and_no_value_error() {
+        let error = classify_ax_attribute(
+            AX_ERROR_NO_VALUE,
+            true,
+            AX_FOCUSED_UI_ELEMENT_ATTRIBUTE,
+            AxAttributeRequirement::Required,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.diagnostic_stage(), Some("copy_attribute"));
+        assert_eq!(error.ax_attribute(), Some(AX_FOCUSED_UI_ELEMENT_ATTRIBUTE));
+        assert_eq!(error.ax_error_code(), Some(AX_ERROR_NO_VALUE));
     }
 
     #[test]
