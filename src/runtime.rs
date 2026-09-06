@@ -18,6 +18,7 @@ use objc2_foundation::MainThreadMarker;
 use crate::asr::{spawn_asr_worker, AsrCommand, AsrEvent};
 use crate::asr_task::{AsrTask, AsrTaskError};
 use crate::audio::{AudioError, AudioRecorder};
+use crate::audio_task::AudioPreparationTask;
 use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS};
 use crate::hotkey::{AssignmentEpoch, HotkeyControl, HotkeyListener, HotkeySignal};
 use crate::inserter::{InsertError, PASTEBOARD_RESTORE_DELAY_MS, PASTEBOARD_SETTLE_DELAY_MS};
@@ -580,6 +581,65 @@ extern "C" fn timer_fired(_timer: CFRunLoopTimerRef, raw_context: *mut c_void) {
     }
 }
 
+#[derive(Default, PartialEq, Eq)]
+enum CapturePhase {
+    #[default]
+    Inactive,
+    Recording,
+    Preparing,
+    Submitted,
+}
+
+/// Dictation identity survives controller status changes. Recognizing alone is
+/// insufficient: a later dictation can have the same status as a cancelled one.
+#[derive(Default)]
+struct DictationCapture {
+    generation: u64,
+    phase: CapturePhase,
+}
+
+impl DictationCapture {
+    fn begin(&mut self) {
+        self.abandon();
+        self.phase = CapturePhase::Recording;
+    }
+
+    fn abandon(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.phase = CapturePhase::Inactive;
+    }
+
+    fn abandon_unless_active(&mut self, status: &AppStatus) -> bool {
+        if self.phase != CapturePhase::Inactive
+            && !matches!(status, AppStatus::Recording | AppStatus::Recognizing)
+        {
+            self.abandon();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_preparation(&mut self) -> Option<u64> {
+        if self.phase != CapturePhase::Recording {
+            return None;
+        }
+        self.phase = CapturePhase::Preparing;
+        Some(self.generation)
+    }
+
+    fn accept(&mut self, generation: u64, status: &AppStatus) -> bool {
+        if self.phase != CapturePhase::Preparing
+            || self.generation != generation
+            || *status != AppStatus::Recognizing
+        {
+            return false;
+        }
+        self.phase = CapturePhase::Submitted;
+        true
+    }
+}
+
 /// Main-thread owner of the reducer and every macOS UI/input component.
 pub struct Runtime {
     controller: AppController,
@@ -591,6 +651,8 @@ pub struct Runtime {
     assignment: AssignmentTracker,
     menu_readiness: MenuReadiness,
     recorder: AudioRecorder,
+    audio_preparation: AudioPreparationTask,
+    dictation_capture: DictationCapture,
     hotkey: Option<HotkeyListener>,
     hotkey_sender: Sender<HotkeySignal>,
     hotkey_events: Receiver<HotkeySignal>,
@@ -670,6 +732,8 @@ impl Runtime {
             assignment: AssignmentTracker::default(),
             menu_readiness,
             recorder: AudioRecorder::new(),
+            audio_preparation: AudioPreparationTask::spawn(),
+            dictation_capture: DictationCapture::default(),
             hotkey: None,
             hotkey_sender,
             hotkey_events,
@@ -811,6 +875,8 @@ impl Runtime {
         if self.pending_insertion.is_none() {
             self.drain_hotkey_events();
         }
+
+        self.drain_audio_preparation();
 
         while let Some(result) = self.asr.poll(Instant::now()) {
             match result {
@@ -1067,6 +1133,8 @@ impl Runtime {
         {
             return;
         }
+        self.dictation_capture.abandon();
+        self.audio_preparation.stop();
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         let application = NSApplication::sharedApplication(mtm);
         unsafe { application.terminate(None) };
@@ -1216,6 +1284,15 @@ impl Runtime {
 
     fn dispatch(&mut self, event: AppEvent) {
         let effects = self.controller.handle(event);
+        if self
+            .dictation_capture
+            .abandon_unless_active(self.controller.status())
+        {
+            self.audio_preparation.cancel();
+            self.cancel_finish_timer();
+            self.cancel_capture_limit_timer();
+            self.recorder.abort();
+        }
         self.menu_readiness
             .set_ready(self.controller.status() == &AppStatus::Ready);
         self.assignment
@@ -1262,6 +1339,8 @@ impl Runtime {
                 }
             }
             Effect::StartCapture => {
+                self.audio_preparation.cancel();
+                self.dictation_capture.begin();
                 match capture_start_result_event(self.recorder.start(), &self.hotkey_control) {
                     Ok(()) => {
                         crate::browser_accessibility::prepare_focused_browser();
@@ -1275,6 +1354,8 @@ impl Runtime {
                 }
             }
             Effect::AbortCapture => {
+                self.dictation_capture.abandon();
+                self.audio_preparation.cancel();
                 self.cancel_finish_timer();
                 self.cancel_capture_limit_timer();
                 self.recorder.abort();
@@ -1320,17 +1401,51 @@ impl Runtime {
     }
 
     fn finish_capture(&mut self) {
-        let stop_result = self.recorder.stop();
-        match &stop_result {
-            Ok(samples) => {
-                let sample_count = samples.as_ref().map_or(0, Vec::len);
-                tracing::debug!(sample_count, lifecycle = "capture_finished");
+        self.cancel_finish_timer();
+        if self.controller.status() != &AppStatus::Recognizing {
+            return;
+        }
+        let Some(generation) = self.dictation_capture.expect_preparation() else {
+            return;
+        };
+        match self.recorder.finish() {
+            Ok(capture) => {
+                if let Err(error) = self.audio_preparation.submit(generation, capture) {
+                    tracing::warn!(error_category = "audio_preparation_submit", error = ?error);
+                    self.dispatch(AppEvent::CaptureFailed);
+                }
             }
             Err(_) => {
                 tracing::warn!(error_category = "microphone_stop");
+                self.dispatch(AppEvent::CaptureFailed);
             }
         }
-        self.dispatch(capture_result_event(stop_result));
+    }
+
+    fn drain_audio_preparation(&mut self) {
+        while let Some(prepared) = self.audio_preparation.poll() {
+            if !self
+                .dictation_capture
+                .accept(prepared.generation, self.controller.status())
+            {
+                continue;
+            }
+            tracing::debug!(
+                native_sample_count = prepared.native_sample_count,
+                sample_count = prepared
+                    .result
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map_or(0, Vec::len),
+                elapsed_ms = prepared.elapsed.as_millis() as u64,
+                lifecycle = "capture_prepared"
+            );
+            if let Err(error) = &prepared.result {
+                tracing::warn!(error_category = "audio_preparation", error = ?error);
+            }
+            self.dispatch(capture_result_event(prepared.result));
+        }
     }
 
     fn replace_finish_timer(&mut self, delay_ms: u64) {
@@ -1448,7 +1563,7 @@ fn log_text_insertion_error(error: InsertError) {
     );
 }
 
-pub(crate) fn capture_result_event(result: Result<Option<Vec<f32>>, AudioError>) -> AppEvent {
+pub(crate) fn capture_result_event<E>(result: Result<Option<Vec<f32>>, E>) -> AppEvent {
     match result {
         Ok(samples) => AppEvent::AudioReady(samples),
         Err(_) => AppEvent::CaptureFailed,
@@ -1457,6 +1572,8 @@ pub(crate) fn capture_result_event(result: Result<Option<Vec<f32>>, AudioError>)
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        self.dictation_capture.abandon();
+        self.audio_preparation.stop();
         cancel_timer(&self.run_loop, &mut self.drain_timer);
         cancel_timer(&self.run_loop, &mut self.updater_timer);
         cancel_timer(&self.run_loop, &mut self.permission_timer);
@@ -1612,6 +1729,75 @@ mod tests {
         TriggerKey,
     };
     use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
+
+    #[test]
+    fn permission_transition_invalidates_preparation_before_new_recognizing_state() {
+        let mut capture = super::DictationCapture::default();
+        let mut controller = AppController::new();
+        controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
+        controller.handle(AppEvent::ModelLoaded(Ok(())));
+        controller.handle(AppEvent::TriggerPressed);
+        capture.begin();
+        controller.handle(AppEvent::TriggerReleased { short: false });
+        let old = capture.expect_preparation().unwrap();
+        controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
+        assert!(capture.abandon_unless_active(controller.status()));
+        controller.handle(AppEvent::TriggerPressed);
+        capture.begin();
+        controller.handle(AppEvent::TriggerReleased { short: false });
+        let current = capture.expect_preparation().unwrap();
+        assert!(!capture.accept(old, controller.status()));
+        assert!(capture.accept(current, controller.status()));
+        assert!(
+            !capture.accept(current, controller.status()),
+            "duplicate audio accepted"
+        );
+    }
+
+    #[test]
+    fn preparation_failures_are_recoverable_and_never_recognize_or_insert() {
+        use crate::audio_task::AudioPreparationError;
+        for error in [
+            AudioPreparationError::Busy,
+            AudioPreparationError::Panicked,
+            AudioPreparationError::Disconnected,
+        ] {
+            let mut controller = AppController::new();
+            controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
+            controller.handle(AppEvent::ModelLoaded(Ok(())));
+            controller.handle(AppEvent::TriggerPressed);
+            controller.handle(AppEvent::TriggerReleased { short: false });
+            let effects = controller.handle(super::capture_result_event(Err(error)));
+            assert!(effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::Recognize(_) | Effect::InsertText(_))));
+            assert!(matches!(
+                controller.status(),
+                AppStatus::Error {
+                    recoverable: true,
+                    ..
+                }
+            ));
+            controller.handle(AppEvent::ErrorTimerFired);
+            assert_eq!(controller.status(), &AppStatus::Ready);
+        }
+    }
+
+    #[test]
+    fn aborted_capture_and_shutdown_reject_old_audio() {
+        let mut capture = super::DictationCapture::default();
+        capture.begin();
+        let old = capture.expect_preparation().unwrap();
+        capture.abandon();
+        assert!(!capture.accept(old, &AppStatus::Recognizing));
+        assert_eq!(capture.expect_preparation(), None);
+        capture.begin();
+        let next = capture.expect_preparation().unwrap();
+        assert_ne!(old, next);
+        assert!(!capture.accept(next, &AppStatus::Ready));
+        capture.abandon();
+        assert!(!capture.accept(next, &AppStatus::Recognizing));
+    }
 
     struct RecordingMicrophoneBoundary {
         events: Rc<RefCell<Vec<&'static str>>>,

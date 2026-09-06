@@ -4,6 +4,7 @@ compile_error!("PTT2me supports only aarch64-apple-darwin");
 pub mod asr;
 mod asr_task;
 pub mod audio;
+mod audio_task;
 mod browser_accessibility;
 pub mod constants;
 pub mod hotkey;
