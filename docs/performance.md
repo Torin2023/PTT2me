@@ -57,6 +57,11 @@ a non-symlink regular file, bounded to the production capture allowance,
 checked against its declared SHA-256, and decoded only if it is mono 16 kHz
 PCM16. Warmups are limited to 1..=3 and measured repeats to 1..=20.
 
+Schema 2 labels each configuration wall and CPU interval as recognizer load,
+warmups, measured transcriptions, and the per-case quantile/RTF report
+bookkeeping through the final resource snapshot. Per-case transcription
+latencies remain timed around the recognizer call itself.
+
 ## Recorded result
 
 The historical run on 2026-09-06 used the earlier schema 1 tool. Its
@@ -83,9 +88,12 @@ The synthetic Apple Milena 150 wpm corpus had four cases lasting 3.2243,
 
 One warmup and five measured repeats were run for every fixed case and CPU
 configuration. p50 and p95 use nearest rank within the five repeats for that
-case. CPU time is the user plus system delta for recognizer load, warmups, and
-measured transcriptions in the shared comparison process. Peak RSS comes from
-the corresponding single-configuration process.
+case. Configuration wall and CPU time start before recognizer load and include
+warmups, measured transcriptions, per-case quantile/RTF allocations and
+sorting, report construction, and the final resource snapshot in the shared
+comparison process. The historical values below already used this interval;
+this scope correction does not relabel them as new measurements. Peak RSS
+comes from the corresponding single-configuration process.
 
 | CPU threads | Native load (ms) | Configuration wall (ms) | CPU time (ms) | Peak RSS (MiB) |
 | ---: | ---: | ---: | ---: | ---: |
