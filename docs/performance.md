@@ -12,14 +12,25 @@ accepts an existing verified model and an explicit consented mono 16 kHz PCM16
 WAV corpus; it never downloads either input.
 
 ```bash
+if test -n "$(git status --porcelain=v1 --untracked-files=normal)"; then
+  echo "benchmark source checkout must be clean" >&2
+  exit 1
+fi
+
+export PTT2ME_BENCHMARK_BUILD_COMMIT="$(git rev-parse HEAD)"
+export PTT2ME_BENCHMARK_BUILD_DIRTY=false
+export PTT2ME_BENCHMARK_BUILD_RUSTC="$(rustc --version)"
+export PTT2ME_BENCH_TARGET="$(mktemp -d /private/tmp/ptt2me-asr-benchmark.XXXXXX)"
+export CARGO_TARGET_DIR="$PTT2ME_BENCH_TARGET"
+
 cargo build --release --example asr_performance --locked
 
 PTT2ME_MODEL_DIR=/path/to/gigaam-v3-rnnt-v1
 PTT2ME_CORPUS_MANIFEST=/path/to/verified-manifest.json
 PTT2ME_BENCH_OUTPUT=/private/tmp/ptt2me-asr-performance.json
 
-DYLD_LIBRARY_PATH=target/release/examples \
-  target/release/examples/asr_performance \
+DYLD_LIBRARY_PATH="$PTT2ME_BENCH_TARGET/release/examples" \
+  "$PTT2ME_BENCH_TARGET/release/examples/asr_performance" \
   --model "$PTT2ME_MODEL_DIR" \
   --corpus "$PTT2ME_CORPUS_MANIFEST" \
   --consent-to-process-audio \
@@ -33,6 +44,14 @@ Run the same command once for each of `--threads 1`, `--threads 2`, and
 JSON and corpus audio outside Git. The tool emits no transcript, audio sample,
 input path, or recognized-output digest.
 
+An actual measurement fails closed unless the build command embeds a source
+commit, dirty state, and compiler identity. Schema 2 records those compile-time
+values under `provenance.build`, plus the SHA-256 and size of the executable
+opened by the benchmark process under `provenance.executable`. The separate
+`provenance.runtime_checkout` and `environment.runtime_rustc` fields describe
+the run-time working directory and installed toolchain only; they are not
+compiler or executable provenance.
+
 The corpus manifest is bounded to 64 KiB and 16 cases. Every WAV is opened as
 a non-symlink regular file, bounded to the production capture allowance,
 checked against its declared SHA-256, and decoded only if it is mono 16 kHz
@@ -40,10 +59,19 @@ PCM16. Warmups are limited to 1..=3 and measured repeats to 1..=20.
 
 ## Recorded result
 
-The run used benchmark source commit `5d8b4af2b3915195f035edba64028bc7832086cd`
-on 2026-09-06. The machine was a Mac17,4 with Apple M5, 10 physical/logical
-CPUs, 16 GiB memory, macOS 26.6.2 build 25G83, and Rust 1.94.0. It was on
-battery power with no recorded thermal or performance warning. Moderate
+The historical run on 2026-09-06 used the earlier schema 1 tool. Its
+`source_commit` value was the run-time working-directory HEAD
+`5d8b4af2b3915195f035edba64028bc7832086cd`; that field alone cannot prove
+which source produced the executable. The controlled task record places the
+release build immediately after that commit and before the measurements. A
+later observation of the retained 520,336-byte executable found SHA-256
+`622da31414f6dd13c6e6fdbd843878d1a14972486064a9bb99251db08241fd74`, but
+because schema 1 did not record an executable hash, this later observation is
+not independent proof that every historical measurement used those bytes.
+
+The machine was a Mac17,4 with Apple M5, 10 physical/logical CPUs, 16 GiB
+memory, macOS 26.6.2 build 25G83, and a run-time Rust 1.94.0 observation. It
+was on battery power with no recorded thermal or performance warning. Moderate
 background GUI activity was present.
 
 The fixed model was `gigaam-v3-rnnt-v1`; its embedded manifest SHA-256 was
