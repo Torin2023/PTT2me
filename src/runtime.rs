@@ -1264,6 +1264,7 @@ impl Runtime {
             Effect::StartCapture => {
                 match capture_start_result_event(self.recorder.start(), &self.hotkey_control) {
                     Ok(()) => {
+                        crate::browser_accessibility::prepare_focused_browser();
                         self.replace_capture_limit_timer(MAX_CAPTURE_MS);
                         tracing::debug!(lifecycle = "capture_started");
                     }

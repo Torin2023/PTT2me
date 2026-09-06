@@ -1,6 +1,6 @@
 [package]
 name = "ptt2me"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 description = "Minimal offline GigaAM v3 push-to-talk for macOS"
 
