@@ -1,7 +1,8 @@
 use std::ffi::c_void;
 use std::ptr::null;
+use std::time::{Duration, Instant};
 
-use core_foundation::base::{CFType, CFTypeRef, TCFType};
+use core_foundation::base::{CFType, CFTypeID, CFTypeRef, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
 
 use crate::inserter::{normalize_text, InsertError, PendingInsertion};
@@ -12,6 +13,8 @@ type AXError = i32;
 const AX_SUCCESS: AXError = 0;
 const AX_ERROR_ATTRIBUTE_UNSUPPORTED: AXError = -25205;
 const AX_ERROR_NO_VALUE: AXError = -25212;
+const AX_COPY_TIMEOUT: Duration = Duration::from_millis(200);
+const AX_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const AX_FOCUSED_UI_ELEMENT_ATTRIBUTE: &str = "AXFocusedUIElement";
 const AX_ROLE_ATTRIBUTE: &str = "AXRole";
 const AX_SUBROLE_ATTRIBUTE: &str = "AXSubrole";
@@ -56,56 +59,238 @@ struct SystemAccessibility;
 
 impl AccessibilityProbe for SystemAccessibility {
     fn ensure_not_secure(&mut self) -> Result<(), InsertError> {
+        let clock = SystemProbeClock::new();
+        ensure_not_secure_with(&mut SystemAxAccess, &clock)
+    }
+}
+
+trait ProbeClock {
+    fn elapsed(&self) -> Duration;
+}
+
+struct SystemProbeClock {
+    started: Instant,
+}
+
+impl SystemProbeClock {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl ProbeClock for SystemProbeClock {
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
+struct AxProbeBudget {
+    deadline: Duration,
+}
+
+impl AxProbeBudget {
+    fn new<C: ProbeClock>(clock: &C) -> Self {
+        Self {
+            deadline: clock.elapsed().saturating_add(AX_PROBE_TIMEOUT),
+        }
+    }
+
+    fn remaining<C: ProbeClock>(
+        &self,
+        clock: &C,
+        attribute: &'static str,
+    ) -> Result<Duration, InsertError> {
+        let elapsed = clock.elapsed();
+        let Some(remaining) = self.deadline.checked_sub(elapsed) else {
+            return Err(ax_probe_timeout(elapsed, attribute));
+        };
+        if remaining.is_zero() {
+            return Err(ax_probe_timeout(elapsed, attribute));
+        }
+        Ok(remaining)
+    }
+
+    fn check<C: ProbeClock>(&self, clock: &C, attribute: &'static str) -> Result<(), InsertError> {
+        self.remaining(clock, attribute).map(|_| ())
+    }
+}
+
+fn ax_probe_timeout(elapsed: Duration, attribute: &'static str) -> InsertError {
+    tracing::warn!(
+        error_category = "accessibility_probe_timeout",
+        elapsed_ms = elapsed.as_millis() as u64,
+        limit_ms = AX_PROBE_TIMEOUT.as_millis() as u64,
+        ax_attribute = attribute,
+    );
+    InsertError::accessibility("probe_timeout", Some(attribute), None)
+}
+
+trait AxAccess {
+    type Element;
+    type Value;
+
+    fn create_system_wide(&mut self) -> Result<Self::Element, InsertError>;
+    fn set_messaging_timeout(
+        &mut self,
+        element: &Self::Element,
+        attribute: &'static str,
+        timeout: Duration,
+    ) -> Result<(), InsertError>;
+    fn copy_attribute(
+        &mut self,
+        element: &Self::Element,
+        attribute: &'static str,
+        requirement: AxAttributeRequirement,
+    ) -> Result<Option<Self::Value>, InsertError>;
+    fn value_into_element(&mut self, value: Self::Value) -> Result<Self::Element, InsertError>;
+    fn value_into_string(
+        &mut self,
+        value: Self::Value,
+        attribute: &'static str,
+    ) -> Result<String, InsertError>;
+}
+
+struct SystemAxAccess;
+
+impl AxAccess for SystemAxAccess {
+    type Element = CFType;
+    type Value = CFType;
+
+    fn create_system_wide(&mut self) -> Result<Self::Element, InsertError> {
         let system = unsafe { AXUIElementCreateSystemWide() };
         if system.is_null() {
             return Err(InsertError::accessibility("create_system_wide", None, None));
         }
-        let system = unsafe { CFType::wrap_under_create_rule(system.cast()) };
+        Ok(unsafe { CFType::wrap_under_create_rule(system.cast()) })
+    }
 
-        let focused = copy_ax_attribute(
-            system.as_CFTypeRef().cast(),
-            AX_FOCUSED_UI_ELEMENT_ATTRIBUTE,
-            AxAttributeRequirement::Required,
-        )?
-        .ok_or_else(|| {
-            InsertError::accessibility(
-                "missing_attribute",
+    fn set_messaging_timeout(
+        &mut self,
+        element: &Self::Element,
+        attribute: &'static str,
+        timeout: Duration,
+    ) -> Result<(), InsertError> {
+        let status = unsafe {
+            AXUIElementSetMessagingTimeout(element.as_CFTypeRef().cast(), timeout.as_secs_f32())
+        };
+        if status == AX_SUCCESS {
+            Ok(())
+        } else {
+            Err(InsertError::accessibility(
+                "set_messaging_timeout",
+                Some(attribute),
+                Some(status),
+            ))
+        }
+    }
+
+    fn copy_attribute(
+        &mut self,
+        element: &Self::Element,
+        attribute: &'static str,
+        requirement: AxAttributeRequirement,
+    ) -> Result<Option<Self::Value>, InsertError> {
+        copy_ax_attribute(element.as_CFTypeRef().cast(), attribute, requirement)
+    }
+
+    fn value_into_element(&mut self, value: Self::Value) -> Result<Self::Element, InsertError> {
+        if value.type_of() == unsafe { AXUIElementGetTypeID() } {
+            Ok(value)
+        } else {
+            Err(InsertError::accessibility(
+                "decode_attribute",
                 Some(AX_FOCUSED_UI_ELEMENT_ATTRIBUTE),
                 None,
-            )
-        })?;
-        let focused_ref = focused.as_CFTypeRef().cast();
-
-        let role = copy_ax_attribute(
-            focused_ref,
-            AX_ROLE_ATTRIBUTE,
-            AxAttributeRequirement::Required,
-        )?
-        .ok_or_else(|| {
-            InsertError::accessibility("missing_attribute", Some(AX_ROLE_ATTRIBUTE), None)
-        })?
-        .downcast_into::<CFString>()
-        .ok_or_else(|| {
-            InsertError::accessibility("decode_attribute", Some(AX_ROLE_ATTRIBUTE), None)
-        })?;
-
-        let subrole = match copy_ax_attribute(
-            focused_ref,
-            AX_SUBROLE_ATTRIBUTE,
-            AxAttributeRequirement::Optional,
-        )? {
-            Some(value) => Some(value.downcast_into::<CFString>().ok_or_else(|| {
-                InsertError::accessibility("decode_attribute", Some(AX_SUBROLE_ATTRIBUTE), None)
-            })?),
-            None => None,
-        };
-        let role = role.to_string();
-        let subrole = subrole.map(|value| value.to_string());
-        if is_secure_ax_field(&role, subrole.as_deref()) {
-            return Err(InsertError::SecureField);
+            ))
         }
-        Ok(())
     }
+
+    fn value_into_string(
+        &mut self,
+        value: Self::Value,
+        attribute: &'static str,
+    ) -> Result<String, InsertError> {
+        value
+            .downcast_into::<CFString>()
+            .map(|value| value.to_string())
+            .ok_or_else(|| InsertError::accessibility("decode_attribute", Some(attribute), None))
+    }
+}
+
+fn copy_bounded_ax_attribute<A: AxAccess, C: ProbeClock>(
+    access: &mut A,
+    clock: &C,
+    budget: &AxProbeBudget,
+    element: &A::Element,
+    attribute: &'static str,
+    requirement: AxAttributeRequirement,
+) -> Result<Option<A::Value>, InsertError> {
+    let timeout = budget.remaining(clock, attribute)?.min(AX_COPY_TIMEOUT);
+    access.set_messaging_timeout(element, attribute, timeout)?;
+    budget.check(clock, attribute)?;
+    let value = access.copy_attribute(element, attribute, requirement)?;
+    budget.check(clock, attribute)?;
+    Ok(value)
+}
+
+fn ensure_not_secure_with<A: AxAccess, C: ProbeClock>(
+    access: &mut A,
+    clock: &C,
+) -> Result<(), InsertError> {
+    let budget = AxProbeBudget::new(clock);
+    budget.check(clock, AX_FOCUSED_UI_ELEMENT_ATTRIBUTE)?;
+    let system = access.create_system_wide()?;
+    budget.check(clock, AX_FOCUSED_UI_ELEMENT_ATTRIBUTE)?;
+    let focused = copy_bounded_ax_attribute(
+        access,
+        clock,
+        &budget,
+        &system,
+        AX_FOCUSED_UI_ELEMENT_ATTRIBUTE,
+        AxAttributeRequirement::Required,
+    )?
+    .ok_or_else(|| {
+        InsertError::accessibility(
+            "missing_attribute",
+            Some(AX_FOCUSED_UI_ELEMENT_ATTRIBUTE),
+            None,
+        )
+    })?;
+    let focused = access.value_into_element(focused)?;
+    budget.check(clock, AX_FOCUSED_UI_ELEMENT_ATTRIBUTE)?;
+
+    let role = copy_bounded_ax_attribute(
+        access,
+        clock,
+        &budget,
+        &focused,
+        AX_ROLE_ATTRIBUTE,
+        AxAttributeRequirement::Required,
+    )?
+    .ok_or_else(|| {
+        InsertError::accessibility("missing_attribute", Some(AX_ROLE_ATTRIBUTE), None)
+    })?;
+    let role = access.value_into_string(role, AX_ROLE_ATTRIBUTE)?;
+    budget.check(clock, AX_ROLE_ATTRIBUTE)?;
+
+    let subrole = copy_bounded_ax_attribute(
+        access,
+        clock,
+        &budget,
+        &focused,
+        AX_SUBROLE_ATTRIBUTE,
+        AxAttributeRequirement::Optional,
+    )?
+    .map(|value| access.value_into_string(value, AX_SUBROLE_ATTRIBUTE))
+    .transpose()?;
+    budget.check(clock, AX_SUBROLE_ATTRIBUTE)?;
+
+    if is_secure_ax_field(&role, subrole.as_deref()) {
+        return Err(InsertError::SecureField);
+    }
+    Ok(())
 }
 
 fn is_secure_ax_field(role: &str, subrole: Option<&str>) -> bool {
@@ -213,6 +398,8 @@ pub(crate) fn begin(text: &str, append_space: bool) -> Result<PendingTextInserti
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+    fn AXUIElementGetTypeID() -> CFTypeID;
+    fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout_in_seconds: f32) -> AXError;
     fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,
         attribute: CFStringRef,
@@ -223,12 +410,15 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::rc::Rc;
+    use std::time::Duration;
 
     use super::{
-        begin_with, classify_ax_attribute, is_secure_ax_field, paste_with, AccessibilityProbe,
-        AxAttributeRequirement, ClipboardInsertion, ClipboardPaste, AX_ERROR_ATTRIBUTE_UNSUPPORTED,
-        AX_ERROR_NO_VALUE, AX_FOCUSED_UI_ELEMENT_ATTRIBUTE, AX_ROLE_ATTRIBUTE,
+        begin_with, classify_ax_attribute, ensure_not_secure_with, is_secure_ax_field, paste_with,
+        AccessibilityProbe, AxAccess, AxAttributeRequirement, ClipboardInsertion, ClipboardPaste,
+        ProbeClock, AX_COPY_TIMEOUT, AX_ERROR_ATTRIBUTE_UNSUPPORTED, AX_ERROR_NO_VALUE,
+        AX_FOCUSED_UI_ELEMENT_ATTRIBUTE, AX_PROBE_TIMEOUT, AX_ROLE_ATTRIBUTE,
         AX_SECURE_TEXT_FIELD_SUBROLE, AX_SUBROLE_ATTRIBUTE, AX_SUCCESS,
     };
     use crate::inserter::InsertError;
@@ -446,5 +636,265 @@ mod tests {
         assert!(is_secure_ax_field("AXTextField", Some("AXSecureTextField")));
         assert!(!is_secure_ax_field("AXTextField", None));
         assert!(!is_secure_ax_field("AXTextArea", Some("AXStandardWindow")));
+    }
+
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    enum FakeElement {
+        System,
+        Focused,
+    }
+
+    #[derive(Debug, Clone, Eq, PartialEq)]
+    enum FakeValue {
+        Element(FakeElement),
+        String(&'static str),
+        InvalidElement,
+    }
+
+    #[derive(Debug, Clone, Eq, PartialEq)]
+    enum AxCall {
+        CreateSystemWide,
+        SetTimeout(FakeElement, &'static str, Duration),
+        Copy(FakeElement, &'static str),
+        DecodeElement,
+        DecodeString(&'static str),
+    }
+
+    #[derive(Clone)]
+    struct ManualClock {
+        elapsed: Rc<RefCell<Duration>>,
+    }
+
+    impl ManualClock {
+        fn new() -> Self {
+            Self {
+                elapsed: Rc::new(RefCell::new(Duration::ZERO)),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            *self.elapsed.borrow_mut() += duration;
+        }
+    }
+
+    impl ProbeClock for ManualClock {
+        fn elapsed(&self) -> Duration {
+            *self.elapsed.borrow()
+        }
+    }
+
+    struct FakeAxAccess {
+        calls: Vec<AxCall>,
+        clock: ManualClock,
+        copy_advances: VecDeque<Duration>,
+        decode_advances: VecDeque<Duration>,
+        setter_failure: Option<(&'static str, i32)>,
+        focused_value: FakeValue,
+        role: &'static str,
+        subrole: Option<&'static str>,
+    }
+
+    impl FakeAxAccess {
+        fn normal(clock: ManualClock) -> Self {
+            Self {
+                calls: Vec::new(),
+                clock,
+                copy_advances: VecDeque::new(),
+                decode_advances: VecDeque::new(),
+                setter_failure: None,
+                focused_value: FakeValue::Element(FakeElement::Focused),
+                role: "AXTextArea",
+                subrole: None,
+            }
+        }
+    }
+
+    impl AxAccess for FakeAxAccess {
+        type Element = FakeElement;
+        type Value = FakeValue;
+
+        fn create_system_wide(&mut self) -> Result<Self::Element, InsertError> {
+            self.calls.push(AxCall::CreateSystemWide);
+            Ok(FakeElement::System)
+        }
+
+        fn set_messaging_timeout(
+            &mut self,
+            element: &Self::Element,
+            attribute: &'static str,
+            timeout: Duration,
+        ) -> Result<(), InsertError> {
+            self.calls
+                .push(AxCall::SetTimeout(*element, attribute, timeout));
+            if let Some((failed_attribute, status)) = self.setter_failure {
+                if failed_attribute == attribute {
+                    return Err(InsertError::accessibility(
+                        "set_messaging_timeout",
+                        Some(attribute),
+                        Some(status),
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        fn copy_attribute(
+            &mut self,
+            element: &Self::Element,
+            attribute: &'static str,
+            _requirement: AxAttributeRequirement,
+        ) -> Result<Option<Self::Value>, InsertError> {
+            self.calls.push(AxCall::Copy(*element, attribute));
+            self.clock
+                .advance(self.copy_advances.pop_front().unwrap_or_default());
+            match attribute {
+                AX_FOCUSED_UI_ELEMENT_ATTRIBUTE => Ok(Some(self.focused_value.clone())),
+                AX_ROLE_ATTRIBUTE => Ok(Some(FakeValue::String(self.role))),
+                AX_SUBROLE_ATTRIBUTE => Ok(self.subrole.map(FakeValue::String)),
+                _ => unreachable!(),
+            }
+        }
+
+        fn value_into_element(&mut self, value: Self::Value) -> Result<Self::Element, InsertError> {
+            self.calls.push(AxCall::DecodeElement);
+            self.clock
+                .advance(self.decode_advances.pop_front().unwrap_or_default());
+            match value {
+                FakeValue::Element(element) => Ok(element),
+                FakeValue::String(_) | FakeValue::InvalidElement => {
+                    Err(InsertError::accessibility(
+                        "decode_attribute",
+                        Some(AX_FOCUSED_UI_ELEMENT_ATTRIBUTE),
+                        None,
+                    ))
+                }
+            }
+        }
+
+        fn value_into_string(
+            &mut self,
+            value: Self::Value,
+            attribute: &'static str,
+        ) -> Result<String, InsertError> {
+            self.calls.push(AxCall::DecodeString(attribute));
+            self.clock
+                .advance(self.decode_advances.pop_front().unwrap_or_default());
+            match value {
+                FakeValue::String(value) => Ok(value.to_owned()),
+                FakeValue::Element(_) | FakeValue::InvalidElement => Err(
+                    InsertError::accessibility("decode_attribute", Some(attribute), None),
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn ax_probe_sets_positive_bounded_timeout_before_every_copy() {
+        let clock = ManualClock::new();
+        let mut access = FakeAxAccess::normal(clock.clone());
+        access.copy_advances = VecDeque::from([
+            Duration::from_millis(250),
+            Duration::from_millis(150),
+            Duration::ZERO,
+        ]);
+
+        assert_eq!(ensure_not_secure_with(&mut access, &clock), Ok(()));
+
+        let timeouts = access
+            .calls
+            .iter()
+            .filter_map(|call| match call {
+                AxCall::SetTimeout(_, attribute, timeout) => Some((*attribute, *timeout)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            timeouts,
+            [
+                (AX_FOCUSED_UI_ELEMENT_ATTRIBUTE, AX_COPY_TIMEOUT),
+                (AX_ROLE_ATTRIBUTE, AX_COPY_TIMEOUT),
+                (AX_SUBROLE_ATTRIBUTE, Duration::from_millis(100)),
+            ]
+        );
+        assert!(timeouts.iter().all(|(_, timeout)| !timeout.is_zero()));
+    }
+
+    #[test]
+    fn ax_timeout_setter_failure_prevents_attribute_copy() {
+        let clock = ManualClock::new();
+        let mut access = FakeAxAccess::normal(clock.clone());
+        access.setter_failure = Some((AX_ROLE_ATTRIBUTE, -25204));
+
+        let error = ensure_not_secure_with(&mut access, &clock).unwrap_err();
+
+        assert_eq!(error.diagnostic_stage(), Some("set_messaging_timeout"));
+        assert_eq!(error.ax_attribute(), Some(AX_ROLE_ATTRIBUTE));
+        assert_eq!(error.ax_error_code(), Some(-25204));
+        assert!(!access
+            .calls
+            .contains(&AxCall::Copy(FakeElement::Focused, AX_ROLE_ATTRIBUTE)));
+    }
+
+    #[test]
+    fn expired_ax_probe_stops_before_the_next_native_call() {
+        let clock = ManualClock::new();
+        let mut access = FakeAxAccess::normal(clock.clone());
+        access.copy_advances = VecDeque::from([AX_PROBE_TIMEOUT]);
+
+        let error = ensure_not_secure_with(&mut access, &clock).unwrap_err();
+
+        assert_eq!(error.diagnostic_stage(), Some("probe_timeout"));
+        assert!(!access.calls.iter().any(|call| matches!(
+            call,
+            AxCall::SetTimeout(FakeElement::Focused, _, _) | AxCall::Copy(FakeElement::Focused, _)
+        )));
+    }
+
+    #[test]
+    fn late_final_ax_decode_cannot_authorize_insertion() {
+        let clock = ManualClock::new();
+        let mut access = FakeAxAccess::normal(clock.clone());
+        access.subrole = Some("AXStandardWindow");
+        access.decode_advances = VecDeque::from([
+            Duration::ZERO,
+            Duration::ZERO,
+            AX_PROBE_TIMEOUT + Duration::from_millis(1),
+        ]);
+
+        let error = ensure_not_secure_with(&mut access, &clock).unwrap_err();
+
+        assert_eq!(error.diagnostic_stage(), Some("probe_timeout"));
+        assert_eq!(
+            access.calls.last(),
+            Some(&AxCall::DecodeString(AX_SUBROLE_ATTRIBUTE))
+        );
+    }
+
+    #[test]
+    fn invalid_focused_value_is_rejected_before_focused_ax_calls() {
+        let clock = ManualClock::new();
+        let mut access = FakeAxAccess::normal(clock.clone());
+        access.focused_value = FakeValue::InvalidElement;
+
+        let error = ensure_not_secure_with(&mut access, &clock).unwrap_err();
+
+        assert_eq!(error.diagnostic_stage(), Some("decode_attribute"));
+        assert_eq!(error.ax_attribute(), Some(AX_FOCUSED_UI_ELEMENT_ATTRIBUTE));
+        assert!(!access.calls.iter().any(|call| matches!(
+            call,
+            AxCall::SetTimeout(FakeElement::Focused, _, _) | AxCall::Copy(FakeElement::Focused, _)
+        )));
+    }
+
+    #[test]
+    fn bounded_ax_probe_still_rejects_protected_fields() {
+        let clock = ManualClock::new();
+        let mut access = FakeAxAccess::normal(clock.clone());
+        access.subrole = Some(AX_SECURE_TEXT_FIELD_SUBROLE);
+
+        assert_eq!(
+            ensure_not_secure_with(&mut access, &clock),
+            Err(InsertError::SecureField)
+        );
     }
 }
