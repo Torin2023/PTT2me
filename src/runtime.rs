@@ -748,6 +748,38 @@ pub struct Runtime {
     _pin: PhantomPinned,
 }
 
+/// Completes shutdown after the application's outer run loop has returned.
+/// Borrow only the pinned allocation's owner handle across callback pumping:
+/// no `&mut Runtime` (including one nested in `Pin`) may span a nested run loop
+/// that can invoke timers through their previously stored Runtime pointers.
+pub fn finish_after_run(owner: &mut Pin<Box<Runtime>>) {
+    pump_until_cleanup(owner, Runtime::shutdown_after_run_step, || {
+        CFRunLoop::run_in_mode(
+            unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+            Duration::from_millis(20),
+            true,
+        );
+    });
+}
+
+/// Every pointee borrow is created for one step and ends when that call returns.
+/// The higher-ranked step returns only a boolean, so it cannot retain its
+/// temporary `Pin<&mut T>` for use while the following pump invokes callbacks.
+/// The outer function retains only a reference to the stable owner handle.
+fn pump_until_cleanup<T>(
+    owner: &mut Pin<Box<T>>,
+    mut step: impl for<'access> FnMut(Pin<&'access mut T>) -> bool,
+    mut pump: impl FnMut(),
+) {
+    loop {
+        let complete = step(owner.as_mut());
+        if complete {
+            return;
+        }
+        pump();
+    }
+}
+
 impl Runtime {
     /// Creates and starts the complete runtime. The returned box must remain
     /// alive until `NSApplication::run` returns.
@@ -1299,32 +1331,20 @@ impl Runtime {
         }
     }
 
-    /// Covers a run loop stopped without the menu/updater termination route.
-    /// Keep the pinned runtime and run-loop sources alive until the child is
-    /// reaped. Drop alone only signals cancellation and cannot keep a process alive.
-    pub fn finish_after_run(mut self: Pin<&mut Self>) {
-        unsafe { self.as_mut().get_unchecked_mut() }.begin_shutdown();
-        loop {
-            {
-                let runtime = unsafe { self.as_mut().get_unchecked_mut() };
-                if runtime.asr.cleanup_complete() {
-                    break;
-                }
-                if runtime.asr_shutdown.report_failure(
-                    Instant::now(),
-                    false,
-                    runtime.asr.cleanup_failed(),
-                ) {
-                    tracing::error!(error_category = "asr_shutdown_cleanup_pending");
-                }
-            }
-            // End the mutable borrow before timers can reenter Runtime.
-            CFRunLoop::run_in_mode(
-                unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
-                Duration::from_millis(20),
-                true,
-            );
+    /// One scoped pointee access for the owner-handle shutdown pump. This
+    /// function never pumps callbacks, and its mutable argument ends on return.
+    fn shutdown_after_run_step(self: Pin<&mut Self>) -> bool {
+        let runtime = unsafe { self.get_unchecked_mut() };
+        runtime.begin_shutdown();
+        let cleaned = runtime.asr.cleanup_complete();
+        if runtime.asr_shutdown.report_failure(
+            Instant::now(),
+            cleaned,
+            runtime.asr.cleanup_failed(),
+        ) {
+            tracing::error!(error_category = "asr_shutdown_cleanup_pending");
         }
+        cleaned
     }
 
     fn drain_microphone_permission_completions(&mut self) {
@@ -1943,6 +1963,93 @@ mod tests {
         assert!(recovery.failure().is_none());
         // Recovery owns only retained paths/attempt state; it cannot call model
         // preparation or permission migration and never stores PCM for replay.
+    }
+
+    #[test]
+    fn post_run_shutdown_api_borrows_only_the_pinned_owner_handle() {
+        // Compile-time API regression: Pin<&mut Runtime> is deliberately not
+        // an accepted argument to the function that pumps reentrant callbacks.
+        let _: fn(&mut std::pin::Pin<Box<super::Runtime>>) = super::finish_after_run;
+    }
+
+    #[test]
+    fn post_run_shutdown_pump_runs_callback_before_cleanup_acknowledgment() {
+        use core_foundation::date::CFDate;
+        use core_foundation::runloop::{
+            kCFRunLoopDefaultMode, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext,
+            CFRunLoopTimerRef,
+        };
+        use std::ffi::c_void;
+        use std::marker::PhantomPinned;
+        use std::pin::Pin;
+        use std::time::Instant;
+
+        #[derive(Default)]
+        struct Probe {
+            cleanup_acknowledged: bool,
+            callback_before_ack: bool,
+            callback_during_step: bool,
+            in_step: bool,
+            callback_count: usize,
+            step_count: usize,
+            _pin: PhantomPinned,
+        }
+
+        extern "C" fn callback(_timer: CFRunLoopTimerRef, context: *mut c_void) {
+            // Same lifetime shape as TimerContext.runtime: this pointer was
+            // obtained before the owner-handle pump, and the pinned allocation
+            // outlives its timer. No probe reference is held by that pump.
+            let probe = unsafe { &mut *context.cast::<Probe>() };
+            probe.callback_before_ack = !probe.cleanup_acknowledged;
+            probe.callback_during_step = probe.in_step;
+            probe.callback_count += 1;
+            probe.cleanup_acknowledged = true;
+        }
+
+        let mut owner = Box::pin(Probe::default());
+        let pointer = unsafe { owner.as_mut().get_unchecked_mut() } as *mut Probe;
+        let run_loop = CFRunLoop::get_current();
+        let mode = unsafe { kCFRunLoopDefaultMode };
+        let mut context = CFRunLoopTimerContext {
+            version: 0,
+            info: pointer.cast(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+        };
+        let timer =
+            CFRunLoopTimer::new(CFDate::now().abs_time(), 0.0, 0, 0, callback, &mut context);
+        run_loop.add_timer(&timer, mode);
+        let watchdog = Instant::now() + Duration::from_secs(1);
+        let mut pump_count = 0;
+        super::pump_until_cleanup(
+            &mut owner,
+            |probe: Pin<&mut Probe>| {
+                let probe = unsafe { probe.get_unchecked_mut() };
+                probe.in_step = true;
+                probe.step_count += 1;
+                let complete = probe.cleanup_acknowledged;
+                probe.in_step = false;
+                complete
+            },
+            || {
+                assert!(Instant::now() < watchdog, "cleanup callback watchdog");
+                pump_count += 1;
+                CFRunLoop::run_in_mode(mode, Duration::from_millis(20), true);
+            },
+        );
+        run_loop.remove_timer(&timer, mode);
+
+        let probe = owner.as_ref().get_ref();
+        assert!(pump_count >= 1);
+        assert_eq!(probe.callback_count, 1);
+        assert!(probe.callback_before_ack);
+        assert!(!probe.callback_during_step);
+        assert!(probe.cleanup_acknowledged);
+        assert!(
+            probe.step_count >= 2,
+            "cleanup must be checked after callback"
+        );
     }
 
     #[test]

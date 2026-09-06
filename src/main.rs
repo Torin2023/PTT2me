@@ -5,7 +5,7 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::MainThreadMarker;
 use ptt2me::permissions::prime_microphone_and_exit;
 use ptt2me::release_manifest::verify_release_files;
-use ptt2me::runtime::{smoke_bundled_model, smoke_bundled_model_child, Runtime};
+use ptt2me::runtime::{finish_after_run, smoke_bundled_model, smoke_bundled_model_child, Runtime};
 use ptt2me::single_instance::InstanceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +90,7 @@ fn main() -> ExitCode {
     }
     let mut runtime = Runtime::start(main_thread);
     unsafe { application.run() };
-    runtime.as_mut().finish_after_run();
+    finish_after_run(&mut runtime);
     ExitCode::SUCCESS
 }
 
