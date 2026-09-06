@@ -126,7 +126,7 @@ test("exports a deployable static site without the server bundle", async () => {
     });
 
     const html = await readFile(join(outputDirectory, "index.html"), "utf8");
-    assert.match(html, /Preview 1\.1\.2/);
+    assert.match(html, /Preview 1\.2\.0/);
     assert.match(html, /\/PTT2me\/_next\/static\//);
     assert.doesNotMatch(html, /<script\b/i);
     assert.doesNotMatch(html, /rel="modulepreload"/i);
