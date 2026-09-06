@@ -83,7 +83,9 @@ pub enum AppEvent {
     CaptureFailed,
     AudioReady(Option<Vec<f32>>),
     RecognitionFinished(Result<String, String>),
+    // Command-V completed; delayed clipboard restoration has its own event.
     PasteFinished(Result<(), String>),
+    ClipboardRestoreFailed,
     ErrorTimerFired,
     EventTapLost,
     EventTapRestored,
@@ -228,6 +230,8 @@ impl AppController {
             AppEvent::PasteFinished(Err(_)) if self.status == AppStatus::Recognizing => {
                 self.show_recoverable_error("Не удалось вставить текст")
             }
+            AppEvent::ClipboardRestoreFailed if self.status == AppStatus::Ready => self
+                .show_recoverable_error("Текст вставлен, но не удалось восстановить буфер обмена"),
             AppEvent::ErrorTimerFired
                 if matches!(
                     self.status,

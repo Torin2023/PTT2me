@@ -1651,6 +1651,75 @@ mod tests {
         assert_eq!(insertion.pasteboard.restore_calls, 0);
     }
 
+    impl PasteboardAccess for &mut FakePasteboard {
+        fn change_count(&self) -> isize {
+            (**self).change_count()
+        }
+        fn snapshot(&mut self) -> Result<SnapshotCapture, InsertError> {
+            (**self).snapshot()
+        }
+        fn write_temporary_text(
+            &mut self,
+            text: &str,
+            expected: isize,
+        ) -> Result<TemporaryWrite, TemporaryWriteFailure> {
+            (**self).write_temporary_text(text, expected)
+        }
+        fn restore(
+            &mut self,
+            saved: &PasteboardSnapshot,
+            expected: isize,
+        ) -> Result<(), InsertError> {
+            (**self).restore(saved, expected)
+        }
+    }
+
+    #[test]
+    fn successive_transactions_preserve_user_copy_made_while_next_text_waits() {
+        // Borrow one actual fake board across both production transactions;
+        // the second snapshot must be taken after the first relinquishes it.
+        let original = snapshot(&[&[("public.utf8-plain-text", b"synthetic original")]]);
+        let copied = snapshot(&[
+            &[
+                ("public.utf8-plain-text", b"synthetic copy"),
+                ("public.rtf", b"synthetic rich copy"),
+            ],
+            &[("public.png", &[0x89, 0x50, 0x4e, 0x47])],
+        ]);
+        let mut board = FakePasteboard::with_snapshot(original);
+        {
+            let mut first = InsertionTransaction::begin_with(
+                "synthetic first",
+                &mut board,
+                FakePasteCommand::succeed(),
+            )
+            .unwrap();
+            first.paste().unwrap();
+            // A user copy arrives while the next recognized text is parked.
+            first.pasteboard.current = copied.clone();
+            first.pasteboard.change_count += 1;
+            first.restore().unwrap();
+            assert_eq!(first.pasteboard.current, copied);
+        }
+        {
+            let mut second = InsertionTransaction::begin_with(
+                "synthetic second",
+                &mut board,
+                FakePasteCommand::succeed(),
+            )
+            .unwrap();
+            assert_eq!(second.snapshot, copied);
+            second.paste().unwrap();
+            second.restore().unwrap();
+        }
+        assert_eq!(board.current, copied);
+        assert_eq!(board.temporary_write_calls, 2);
+        assert_eq!(
+            board.restore_calls, 1,
+            "old owner must not overwrite the user copy"
+        );
+    }
+
     #[test]
     fn does_not_overwrite_a_change_during_restore_preparation() {
         let original = snapshot(&[&[("public.utf8-plain-text", b"before")]]);

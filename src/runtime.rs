@@ -421,8 +421,8 @@ enum TimerKind {
     PollPermissions,
     FinishCapture,
     CaptureLimit,
-    PasteCommand,
-    RestorePasteboard,
+    PasteCommand(u64),
+    RestorePasteboard(u64),
     ResetError,
 }
 
@@ -448,7 +448,6 @@ impl PasteInsertion for PendingTextInsertion {
 
 trait PasteFlowBoundary {
     fn schedule(&mut self, kind: TimerKind, delay_ms: u64);
-    fn finish_and_drain_hotkeys(&mut self, result: Result<(), InsertError>);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,42 +457,89 @@ enum PasteFlowState {
     Finished,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PasteOutcome {
+    Delivered,
+    PasteFailed(InsertError),
+    Restored(Result<(), InsertError>),
+}
+
+impl PasteOutcome {
+    fn foreground_event(&self, generation: u64, capture: &DictationCapture) -> Option<AppEvent> {
+        match self {
+            Self::Delivered if generation == capture.generation => {
+                Some(AppEvent::PasteFinished(Ok(())))
+            }
+            Self::PasteFailed(_) if generation == capture.generation => {
+                Some(AppEvent::PasteFinished(Err("insert failed".to_owned())))
+            }
+            Self::Restored(Err(_))
+                if generation == capture.latest_started_generation
+                    && capture.phase == CapturePhase::Inactive =>
+            {
+                Some(AppEvent::ClipboardRestoreFailed)
+            }
+            _ => None,
+        }
+    }
+}
+
 struct PasteFlow<I> {
     insertion: I,
+    generation: u64,
     state: PasteFlowState,
 }
 
 impl<I: PasteInsertion> PasteFlow<I> {
-    fn begin(insertion: I, boundary: &mut impl PasteFlowBoundary) -> Self {
-        boundary.schedule(TimerKind::PasteCommand, PASTEBOARD_SETTLE_DELAY_MS);
+    fn begin(generation: u64, insertion: I, boundary: &mut impl PasteFlowBoundary) -> Self {
+        boundary.schedule(
+            TimerKind::PasteCommand(generation),
+            PASTEBOARD_SETTLE_DELAY_MS,
+        );
         Self {
             insertion,
+            generation,
             state: PasteFlowState::AwaitingPaste,
         }
     }
 
-    fn handle_timer(&mut self, kind: TimerKind, boundary: &mut impl PasteFlowBoundary) {
-        match (self.state, kind) {
-            (PasteFlowState::AwaitingPaste, TimerKind::PasteCommand) => {
-                match self.insertion.paste() {
-                    Ok(()) => {
-                        self.state = PasteFlowState::AwaitingRestore;
-                        boundary
-                            .schedule(TimerKind::RestorePasteboard, PASTEBOARD_RESTORE_DELAY_MS);
-                    }
-                    Err(primary) => {
-                        let error = self.insertion.restore_after_paste_failure(primary);
-                        self.state = PasteFlowState::Finished;
-                        boundary.finish_and_drain_hotkeys(Err(error));
-                    }
+    fn expects_timer(&self, kind: TimerKind) -> bool {
+        matches!((self.state, kind),
+            (PasteFlowState::AwaitingPaste, TimerKind::PasteCommand(generation))
+            | (PasteFlowState::AwaitingRestore, TimerKind::RestorePasteboard(generation))
+            if generation == self.generation)
+    }
+
+    fn handle_timer(
+        &mut self,
+        kind: TimerKind,
+        boundary: &mut impl PasteFlowBoundary,
+    ) -> Option<PasteOutcome> {
+        if !self.expects_timer(kind) {
+            return None;
+        }
+        match self.state {
+            PasteFlowState::AwaitingPaste => match self.insertion.paste() {
+                Ok(()) => {
+                    self.state = PasteFlowState::AwaitingRestore;
+                    boundary.schedule(
+                        TimerKind::RestorePasteboard(self.generation),
+                        PASTEBOARD_RESTORE_DELAY_MS,
+                    );
+                    Some(PasteOutcome::Delivered)
                 }
-            }
-            (PasteFlowState::AwaitingRestore, TimerKind::RestorePasteboard) => {
+                Err(primary) => {
+                    let error = self.insertion.restore_after_paste_failure(primary);
+                    self.state = PasteFlowState::Finished;
+                    Some(PasteOutcome::PasteFailed(error))
+                }
+            },
+            PasteFlowState::AwaitingRestore => {
                 let result = self.insertion.restore();
                 self.state = PasteFlowState::Finished;
-                boundary.finish_and_drain_hotkeys(result);
+                Some(PasteOutcome::Restored(result))
             }
-            _ => {}
+            PasteFlowState::Finished => None,
         }
     }
 
@@ -509,6 +555,52 @@ impl<I: PasteInsertion> PasteFlow<I> {
         self.state = PasteFlowState::Finished;
         result
     }
+}
+
+// Only recognized text waits here; no audio, native objects or hotkeys are queued.
+struct QueuedInsertion {
+    generation: u64,
+    text: String,
+    append_space: bool,
+}
+
+#[derive(Default)]
+struct InsertionQueue(Option<QueuedInsertion>);
+
+impl InsertionQueue {
+    fn park(&mut self, insertion: QueuedInsertion) -> bool {
+        if self.0.is_some() {
+            return false;
+        }
+        self.0 = Some(insertion);
+        true
+    }
+
+    fn discard_unless_current(&mut self, capture: &DictationCapture, status: &AppStatus) {
+        if self.0.as_ref().is_some_and(|queued| {
+            queued.generation != capture.generation
+                || capture.phase != CapturePhase::Inserting
+                || *status != AppStatus::Recognizing
+        }) {
+            self.0 = None;
+        }
+    }
+
+    fn take_if_unblocked(&mut self, paste_pending: bool) -> Option<QueuedInsertion> {
+        if paste_pending {
+            None
+        } else {
+            self.0.take()
+        }
+    }
+}
+
+fn capture_start_allowed(
+    status: &AppStatus,
+    paste_state: Option<PasteFlowState>,
+    queued: bool,
+) -> bool {
+    *status == AppStatus::Ready && paste_state != Some(PasteFlowState::AwaitingPaste) && !queued
 }
 
 struct TimerContext {
@@ -588,6 +680,7 @@ enum CapturePhase {
     Recording,
     Preparing,
     Submitted,
+    Inserting,
 }
 
 /// Dictation identity survives controller status changes. Recognizing alone is
@@ -595,12 +688,14 @@ enum CapturePhase {
 #[derive(Default)]
 struct DictationCapture {
     generation: u64,
+    latest_started_generation: u64,
     phase: CapturePhase,
 }
 
 impl DictationCapture {
     fn begin(&mut self) {
         self.abandon();
+        self.latest_started_generation = self.generation;
         self.phase = CapturePhase::Recording;
     }
 
@@ -618,6 +713,14 @@ impl DictationCapture {
         } else {
             false
         }
+    }
+
+    fn accept_recognition(&mut self, generation: Option<u64>) -> bool {
+        if generation != Some(self.generation) || self.phase != CapturePhase::Submitted {
+            return false;
+        }
+        self.phase = CapturePhase::Inserting;
+        true
     }
 
     fn expect_preparation(&mut self) -> Option<u64> {
@@ -741,6 +844,7 @@ pub struct Runtime {
     insertion_timer: Option<ScheduledTimer>,
     error_timer: Option<ScheduledTimer>,
     pending_insertion: Option<PasteFlow<PendingTextInsertion>>,
+    insertion_queue: InsertionQueue,
     applied_permissions: PermissionSnapshot,
     microphone_permissions: MicrophonePermissionRuntime,
     tap_needs_retry: bool,
@@ -857,6 +961,7 @@ impl Runtime {
             insertion_timer: None,
             error_timer: None,
             pending_insertion: None,
+            insertion_queue: InsertionQueue::default(),
             applied_permissions: PermissionSnapshot::default(),
             microphone_permissions: MicrophonePermissionRuntime::default(),
             tap_needs_retry: false,
@@ -922,7 +1027,7 @@ impl Runtime {
             TimerKind::CaptureLimit => {
                 self.dispatch(AppEvent::CaptureLimitReached);
             }
-            TimerKind::PasteCommand | TimerKind::RestorePasteboard => {
+            TimerKind::PasteCommand(_) | TimerKind::RestorePasteboard(_) => {
                 self.advance_pending_paste(kind);
             }
             TimerKind::ResetError => self.dispatch(AppEvent::ErrorTimerFired),
@@ -980,9 +1085,7 @@ impl Runtime {
 
         self.drain_menu_commands();
 
-        if self.pending_insertion.is_none() {
-            self.drain_hotkey_events();
-        }
+        self.drain_hotkey_events();
 
         self.drain_audio_preparation();
 
@@ -995,8 +1098,9 @@ impl Runtime {
                 }
                 Ok(AsrEvent::Loaded(Err(_))) => self.handle_asr_error(AsrTaskError::WorkerFailed),
                 Ok(AsrEvent::Recognized(result)) => {
-                    if self.asr_generation.take() == Some(self.dictation_capture.generation)
-                        && self.dictation_capture.phase == CapturePhase::Submitted
+                    if self
+                        .dictation_capture
+                        .accept_recognition(self.asr_generation.take())
                     {
                         self.dispatch(AppEvent::RecognitionFinished(result));
                     }
@@ -1252,13 +1356,8 @@ impl Runtime {
                     }
                 }
                 UpdaterMenuAction::OpenDownloadedUpdate => {
-                    if self.pending_insertion.is_none() {
-                        self.drain_hotkey_events();
-                    }
-                    if updater_open_allowed(
-                        self.controller.status(),
-                        self.pending_insertion.is_some(),
-                    ) {
+                    self.drain_hotkey_events();
+                    if updater_open_allowed(self.controller.status(), self.clipboard_busy()) {
                         self.updater
                             .as_mut()
                             .map(SystemUpdaterLane::request_open)
@@ -1273,9 +1372,12 @@ impl Runtime {
         }
     }
 
+    fn clipboard_busy(&self) -> bool {
+        self.pending_insertion.is_some() || self.insertion_queue.0.is_some()
+    }
+
     fn render_updater_menu(&self) {
-        let open_enabled =
-            updater_open_allowed(self.controller.status(), self.pending_insertion.is_some());
+        let open_enabled = updater_open_allowed(self.controller.status(), self.clipboard_busy());
         self.menu.render_updater(
             self.updater.as_ref().map(SystemUpdaterLane::state),
             open_enabled,
@@ -1289,6 +1391,7 @@ impl Runtime {
         self.menu_readiness.set_ready(false);
         self.dictation_capture.abandon();
         self.asr_generation = None;
+        self.insertion_queue.0 = None;
         self.audio_preparation.stop();
         self.recorder.abort();
         self.hotkey.take();
@@ -1308,9 +1411,10 @@ impl Runtime {
 
     fn try_orderly_quit(&mut self) {
         if self.asr_shutdown.started.is_none()
-            && self
-                .orderly_quit
-                .take_if_ready(self.controller.status(), self.pending_insertion.is_some())
+            && self.orderly_quit.take_if_ready(
+                self.controller.status(),
+                self.pending_insertion.is_some() || self.insertion_queue.0.is_some(),
+            )
         {
             self.begin_shutdown();
         }
@@ -1363,7 +1467,13 @@ impl Runtime {
     fn handle_hotkey(&mut self, signal: HotkeySignal) {
         match signal {
             HotkeySignal::Pressed => {
-                self.dispatch(AppEvent::TriggerPressed);
+                if capture_start_allowed(
+                    self.controller.status(),
+                    self.pending_insertion.as_ref().map(|flow| flow.state),
+                    self.insertion_queue.0.is_some(),
+                ) {
+                    self.dispatch(AppEvent::TriggerPressed);
+                }
             }
             HotkeySignal::Released { short } => {
                 self.dispatch(AppEvent::TriggerReleased { short });
@@ -1500,8 +1610,13 @@ impl Runtime {
             self.cancel_capture_limit_timer();
             self.recorder.abort();
         }
-        self.menu_readiness
-            .set_ready(self.controller.status() == &AppStatus::Ready);
+        self.insertion_queue
+            .discard_unless_current(&self.dictation_capture, self.controller.status());
+        self.menu_readiness.set_ready(capture_start_allowed(
+            self.controller.status(),
+            self.pending_insertion.as_ref().map(|flow| flow.state),
+            self.insertion_queue.0.is_some(),
+        ));
         self.assignment
             .cancel_unless_ready(self.controller.status(), &self.hotkey_control);
         self.menu.render(self.controller.status());
@@ -1591,16 +1706,15 @@ impl Runtime {
                 }
             }
             Effect::InsertText(text) => {
-                match text_inserter::begin(&text, self.output_preferences.current().append_space) {
-                    Ok(insertion) => {
-                        let flow = PasteFlow::begin(insertion, self);
-                        self.pending_insertion = Some(flow);
-                    }
-                    Err(error) => {
-                        log_text_insertion_error(error);
-                        self.dispatch(AppEvent::PasteFinished(Err("insert failed".to_owned())));
-                    }
+                let queued = QueuedInsertion {
+                    generation: self.dictation_capture.generation,
+                    text,
+                    append_space: self.output_preferences.current().append_space,
+                };
+                if !self.insertion_queue.park(queued) {
+                    tracing::error!(error_category = "insertion_queue_occupied");
                 }
+                self.drain_insertion_queue();
             }
             Effect::ScheduleErrorReset { delay_ms } => {
                 self.replace_error_timer(delay_ms);
@@ -1704,13 +1818,87 @@ impl Runtime {
         ));
     }
 
+    fn drain_insertion_queue(&mut self) {
+        self.insertion_queue
+            .discard_unless_current(&self.dictation_capture, self.controller.status());
+        if self.asr_shutdown.started.is_some() {
+            return;
+        }
+        let Some(queued) = self
+            .insertion_queue
+            .take_if_unblocked(self.pending_insertion.is_some())
+        else {
+            return;
+        };
+        match text_inserter::begin(&queued.text, queued.append_space) {
+            Ok(insertion) => {
+                let flow = PasteFlow::begin(queued.generation, insertion, self);
+                self.pending_insertion = Some(flow);
+                self.render_updater_menu();
+            }
+            Err(error) => {
+                self.handle_paste_outcome(queued.generation, PasteOutcome::PasteFailed(error))
+            }
+        }
+    }
+
     fn advance_pending_paste(&mut self, kind: TimerKind) {
         let Some(mut flow) = self.pending_insertion.take() else {
             return;
         };
-        flow.handle_timer(kind, self);
-        if !flow.is_finished() {
+        if !flow.expects_timer(kind) {
             self.pending_insertion = Some(flow);
+            return;
+        }
+        cancel_timer(&self.run_loop, &mut self.insertion_timer);
+        let generation = flow.generation;
+        let outcome = flow.handle_timer(kind, self);
+        if flow.is_finished() {
+            // A failed restore can retry in Drop. Finish that ownership scope
+            // before taking the next snapshot or mutating the clipboard again.
+            drop(flow);
+        } else {
+            self.pending_insertion = Some(flow);
+        }
+        if let Some(outcome) = outcome {
+            self.handle_paste_outcome(generation, outcome);
+        }
+        self.drain_insertion_queue();
+        self.render_updater_menu();
+        self.try_orderly_quit();
+    }
+
+    fn handle_paste_outcome(&mut self, generation: u64, outcome: PasteOutcome) {
+        match &outcome {
+            PasteOutcome::Delivered => {
+                tracing::debug!(
+                    method = "clipboard",
+                    lifecycle = "text_inserted",
+                    generation
+                );
+                // Consume the busy prefix before Ready. Never replay a press
+                // made before Command-V, even when the drain timer has not run.
+                self.drain_hotkey_events();
+            }
+            PasteOutcome::PasteFailed(error) | PasteOutcome::Restored(Err(error)) => {
+                tracing::warn!(
+                    error_category = "dictation_clipboard",
+                    generation,
+                    stage = if matches!(outcome, PasteOutcome::PasteFailed(_)) {
+                        "paste"
+                    } else {
+                        "restore"
+                    }
+                );
+                log_text_insertion_error(*error);
+                if matches!(outcome, PasteOutcome::PasteFailed(_)) {
+                    self.drain_hotkey_events();
+                }
+            }
+            PasteOutcome::Restored(Ok(())) => {}
+        }
+        if let Some(event) = outcome.foreground_event(generation, &self.dictation_capture) {
+            self.dispatch(event);
         }
     }
 
@@ -1742,21 +1930,6 @@ fn capture_start_result_event(
 impl PasteFlowBoundary for Runtime {
     fn schedule(&mut self, kind: TimerKind, delay_ms: u64) {
         self.replace_insertion_timer(kind, delay_ms);
-    }
-
-    fn finish_and_drain_hotkeys(&mut self, result: Result<(), InsertError>) {
-        cancel_timer(&self.run_loop, &mut self.insertion_timer);
-        if result.is_ok() {
-            tracing::debug!(method = "clipboard", lifecycle = "text_inserted");
-        } else if let Err(error) = result {
-            log_text_insertion_error(error);
-        }
-        self.dispatch(AppEvent::PasteFinished(
-            result.map_err(|_| "insert failed".to_owned()),
-        ));
-        self.drain_menu_commands();
-        self.drain_hotkey_events();
-        self.try_orderly_quit();
     }
 }
 
@@ -2599,119 +2772,520 @@ mod tests {
         assert_eq!(milliseconds_to_seconds(RELEASE_GRACE_MS), 0.18);
     }
 
+    struct TestPasteInsertion {
+        events: Rc<RefCell<Vec<&'static str>>>,
+        paste_error: Option<InsertError>,
+        restore_error: Option<InsertError>,
+    }
+
+    impl PasteInsertion for TestPasteInsertion {
+        fn paste(&mut self) -> Result<(), InsertError> {
+            self.events.borrow_mut().push("paste");
+            self.paste_error.map_or(Ok(()), Err)
+        }
+        fn restore(&mut self) -> Result<(), InsertError> {
+            self.events.borrow_mut().push("restore");
+            self.restore_error.map_or(Ok(()), Err)
+        }
+        fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {
+            self.events.borrow_mut().push("failure_restore");
+            primary
+        }
+    }
+
+    #[derive(Default)]
+    struct TestPasteTimers {
+        now_ms: u64,
+        scheduled: Vec<(u64, TimerKind)>,
+    }
+
+    impl PasteFlowBoundary for TestPasteTimers {
+        fn schedule(&mut self, kind: TimerKind, delay_ms: u64) {
+            self.scheduled.push((self.now_ms + delay_ms, kind));
+        }
+    }
+
+    fn synthetic_insertion() -> TestPasteInsertion {
+        TestPasteInsertion {
+            events: Rc::new(RefCell::new(Vec::new())),
+            paste_error: None,
+            restore_error: None,
+        }
+    }
+
+    fn apply_paste_outcome(
+        controller: &mut AppController,
+        capture: &mut super::DictationCapture,
+        generation: u64,
+        outcome: super::PasteOutcome,
+    ) {
+        if let Some(event) = outcome.foreground_event(generation, capture) {
+            controller.handle(event);
+            capture.abandon_unless_active(controller.status());
+        }
+    }
+
+    fn inserting_capture() -> super::DictationCapture {
+        let mut capture = super::DictationCapture::default();
+        capture.begin();
+        let generation = capture.expect_preparation().unwrap();
+        assert!(capture.accept(generation, &AppStatus::Recognizing));
+        assert!(capture.accept_recognition(Some(generation)));
+        capture
+    }
+
     #[test]
-    fn paste_flow_orders_command_restore_finish_and_hotkey_drain() {
-        struct RecordingInsertion {
-            events: Rc<RefCell<Vec<&'static str>>>,
-        }
-
-        impl PasteInsertion for RecordingInsertion {
-            fn paste(&mut self) -> Result<(), InsertError> {
-                self.events.borrow_mut().push("paste");
-                Ok(())
-            }
-
-            fn restore(&mut self) -> Result<(), InsertError> {
-                self.events.borrow_mut().push("restore");
-                Ok(())
-            }
-
-            fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {
-                self.events.borrow_mut().push("failure_restore");
-                primary
-            }
-        }
-
-        struct RecordingBoundary {
-            events: Rc<RefCell<Vec<&'static str>>>,
-        }
-
-        impl PasteFlowBoundary for RecordingBoundary {
-            fn schedule(&mut self, kind: TimerKind, delay_ms: u64) {
-                match (kind, delay_ms) {
-                    (TimerKind::PasteCommand, 30) => {
-                        self.events.borrow_mut().push("schedule_paste")
-                    }
-                    (TimerKind::RestorePasteboard, 1_000) => {
-                        self.events.borrow_mut().push("schedule_restore")
-                    }
-                    _ => panic!("unexpected timer"),
-                }
-            }
-
-            fn finish_and_drain_hotkeys(&mut self, result: Result<(), InsertError>) {
-                assert_eq!(result, Ok(()));
-                self.events.borrow_mut().push("finish");
-                self.events.borrow_mut().push("drain_hotkeys");
-            }
-        }
-
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let insertion = RecordingInsertion {
-            events: Rc::clone(&events),
-        };
-        let mut boundary = RecordingBoundary {
-            events: Rc::clone(&events),
-        };
-        let mut flow = PasteFlow::begin(insertion, &mut boundary);
-
-        flow.handle_timer(TimerKind::RestorePasteboard, &mut boundary);
-        flow.handle_timer(TimerKind::PasteCommand, &mut boundary);
-        flow.handle_timer(TimerKind::PasteCommand, &mut boundary);
-        flow.handle_timer(TimerKind::RestorePasteboard, &mut boundary);
-
+    fn paste_delivery_opens_next_capture_before_restore() {
+        let mut controller = recognizing_controller();
+        let mut capture = inserting_capture();
+        let generation = capture.generation;
+        let mut timers = TestPasteTimers::default();
+        let mut flow = PasteFlow::begin(generation, synthetic_insertion(), &mut timers);
+        assert!(!super::capture_start_allowed(
+            controller.status(),
+            Some(flow.state),
+            false
+        ));
+        timers.now_ms = 30;
+        let outcome = flow
+            .handle_timer(TimerKind::PasteCommand(generation), &mut timers)
+            .unwrap();
+        apply_paste_outcome(&mut controller, &mut capture, generation, outcome);
+        assert!(!flow.is_finished(), "clipboard owner must survive delivery");
+        assert!(super::capture_start_allowed(
+            controller.status(),
+            Some(flow.state),
+            false
+        ));
         assert_eq!(
-            events.borrow().as_slice(),
-            [
-                "schedule_paste",
-                "paste",
-                "schedule_restore",
-                "restore",
-                "finish",
-                "drain_hotkeys",
+            controller.handle(AppEvent::TriggerPressed),
+            vec![Effect::StartCapture]
+        );
+        assert_eq!(
+            timers.scheduled,
+            vec![
+                (30, TimerKind::PasteCommand(1)),
+                (1030, TimerKind::RestorePasteboard(1))
             ]
         );
     }
 
     #[test]
+    fn paste_flow_orders_command_restore_and_rejects_stale_timers() {
+        let insertion = synthetic_insertion();
+        let events = Rc::clone(&insertion.events);
+        let mut timers = TestPasteTimers::default();
+        let mut flow = PasteFlow::begin(7, insertion, &mut timers);
+        assert_eq!(
+            flow.handle_timer(TimerKind::RestorePasteboard(7), &mut timers),
+            None
+        );
+        assert_eq!(
+            flow.handle_timer(TimerKind::PasteCommand(6), &mut timers),
+            None
+        );
+        assert_eq!(
+            flow.handle_timer(TimerKind::PasteCommand(7), &mut timers),
+            Some(super::PasteOutcome::Delivered)
+        );
+        assert_eq!(
+            flow.handle_timer(TimerKind::PasteCommand(7), &mut timers),
+            None
+        );
+        assert_eq!(
+            flow.handle_timer(TimerKind::RestorePasteboard(6), &mut timers),
+            None
+        );
+        assert_eq!(events.borrow().as_slice(), ["paste"]);
+        assert_eq!(
+            flow.handle_timer(TimerKind::RestorePasteboard(7), &mut timers),
+            Some(super::PasteOutcome::Restored(Ok(())))
+        );
+        assert_eq!(
+            flow.handle_timer(TimerKind::RestorePasteboard(7), &mut timers),
+            None
+        );
+        assert_eq!(events.borrow().as_slice(), ["paste", "restore"]);
+    }
+
+    #[test]
     fn paste_flow_preserves_insert_error_for_runtime_diagnostics() {
-        struct FailingInsertion;
-
-        impl PasteInsertion for FailingInsertion {
-            fn paste(&mut self) -> Result<(), InsertError> {
-                Err(InsertError::KeyboardEvent)
+        let mut insertion = synthetic_insertion();
+        insertion.paste_error = Some(InsertError::KeyboardEvent);
+        let events = Rc::clone(&insertion.events);
+        let mut timers = TestPasteTimers::default();
+        let mut flow = PasteFlow::begin(1, insertion, &mut timers);
+        let outcome = flow
+            .handle_timer(TimerKind::PasteCommand(1), &mut timers)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            super::PasteOutcome::PasteFailed(InsertError::KeyboardEvent)
+        );
+        assert!(flow.is_finished());
+        assert_eq!(events.borrow().as_slice(), ["paste", "failure_restore"]);
+        assert_eq!(timers.scheduled, [(30, TimerKind::PasteCommand(1))]);
+        let mut controller = recognizing_controller();
+        let mut capture = inserting_capture();
+        apply_paste_outcome(&mut controller, &mut capture, 1, outcome);
+        assert!(matches!(
+            controller.status(),
+            AppStatus::Error {
+                recoverable: true,
+                ..
             }
+        ));
+    }
 
-            fn restore(&mut self) -> Result<(), InsertError> {
-                Ok(())
+    #[test]
+    fn overlapping_phrases_at_exact_gaps_park_one_result_until_restore() {
+        for gap_ms in [0, 100, 500, 1_000] {
+            let mut controller = recognizing_controller();
+            let mut capture = inserting_capture();
+            let first = capture.generation;
+            let mut timers = TestPasteTimers::default();
+            let mut flow = PasteFlow::begin(first, synthetic_insertion(), &mut timers);
+            timers.now_ms = 30;
+            let delivered = flow
+                .handle_timer(TimerKind::PasteCommand(first), &mut timers)
+                .unwrap();
+            apply_paste_outcome(&mut controller, &mut capture, first, delivered);
+            if gap_ms == 1_000 {
+                timers.now_ms = 1_030;
+                let restored = flow
+                    .handle_timer(TimerKind::RestorePasteboard(first), &mut timers)
+                    .unwrap();
+                apply_paste_outcome(&mut controller, &mut capture, first, restored);
             }
+            timers.now_ms = 30 + gap_ms;
+            assert!(super::capture_start_allowed(
+                controller.status(),
+                Some(flow.state),
+                false
+            ));
+            assert_eq!(
+                controller.handle(AppEvent::TriggerPressed),
+                vec![Effect::StartCapture]
+            );
+            capture.begin();
+            let second = capture.generation;
+            assert_eq!(
+                controller.handle(AppEvent::TriggerReleased { short: false }),
+                vec![Effect::FinishCaptureAfter { delay_ms: 180 }]
+            );
+            timers.now_ms += 180;
+            assert_eq!(capture.expect_preparation(), Some(second));
+            assert!(capture.accept(second, controller.status()));
+            assert!(
+                !capture.accept_recognition(Some(first)),
+                "old ASR cannot fill the slot"
+            );
+            assert!(capture.accept_recognition(Some(second)));
+            assert!(
+                !capture.accept_recognition(Some(second)),
+                "duplicate ASR cannot overwrite text"
+            );
+            assert_eq!(
+                controller.handle(AppEvent::RecognitionFinished(Ok("synthetic second".into()))),
+                vec![Effect::InsertText("synthetic second".into())]
+            );
+            let mut queue = super::InsertionQueue::default();
+            assert!(queue.park(super::QueuedInsertion {
+                generation: second,
+                text: "synthetic second".into(),
+                append_space: true
+            }));
+            assert!(!queue.park(super::QueuedInsertion {
+                generation: second,
+                text: "synthetic duplicate".into(),
+                append_space: false
+            }));
+            assert!(controller.handle(AppEvent::TriggerPressed).is_empty());
+            assert!(!super::capture_start_allowed(
+                controller.status(),
+                Some(flow.state),
+                true
+            ));
+            if gap_ms < 1_000 {
+                assert!(
+                    queue.take_if_unblocked(true).is_none(),
+                    "cannot begin another clipboard transaction"
+                );
+                timers.now_ms = 1_030;
+                let restored = flow
+                    .handle_timer(TimerKind::RestorePasteboard(first), &mut timers)
+                    .unwrap();
+                apply_paste_outcome(&mut controller, &mut capture, first, restored);
+                assert_eq!(controller.status(), &AppStatus::Recognizing);
+                assert_eq!(capture.generation, second);
+            }
+            assert!(flow.is_finished());
+            drop(flow);
+            queue.discard_unless_current(&capture, controller.status());
+            let waiting = queue.take_if_unblocked(false).unwrap();
+            assert_eq!(waiting.text, "synthetic second");
+            assert_eq!(waiting.generation, second);
+            assert!(waiting.append_space);
+            assert!(queue.take_if_unblocked(false).is_none());
+            let mut next = PasteFlow::begin(waiting.generation, synthetic_insertion(), &mut timers);
+            assert_eq!(
+                next.handle_timer(TimerKind::RestorePasteboard(first), &mut timers),
+                None
+            );
+            let delivered = next
+                .handle_timer(TimerKind::PasteCommand(second), &mut timers)
+                .unwrap();
+            apply_paste_outcome(&mut controller, &mut capture, second, delivered);
+            assert_eq!(controller.status(), &AppStatus::Ready);
+        }
+    }
 
-            fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {
-                primary
+    #[test]
+    fn old_restore_failure_preserves_new_recording_preparation_asr_and_queued_text() {
+        for phase in [
+            super::CapturePhase::Recording,
+            super::CapturePhase::Preparing,
+            super::CapturePhase::Submitted,
+            super::CapturePhase::Inserting,
+        ] {
+            let mut controller = recognizing_controller();
+            let mut capture = inserting_capture();
+            let old = capture.generation;
+            apply_paste_outcome(
+                &mut controller,
+                &mut capture,
+                old,
+                super::PasteOutcome::Delivered,
+            );
+            controller.handle(AppEvent::TriggerPressed);
+            capture.begin();
+            let generation = capture.generation;
+            if phase != super::CapturePhase::Recording {
+                controller.handle(AppEvent::TriggerReleased { short: false });
+                capture.expect_preparation();
+            }
+            if matches!(
+                phase,
+                super::CapturePhase::Submitted | super::CapturePhase::Inserting
+            ) {
+                assert!(capture.accept(generation, controller.status()));
+            }
+            if phase == super::CapturePhase::Inserting {
+                assert!(capture.accept_recognition(Some(generation)));
+            }
+            let before = controller.status().clone();
+            let mut queue = super::InsertionQueue::default();
+            if phase == super::CapturePhase::Inserting {
+                assert!(queue.park(super::QueuedInsertion {
+                    generation,
+                    text: "synthetic waiting".into(),
+                    append_space: false
+                }));
+            }
+            apply_paste_outcome(
+                &mut controller,
+                &mut capture,
+                old,
+                super::PasteOutcome::Restored(Err(InsertError::PasteboardRestore)),
+            );
+            assert_eq!(controller.status(), &before);
+            assert_eq!(capture.generation, generation);
+            assert!(capture.phase == phase);
+            queue.discard_unless_current(&capture, controller.status());
+            if phase == super::CapturePhase::Inserting {
+                assert_eq!(
+                    queue.take_if_unblocked(false).unwrap().text,
+                    "synthetic waiting"
+                );
+            }
+            if phase == super::CapturePhase::Submitted {
+                assert!(capture.accept_recognition(Some(generation)));
             }
         }
+    }
 
-        struct RecordingBoundary {
-            result: Rc<RefCell<Option<Result<(), InsertError>>>>,
-        }
-
-        impl PasteFlowBoundary for RecordingBoundary {
-            fn schedule(&mut self, _kind: TimerKind, _delay_ms: u64) {}
-
-            fn finish_and_drain_hotkeys(&mut self, result: Result<(), InsertError>) {
-                *self.result.borrow_mut() = Some(result);
+    #[test]
+    fn old_restore_cannot_replace_new_empty_failed_or_cancelled_cycle() {
+        for event in [
+            AppEvent::RecognitionFinished(Ok(String::new())),
+            AppEvent::RecognitionFinished(Err("synthetic failure".into())),
+            AppEvent::AudioReady(None),
+            AppEvent::CaptureFailed,
+            AppEvent::AsrRecoveryStarted,
+            AppEvent::AsrUnavailable,
+            AppEvent::TriggerReleased { short: true },
+        ] {
+            let mut controller = recognizing_controller();
+            let mut capture = inserting_capture();
+            let old = capture.generation;
+            apply_paste_outcome(
+                &mut controller,
+                &mut capture,
+                old,
+                super::PasteOutcome::Delivered,
+            );
+            controller.handle(AppEvent::TriggerPressed);
+            capture.begin();
+            if !matches!(event, AppEvent::TriggerReleased { short: true }) {
+                controller.handle(AppEvent::TriggerReleased { short: false });
             }
+            controller.handle(event);
+            capture.abandon_unless_active(controller.status());
+            let before = controller.status().clone();
+            let generation = capture.generation;
+            for result in [Ok(()), Err(InsertError::PasteboardRestore)] {
+                apply_paste_outcome(
+                    &mut controller,
+                    &mut capture,
+                    old,
+                    super::PasteOutcome::Restored(result),
+                );
+                assert_eq!(controller.status(), &before);
+                assert_eq!(capture.generation, generation);
+            }
+            let mut queue = super::InsertionQueue::default();
+            assert!(
+                queue.take_if_unblocked(false).is_none(),
+                "empty/failed cycle produces no insertion"
+            );
         }
+    }
 
-        let result = Rc::new(RefCell::new(None));
-        let mut boundary = RecordingBoundary {
-            result: Rc::clone(&result),
-        };
-        let mut flow = PasteFlow::begin(FailingInsertion, &mut boundary);
+    #[test]
+    fn latest_idle_restore_failure_is_visible_without_replaying_delivered_text() {
+        let mut controller = recognizing_controller();
+        let mut capture = inserting_capture();
+        let generation = capture.generation;
+        apply_paste_outcome(
+            &mut controller,
+            &mut capture,
+            generation,
+            super::PasteOutcome::Delivered,
+        );
+        let event = super::PasteOutcome::Restored(Err(InsertError::PasteboardRestore))
+            .foreground_event(generation, &capture)
+            .unwrap();
+        assert_eq!(
+            controller.handle(event),
+            vec![Effect::ScheduleErrorReset { delay_ms: 3_000 }]
+        );
+        assert_eq!(
+            controller.status(),
+            &AppStatus::Error {
+                message: "Текст вставлен, но не удалось восстановить буфер обмена",
+                recoverable: true
+            }
+        );
+        assert!(controller.handle(AppEvent::ErrorTimerFired).is_empty());
+        assert_eq!(controller.status(), &AppStatus::Ready);
+        assert!(controller
+            .handle(AppEvent::RecognitionFinished(Ok("synthetic old".into())))
+            .is_empty());
+    }
 
-        flow.handle_timer(TimerKind::PasteCommand, &mut boundary);
+    #[test]
+    fn restore_warning_does_not_override_non_ready_foreground_states() {
+        for event in [
+            AppEvent::PermissionsChanged(PermissionSnapshot::default()),
+            AppEvent::AsrRecoveryStarted,
+            AppEvent::AsrUnavailable,
+            AppEvent::EventTapLost,
+        ] {
+            let mut controller = recognizing_controller();
+            let mut capture = inserting_capture();
+            let generation = capture.generation;
+            apply_paste_outcome(
+                &mut controller,
+                &mut capture,
+                generation,
+                super::PasteOutcome::Delivered,
+            );
+            controller.handle(event);
+            let before = controller.status().clone();
+            apply_paste_outcome(
+                &mut controller,
+                &mut capture,
+                generation,
+                super::PasteOutcome::Restored(Err(InsertError::PasteboardRestore)),
+            );
+            assert_eq!(controller.status(), &before);
+        }
+    }
 
-        assert_eq!(*result.borrow(), Some(Err(InsertError::KeyboardEvent)));
+    #[test]
+    fn queued_text_is_discarded_on_invalidation_and_never_revived_after_reload() {
+        let mut capture = inserting_capture();
+        let mut queue = super::InsertionQueue::default();
+        assert!(queue.park(super::QueuedInsertion {
+            generation: capture.generation,
+            text: "synthetic cancelled".into(),
+            append_space: false
+        }));
+        capture.abandon();
+        queue.discard_unless_current(&capture, &AppStatus::AsrUnavailable);
+        capture.begin();
+        assert!(queue.take_if_unblocked(false).is_none());
+    }
+
+    #[test]
+    fn quit_and_update_open_wait_for_both_dictation_and_clipboard_lanes() {
+        use crate::updater_runtime::{updater_open_allowed, OrderlyQuitGate};
+        let mut quit = OrderlyQuitGate::default();
+        quit.request();
+        for (status, paste_pending) in [
+            (AppStatus::Recognizing, true), // AwaitingPaste
+            (AppStatus::Ready, true),       // Delivered, AwaitingRestore
+            (AppStatus::Recording, true),
+            (AppStatus::Recognizing, true), // preparation / ASR / parked text
+            (AppStatus::Recognizing, false), // old restored, foreground still active
+        ] {
+            assert!(!updater_open_allowed(&status, paste_pending));
+            assert!(!quit.take_if_ready(&status, paste_pending));
+        }
+        assert!(updater_open_allowed(&AppStatus::Ready, false));
+        assert!(quit.take_if_ready(&AppStatus::Ready, false));
+        assert!(!quit.take_if_ready(&AppStatus::Ready, false));
+    }
+
+    #[test]
+    fn shutdown_restores_each_clipboard_phase_without_pasting_queued_text() {
+        for delivered in [false, true] {
+            let insertion = synthetic_insertion();
+            let events = Rc::clone(&insertion.events);
+            let mut timers = TestPasteTimers::default();
+            let mut flow = PasteFlow::begin(1, insertion, &mut timers);
+            if delivered {
+                flow.handle_timer(TimerKind::PasteCommand(1), &mut timers);
+            }
+            let mut capture = inserting_capture();
+            let mut queue = super::InsertionQueue::default();
+            queue.park(super::QueuedInsertion {
+                generation: capture.generation,
+                text: "synthetic pending".into(),
+                append_space: false,
+            });
+            capture.abandon();
+            queue.discard_unless_current(&capture, &AppStatus::Recognizing);
+            assert_eq!(flow.restore_on_shutdown(), Ok(()));
+            assert_eq!(flow.restore_on_shutdown(), Ok(()));
+            assert!(queue.take_if_unblocked(false).is_none());
+            assert_eq!(
+                flow.handle_timer(TimerKind::PasteCommand(1), &mut timers),
+                None
+            );
+            assert_eq!(
+                flow.handle_timer(TimerKind::RestorePasteboard(1), &mut timers),
+                None
+            );
+            assert_eq!(
+                events.borrow().as_slice(),
+                if delivered {
+                    &["paste", "restore"][..]
+                } else {
+                    &["restore"][..]
+                }
+            );
+        }
     }
 
     #[test]
@@ -2755,19 +3329,15 @@ mod tests {
         impl PasteFlowBoundary for PanickingBoundary {
             fn schedule(&mut self, kind: TimerKind, _delay_ms: u64) {
                 match kind {
-                    TimerKind::PasteCommand => {
+                    TimerKind::PasteCommand(_) => {
                         self.events.borrow_mut().push("schedule_paste");
                     }
-                    TimerKind::RestorePasteboard => {
+                    TimerKind::RestorePasteboard(_) => {
                         self.events.borrow_mut().push("schedule_restore");
                         panic!("timer scheduling failed");
                     }
                     _ => panic!("unexpected timer"),
                 }
-            }
-
-            fn finish_and_drain_hotkeys(&mut self, _result: Result<(), InsertError>) {
-                panic!("paste flow must not finish after scheduling panic");
             }
         }
 
@@ -2782,8 +3352,8 @@ mod tests {
                 let mut boundary = PanickingBoundary {
                     events: Rc::clone(&events),
                 };
-                let mut flow = PasteFlow::begin(insertion, &mut boundary);
-                flow.handle_timer(TimerKind::PasteCommand, &mut boundary);
+                let mut flow = PasteFlow::begin(1, insertion, &mut boundary);
+                flow.handle_timer(TimerKind::PasteCommand(1), &mut boundary);
             }
         }));
 
