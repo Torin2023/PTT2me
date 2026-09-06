@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<title>PTT2me insertion fixture</title>
+<style>
+  body { font: 16px system-ui; margin: 24px; }
+  label { display: block; margin: 12px 0; }
+  input, textarea, [contenteditable] { display: block; width: 90%; font: inherit; border: 1px solid #888; padding: 8px; }
+</style>
+<label>input<input id="input" value="AB"></label>
+<label>textarea<textarea id="textarea">AB</textarea></label>
+<label>contenteditable<div id="editable" contenteditable="true">AB</div></label>
+<label>password<input id="password" type="password" value="secret"></label>
+<script>
+  window.inputEvents = {input: 0, textarea: 0, editable: 0, password: 0};
+  for (const id of Object.keys(inputEvents)) {
+    document.getElementById(id).addEventListener('input', () => inputEvents[id]++);
+  }
+  window.resetFields = () => {
+    for (const id of Object.keys(inputEvents)) {
+      const el = document.getElementById(id);
+      if (el.isContentEditable) el.textContent = 'AB';
+      else el.value = id === 'password' ? 'secret' : 'AB';
+      inputEvents[id] = 0;
+    }
+  };
+  window.focusField = id => {
+    const el = document.getElementById(id);
+    el.focus();
+    if (el.isContentEditable) {
+      const range = document.createRange();
+      range.setStart(el.firstChild, 1);
+      range.collapse(true);
+      const selection = getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } else el.setSelectionRange(1, 1);
+    return document.activeElement.id;
+  };
+  window.fieldValue = id => {
+    const el = document.getElementById(id);
+    return el.isContentEditable ? el.textContent : el.value;
+  };
+</script>
+</html>

@@ -40,6 +40,7 @@ pub enum CheckReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateFailure {
+    WorkerStopped,
     Network,
     UntrustedManifest,
     Storage,

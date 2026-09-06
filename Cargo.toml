@@ -45,6 +45,12 @@ path = "tests/pasteboard_main.rs"
 harness = false
 required-features = ["test-support"]
 
+[[example]]
+name = "insertion_bridge"
+path = "tests/gui/insertion_bridge.rs"
+crate-type = ["staticlib"]
+required-features = ["test-support"]
+
 [profile.release]
 opt-level = 3
 lto = true
