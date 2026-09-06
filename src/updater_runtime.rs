@@ -1,3 +1,4 @@
+use crate::event_wake::{EventNotifier, TerminalSender};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -387,15 +388,21 @@ pub(crate) struct UpdaterWorkerTask {
 }
 
 impl UpdaterWorkerTask {
-    pub(crate) fn spawn(mut boundary: impl UpdaterWorkerBoundary) -> Self {
+    #[cfg(test)]
+    pub(crate) fn spawn(boundary: impl UpdaterWorkerBoundary) -> Self {
+        Self::spawn_notified(boundary, EventNotifier::default())
+    }
+    fn spawn_notified(mut boundary: impl UpdaterWorkerBoundary, notifier: EventNotifier) -> Self {
         let (request_sender, request_receiver) = mpsc::channel();
         let (result_sender, result_receiver) = mpsc::channel();
         let worker = thread::spawn(move || {
+            let result_sender = TerminalSender::new(result_sender, notifier.clone());
             while let Ok(request) = request_receiver.recv() {
                 if let Some(result) = boundary.execute(request) {
                     if result_sender.send(result).is_err() {
                         break;
                     }
+                    notifier.notify();
                 }
             }
         });
@@ -419,9 +426,13 @@ impl UpdaterWorkerTask {
         Ok(())
     }
 
+    #[cfg(test)]
     fn drain_results(&mut self) -> (Vec<UpdaterEvent>, bool) {
+        self.drain_results_limit(usize::MAX)
+    }
+    fn drain_results_limit(&mut self, limit: usize) -> (Vec<UpdaterEvent>, bool) {
         let mut events = Vec::new();
-        loop {
+        while events.len() < limit {
             match self.results.try_recv() {
                 Ok(result) => {
                     self.pending.remove(&result.operation_id());
@@ -431,11 +442,18 @@ impl UpdaterWorkerTask {
                 Err(TryRecvError::Disconnected) => {
                     // Buffered completions win over failures. Only requests without
                     // a result belong to the dead worker; new operation IDs remain safe.
-                    events.extend(self.pending.drain().map(|(_, event)| event));
+                    if let Some(id) = self.pending.keys().next().copied() {
+                        events.push(self.pending.remove(&id).unwrap());
+                        if limit == 1 {
+                            return (events, false);
+                        }
+                        events.extend(self.pending.drain().map(|(_, event)| event));
+                    }
                     return (events, true);
                 }
             }
         }
+        (events, false)
     }
 }
 
@@ -574,23 +592,40 @@ pub(crate) struct UpdaterLane<R: RawUpdateScheduleStore, C: UpdateClock> {
 pub(crate) type SystemUpdaterLane = UpdaterLane<SystemUpdateScheduleStore, SystemClock>;
 
 impl UpdaterLane<SystemUpdateScheduleStore, SystemClock> {
-    pub(crate) fn production(config: UpdaterLaunchConfig) -> Self {
+    pub(crate) fn production(config: UpdaterLaunchConfig, notifier: EventNotifier) -> Self {
         let worker_config = config.clone();
-        Self::with_boundaries(
+        Self::with_notifier(
             config,
             SystemUpdateScheduleStore::standard(),
             SystemClock,
             move || ProductionUpdaterWorker::new(&worker_config),
+            notifier,
         )
     }
 }
 
 impl<R: RawUpdateScheduleStore, C: UpdateClock> UpdaterLane<R, C> {
+    #[cfg(test)]
     pub(crate) fn with_boundaries<B: UpdaterWorkerBoundary>(
         config: UpdaterLaunchConfig,
         schedule: R,
         clock: C,
+        worker_factory: impl FnMut() -> B + 'static,
+    ) -> Self {
+        Self::with_notifier(
+            config,
+            schedule,
+            clock,
+            worker_factory,
+            EventNotifier::default(),
+        )
+    }
+    fn with_notifier<B: UpdaterWorkerBoundary>(
+        config: UpdaterLaunchConfig,
+        schedule: R,
+        clock: C,
         mut worker_factory: impl FnMut() -> B + 'static,
+        notifier: EventNotifier,
     ) -> Self {
         let launch_at = clock.now();
         Self {
@@ -598,8 +633,13 @@ impl<R: RawUpdateScheduleStore, C: UpdateClock> UpdaterLane<R, C> {
             schedule: UpdateScheduleRepository::new(schedule),
             clock,
             launch_at,
-            worker: Some(UpdaterWorkerTask::spawn(worker_factory())),
-            worker_factory: Box::new(move || UpdaterWorkerTask::spawn(worker_factory())),
+            worker: Some(UpdaterWorkerTask::spawn_notified(
+                worker_factory(),
+                notifier.clone(),
+            )),
+            worker_factory: Box::new(move || {
+                UpdaterWorkerTask::spawn_notified(worker_factory(), notifier.clone())
+            }),
         }
     }
 
@@ -643,11 +683,18 @@ impl<R: RawUpdateScheduleStore, C: UpdateClock> UpdaterLane<R, C> {
         self.handle_event(UpdaterEvent::OpenRequested)
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_worker_results(&mut self) -> (Vec<UpdaterRuntimeEffect>, bool) {
+        self.drain_worker_results_limit(usize::MAX)
+    }
+    pub(crate) fn poll_worker_result(&mut self) -> (Vec<UpdaterRuntimeEffect>, bool) {
+        self.drain_worker_results_limit(1)
+    }
+    fn drain_worker_results_limit(&mut self, limit: usize) -> (Vec<UpdaterRuntimeEffect>, bool) {
         let Some(worker) = &mut self.worker else {
             return (Vec::new(), false);
         };
-        let (events, disconnected) = worker.drain_results();
+        let (events, disconnected) = worker.drain_results_limit(limit);
         let handled = disconnected || !events.is_empty();
         if disconnected {
             tracing::warn!(error_category = "updater_worker_stopped");
@@ -1326,6 +1373,60 @@ mod tests {
                 }
                 _ => panic!("injected crash after buffered completion"),
             }
+        }
+    }
+
+    #[test]
+    fn result_terminal_failure_and_recreated_worker_keep_main_wake() {
+        use core_foundation::runloop::CFRunLoop;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let source = crate::event_wake::EventSource::new(CFRunLoop::get_current());
+        let temp = tempfile::tempdir().unwrap();
+        let starts = Arc::new(AtomicU64::new(0));
+        let factory_starts = starts.clone();
+        let lane = Rc::new(RefCell::new(UpdaterLane::with_notifier(
+            launch_config(&temp),
+            RecordingSchedule {
+                last_attempt: None,
+                fail_writes: false,
+                timeline: Arc::new(Mutex::new(Vec::new())),
+            },
+            FixedClock::new(1_000),
+            move || {
+                factory_starts.fetch_add(1, Ordering::SeqCst);
+                CompleteThenCrash
+            },
+            source.notifier(),
+        )));
+        let consumer = lane.clone();
+        let notifier = source.notifier();
+        source.set_handler(move || {
+            // Production uses one event per lane visit and re-signals at quota.
+            let (_, handled) = consumer.borrow_mut().poll_worker_result();
+            if handled {
+                notifier.notify();
+            }
+        });
+        source.attach();
+        CFRunLoop::run_in_mode(
+            unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+            Duration::ZERO,
+            true,
+        );
+        for expected_starts in 1..=2 {
+            lane.borrow_mut().manual_check();
+            lane.borrow_mut()
+                .queue_worker(UpdaterWorkerRequest::StoreVerifiedManifest { bytes: vec![] });
+            crate::event_wake::tests::pump_until(|| lane.borrow().worker.is_none());
+            assert!(matches!(
+                lane.borrow().state(),
+                UpdaterState::Failed {
+                    failure: UpdateFailure::HttpStatus,
+                    ..
+                }
+            ));
+            assert_eq!(starts.load(Ordering::SeqCst), expected_starts);
         }
     }
 

@@ -14,6 +14,7 @@ pub mod audio;
 mod audio_task;
 mod browser_accessibility;
 pub mod constants;
+mod event_wake;
 pub mod hotkey;
 pub mod inserter;
 pub mod logging;

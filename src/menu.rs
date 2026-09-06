@@ -1,3 +1,4 @@
+use crate::event_wake::EventNotifier;
 use std::cell::Cell;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -9,7 +10,8 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSColor, NSControlStateValueOff, NSControlStateValueOn, NSImage, NSImageSymbolConfiguration,
-    NSMenu, NSMenuItem, NSStatusBar, NSStatusBarButton, NSStatusItem, NSVariableStatusItemLength,
+    NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusBarButton, NSStatusItem,
+    NSVariableStatusItemLength,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 
@@ -381,7 +383,12 @@ pub const MENU_DESCRIPTOR: [MenuEntry; 10] = [
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuCommand {
-    BeginTriggerAssignment { epoch: AssignmentEpoch },
+    /// Internal assignment-prefix fence, never a menu preference.
+    #[doc(hidden)]
+    Boundary(u64),
+    BeginTriggerAssignment {
+        epoch: AssignmentEpoch,
+    },
     ResetTrigger,
     SetThreshold(HoldThreshold),
     SetAppendSpace(bool),
@@ -394,6 +401,7 @@ fn toggled_append_space(selected: bool) -> (bool, MenuCommand) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MenuAction {
+    RefreshPermissions,
     Quit,
     OpenPermission(PermissionKind),
     RetryModelPreparation,
@@ -452,6 +460,7 @@ struct MenuTargetIvars {
 
 #[derive(Clone)]
 struct MenuCommandPublisher {
+    notifier: EventNotifier,
     sender: Sender<MenuCommand>,
     hotkey: HotkeyControl,
     readiness: MenuReadiness,
@@ -460,6 +469,7 @@ struct MenuCommandPublisher {
 impl MenuCommandPublisher {
     fn new(sender: Sender<MenuCommand>, hotkey: HotkeyControl, readiness: MenuReadiness) -> Self {
         Self {
+            notifier: EventNotifier::default(),
             sender,
             hotkey,
             readiness,
@@ -468,16 +478,16 @@ impl MenuCommandPublisher {
 
     fn send(&self, command: MenuCommand) -> bool {
         match command {
-            MenuCommand::BeginTriggerAssignment { .. } => false,
+            MenuCommand::BeginTriggerAssignment { .. } | MenuCommand::Boundary(_) => false,
             MenuCommand::ResetTrigger => {
                 self.hotkey.set_trigger(TriggerKey::FnGlobe);
-                self.sender.send(command).is_ok()
+                self.notifier.send(&self.sender, command)
             }
             MenuCommand::SetThreshold(threshold) => {
                 self.hotkey.set_threshold(threshold);
-                self.sender.send(command).is_ok()
+                self.notifier.send(&self.sender, command)
             }
-            MenuCommand::SetAppendSpace(_) => self.sender.send(command).is_ok(),
+            MenuCommand::SetAppendSpace(_) => self.notifier.send(&self.sender, command),
         }
     }
 
@@ -489,9 +499,8 @@ impl MenuCommandPublisher {
             return false;
         };
         if self
-            .sender
-            .send(MenuCommand::BeginTriggerAssignment { epoch })
-            .is_ok()
+            .notifier
+            .send(&self.sender, MenuCommand::BeginTriggerAssignment { epoch })
         {
             true
         } else {
@@ -519,12 +528,19 @@ declare_class!(
 
     unsafe impl NSObjectProtocol for MenuTarget {}
 
+    unsafe impl NSMenuDelegate for MenuTarget {
+        #[method(menuWillOpen:)]
+        fn menu_will_open(&self, _menu: &NSMenu) {
+            self.ivars().publisher.notifier.send(&self.ivars().action_sender, MenuAction::RefreshPermissions);
+        }
+    }
+
     // SAFETY: `quit:` has the Cocoa action signature `(id) -> void` and is
     // invoked by AppKit on the main thread.
     unsafe impl MenuTarget {
         #[method(quit:)]
         fn quit(&self, _sender: &AnyObject) {
-            let _ = self.ivars().action_sender.send(MenuAction::Quit);
+            self.ivars().publisher.notifier.send(&self.ivars().action_sender, MenuAction::Quit);
         }
 
         #[method(performStatusAction:)]
@@ -542,7 +558,7 @@ declare_class!(
                 Some(StatusActionKind::RetryAsr) => MenuAction::RetryAsr,
                 None => return,
             };
-            let _ = self.ivars().action_sender.send(action);
+            self.ivars().publisher.notifier.send(&self.ivars().action_sender, action);
         }
 
         #[method(performUpdaterAction:)]
@@ -550,7 +566,7 @@ declare_class!(
             let Some(action) = self.ivars().updater_action.get() else {
                 return;
             };
-            let _ = self.ivars().updater_action_sender.send(action);
+            self.ivars().publisher.notifier.send(&self.ivars().updater_action_sender, action);
         }
 
         #[method(assignTrigger:)]
@@ -590,15 +606,13 @@ declare_class!(
 impl MenuTarget {
     fn new(
         mtm: MainThreadMarker,
-        sender: Sender<MenuCommand>,
-        hotkey: HotkeyControl,
-        readiness: MenuReadiness,
+        publisher: MenuCommandPublisher,
         action_sender: Sender<MenuAction>,
         updater_action_sender: Sender<UpdaterMenuAction>,
         append_space: bool,
     ) -> Retained<Self> {
         let this = mtm.alloc().set_ivars(MenuTargetIvars {
-            publisher: MenuCommandPublisher::new(sender, hotkey, readiness),
+            publisher,
             action_sender,
             updater_action_sender,
             status_action: Cell::new(None),
@@ -643,20 +657,41 @@ impl MenuBar {
         hotkey: HotkeyControl,
         readiness: MenuReadiness,
     ) -> Self {
-        let mtm = main_thread_marker();
-        let (action_sender, action_receiver) = mpsc::channel();
-        let (updater_action_sender, updater_action_receiver) = mpsc::channel();
-        let target = MenuTarget::new(
-            mtm,
+        Self::new_notified(
+            preferences,
+            append_space,
             sender,
             hotkey,
             readiness,
+            EventNotifier::default(),
+        )
+    }
+
+    pub(crate) fn new_notified(
+        preferences: Preferences,
+        append_space: bool,
+        sender: Sender<MenuCommand>,
+        hotkey: HotkeyControl,
+        readiness: MenuReadiness,
+        notifier: EventNotifier,
+    ) -> Self {
+        let mtm = main_thread_marker();
+        let (action_sender, action_receiver) = mpsc::channel();
+        let (updater_action_sender, updater_action_receiver) = mpsc::channel();
+        let mut publisher = MenuCommandPublisher::new(sender, hotkey, readiness);
+        publisher.notifier = notifier;
+        let target = MenuTarget::new(
+            mtm,
+            publisher,
             action_sender,
             updater_action_sender,
             append_space,
         );
         let menu = unsafe { NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("PTT2me")) };
-        unsafe { menu.setAutoenablesItems(false) };
+        unsafe {
+            menu.setAutoenablesItems(false);
+            menu.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*target)));
+        };
 
         let mut status_row = None;
         let mut status_action_row = None;
@@ -1070,6 +1105,43 @@ mod tests {
                 ArtifactKind::Update => release.application_update.clone(),
             },
         }
+    }
+
+    #[test]
+    fn command_publisher_wakes_for_preferences_and_assignment() {
+        use core_foundation::runloop::CFRunLoop;
+        use std::cell::RefCell;
+        use std::time::Duration;
+        let source = crate::event_wake::EventSource::new(CFRunLoop::get_current());
+        let (sender, receiver) = mpsc::channel();
+        let mut publisher = MenuCommandPublisher::new(
+            sender,
+            HotkeyControl::new(Preferences::default()),
+            MenuReadiness::new(true),
+        );
+        publisher.notifier = source.notifier();
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let seen = commands.clone();
+        source.set_handler(move || {
+            while let Ok(command) = receiver.try_recv() {
+                seen.borrow_mut().push(command);
+            }
+        });
+        source.attach();
+        CFRunLoop::run_in_mode(
+            unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+            Duration::ZERO,
+            true,
+        );
+        assert!(publisher.send(MenuCommand::ResetTrigger));
+        assert!(publisher.send(MenuCommand::SetThreshold(HoldThreshold::MS_750)));
+        assert!(publisher.send(MenuCommand::SetAppendSpace(true)));
+        assert!(publisher.begin_assignment());
+        crate::event_wake::tests::pump_until(|| commands.borrow().len() == 4);
+        assert!(matches!(
+            commands.borrow()[3],
+            MenuCommand::BeginTriggerAssignment { .. }
+        ));
     }
 
     #[test]

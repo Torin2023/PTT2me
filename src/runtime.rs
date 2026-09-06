@@ -1,13 +1,17 @@
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::marker::PhantomPinned;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Child, Command};
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use core_foundation::base::TCFType;
 use core_foundation::date::CFDate;
 use core_foundation::runloop::{
     kCFRunLoopCommonModes, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, CFRunLoopTimerRef,
@@ -20,6 +24,7 @@ use crate::asr_task::{AsrTask, AsrTaskError};
 use crate::audio::{AudioError, AudioRecorder};
 use crate::audio_task::AudioPreparationTask;
 use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS};
+use crate::event_wake::{EventNotifier, EventSource, TerminalSender};
 use crate::hotkey::{AssignmentEpoch, HotkeyControl, HotkeyListener, HotkeySignal};
 use crate::inserter::{InsertError, PASTEBOARD_RESTORE_DELAY_MS, PASTEBOARD_SETTLE_DELAY_MS};
 use crate::menu::{MenuAction, UpdaterMenuAction};
@@ -55,7 +60,6 @@ use crate::updater_runtime::{
     UpdaterLaunchConfig, UpdaterRuntimeEffect,
 };
 
-const EVENT_DRAIN_MS: u64 = 50;
 const PERMISSION_POLL_MS: u64 = 1_000;
 const SMOKE_MODEL_TIMEOUT: Duration = Duration::from_secs(180);
 const SMOKE_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -83,6 +87,7 @@ fn model_preparation_plan(result: Result<VerifiedModel, ModelStoreError>) -> Mod
     }
 }
 
+#[cfg(test)]
 fn spawn_model_preparation_worker_with<F>(
     prepare: F,
 ) -> (
@@ -92,18 +97,32 @@ fn spawn_model_preparation_worker_with<F>(
 where
     F: FnOnce() -> Result<VerifiedModel, ModelStoreError> + Send + 'static,
 {
+    spawn_model_preparation_notified(prepare, EventNotifier::default())
+}
+fn spawn_model_preparation_notified<F>(
+    prepare: F,
+    notifier: EventNotifier,
+) -> (
+    Receiver<Result<VerifiedModel, ModelStoreError>>,
+    JoinHandle<()>,
+)
+where
+    F: FnOnce() -> Result<VerifiedModel, ModelStoreError> + Send + 'static,
+{
     let (sender, receiver) = mpsc::channel();
     let worker = thread::spawn(move || {
-        let _ = sender.send(prepare());
+        let sender = TerminalSender::new(sender, notifier.clone());
+        notifier.send(&sender, prepare());
     });
     (receiver, worker)
 }
-
-fn spawn_model_preparation_worker() -> (
+fn spawn_model_preparation_worker(
+    notifier: EventNotifier,
+) -> (
     Receiver<Result<VerifiedModel, ModelStoreError>>,
     JoinHandle<()>,
 ) {
-    spawn_model_preparation_worker_with(prepare_runtime_model)
+    spawn_model_preparation_notified(prepare_runtime_model, notifier)
 }
 
 /// Owns one preparation attempt. Dropping an unfinished task deliberately
@@ -111,7 +130,7 @@ fn spawn_model_preparation_worker() -> (
 /// and AppKit teardown must never wait for model I/O.
 struct ModelPreparationTask {
     events: Receiver<Result<VerifiedModel, ModelStoreError>>,
-    worker: Option<JoinHandle<()>>,
+    _worker: Option<JoinHandle<()>>,
 }
 
 impl ModelPreparationTask {
@@ -121,19 +140,12 @@ impl ModelPreparationTask {
     ) -> Self {
         Self {
             events,
-            worker: Some(worker),
+            _worker: Some(worker),
         }
     }
 
     fn try_recv(&self) -> Result<Result<VerifiedModel, ModelStoreError>, TryRecvError> {
         self.events.try_recv()
-    }
-
-    fn join_completed(mut self) -> thread::Result<()> {
-        self.worker
-            .take()
-            .expect("model preparation task must own its worker")
-            .join()
     }
 }
 
@@ -142,6 +154,7 @@ struct PermissionMigrationWorkerResult {
     migration: Result<PermissionMigrationSuccess, PermissionMigrationRunError>,
 }
 
+#[cfg(test)]
 fn spawn_permission_migration_worker_with<F>(
     paths: ModelPaths,
     migrate: F,
@@ -149,44 +162,52 @@ fn spawn_permission_migration_worker_with<F>(
 where
     F: FnOnce() -> Result<PermissionMigrationSuccess, PermissionMigrationRunError> + Send + 'static,
 {
+    spawn_permission_migration_notified(paths, migrate, EventNotifier::default())
+}
+fn spawn_permission_migration_notified<F>(
+    paths: ModelPaths,
+    migrate: F,
+    notifier: EventNotifier,
+) -> (Receiver<PermissionMigrationWorkerResult>, JoinHandle<()>)
+where
+    F: FnOnce() -> Result<PermissionMigrationSuccess, PermissionMigrationRunError> + Send + 'static,
+{
     let (sender, receiver) = mpsc::channel();
     let worker = thread::spawn(move || {
+        let sender = TerminalSender::new(sender, notifier.clone());
         let migration = migrate();
-        let _ = sender.send(PermissionMigrationWorkerResult { paths, migration });
+        notifier.send(
+            &sender,
+            PermissionMigrationWorkerResult { paths, migration },
+        );
     });
     (receiver, worker)
 }
 
 fn spawn_permission_migration_worker(
     paths: ModelPaths,
+    notifier: EventNotifier,
 ) -> (Receiver<PermissionMigrationWorkerResult>, JoinHandle<()>) {
-    spawn_permission_migration_worker_with(paths, run_system_permission_migration)
+    spawn_permission_migration_notified(paths, run_system_permission_migration, notifier)
 }
 
 /// Owns one permission migration attempt. Dropping an unfinished task
 /// deliberately detaches its worker so AppKit teardown never waits for TCC.
 struct PermissionMigrationTask {
     events: Receiver<PermissionMigrationWorkerResult>,
-    worker: Option<JoinHandle<()>>,
+    _worker: Option<JoinHandle<()>>,
 }
 
 impl PermissionMigrationTask {
     fn new(events: Receiver<PermissionMigrationWorkerResult>, worker: JoinHandle<()>) -> Self {
         Self {
             events,
-            worker: Some(worker),
+            _worker: Some(worker),
         }
     }
 
     fn try_recv(&self) -> Result<PermissionMigrationWorkerResult, TryRecvError> {
         self.events.try_recv()
-    }
-
-    fn join_completed(mut self) -> thread::Result<()> {
-        self.worker
-            .take()
-            .expect("permission migration task must own its worker")
-            .join()
     }
 }
 
@@ -230,9 +251,9 @@ impl<R: RawPreferenceStore> RuntimePreferences<R> {
         match command {
             MenuCommand::ResetTrigger => self.current.trigger = TriggerKey::FnGlobe,
             MenuCommand::SetThreshold(threshold) => self.current.threshold = threshold,
-            MenuCommand::BeginTriggerAssignment { .. } | MenuCommand::SetAppendSpace(_) => {
-                return Err(())
-            }
+            MenuCommand::BeginTriggerAssignment { .. }
+            | MenuCommand::SetAppendSpace(_)
+            | MenuCommand::Boundary(_) => return Err(()),
         }
         Ok(())
     }
@@ -299,22 +320,28 @@ impl MicrophonePermissionRuntime {
         if self.completions.try_recv().is_err() {
             return false;
         }
-        while self.completions.try_recv().is_ok() {}
         self.flow.request_completed(authorization(), boundary);
         true
     }
 }
 
 struct SystemMicrophonePermissionBoundary {
+    notifier: EventNotifier,
     completion_sender: Sender<()>,
 }
 
+impl SystemMicrophonePermissionBoundary {
+    fn completion(&self) -> impl Fn() + Send + Sync + 'static {
+        let completion_sender = self.completion_sender.clone();
+        let notifier = self.notifier.clone();
+        move || {
+            notifier.send(&completion_sender, ());
+        }
+    }
+}
 impl MicrophonePermissionBoundary for SystemMicrophonePermissionBoundary {
     fn request_access(&mut self) -> bool {
-        let completion_sender = self.completion_sender.clone();
-        permissions::request_microphone_access(move || {
-            let _ = completion_sender.send(());
-        })
+        permissions::request_microphone_access(self.completion())
     }
 
     fn open_settings(&mut self) -> bool {
@@ -416,7 +443,7 @@ const fn is_dictation_in_flight(status: &AppStatus) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimerKind {
-    DrainEvents,
+    AsrWatchdog,
     AutomaticUpdateCheck,
     PollPermissions,
     FinishCapture,
@@ -604,72 +631,206 @@ fn capture_start_allowed(
 }
 
 struct TimerContext {
-    // Points into the pinned `Runtime` that owns this context. Every timer is
-    // removed on that same main run loop before the runtime can be dropped.
-    runtime: *mut Runtime,
     kind: TimerKind,
+    active: Cell<bool>,
+    fired: Cell<bool>,
+    queue: Rc<RefCell<VecDeque<Rc<TimerContext>>>>,
+    notifier: EventNotifier,
 }
-
 struct ScheduledTimer {
     timer: CFRunLoopTimer,
-    _context: Box<TimerContext>,
+    context: Rc<TimerContext>,
 }
-
 impl ScheduledTimer {
     fn new(
         run_loop: &CFRunLoop,
-        runtime: *mut Runtime,
+        queue: Rc<RefCell<VecDeque<Rc<TimerContext>>>>,
+        notifier: EventNotifier,
         kind: TimerKind,
         delay_ms: u64,
-        repeat_ms: Option<u64>,
     ) -> Self {
-        let mut context = Box::new(TimerContext { runtime, kind });
+        let context = Rc::new(TimerContext {
+            kind,
+            active: Cell::new(true),
+            fired: Cell::new(false),
+            queue,
+            notifier,
+        });
         let mut cf_context = CFRunLoopTimerContext {
             version: 0,
-            info: (&mut *context as *mut TimerContext).cast::<c_void>(),
-            retain: None,
-            release: None,
+            info: Rc::as_ptr(&context).cast_mut().cast(),
+            retain: Some(retain_timer_context),
+            release: Some(release_timer_context),
             copyDescription: None,
         };
         let timer = CFRunLoopTimer::new(
             CFDate::now().abs_time() + milliseconds_to_seconds(delay_ms),
-            repeat_ms.map(milliseconds_to_seconds).unwrap_or(0.0),
+            0.0,
             0,
             0,
             timer_fired,
             &mut cf_context,
         );
         run_loop.add_timer(&timer, unsafe { kCFRunLoopCommonModes });
-        Self {
-            timer,
-            _context: context,
-        }
+        Self { timer, context }
     }
-
     fn remove(self, run_loop: &CFRunLoop) {
+        self.context.active.set(false);
+        unsafe {
+            core_foundation::runloop::CFRunLoopTimerInvalidate(self.timer.as_concrete_TypeRef())
+        };
         run_loop.remove_timer(&self.timer, unsafe { kCFRunLoopCommonModes });
     }
 }
-
+impl Drop for ScheduledTimer {
+    fn drop(&mut self) {
+        self.context.active.set(false);
+        unsafe {
+            core_foundation::runloop::CFRunLoopTimerInvalidate(self.timer.as_concrete_TypeRef())
+        };
+    }
+}
+extern "C" fn retain_timer_context(info: *const c_void) -> *const c_void {
+    unsafe { Rc::increment_strong_count(info.cast::<TimerContext>()) };
+    info
+}
+extern "C" fn release_timer_context(info: *const c_void) {
+    unsafe { drop(Rc::from_raw(info.cast::<TimerContext>())) };
+}
 const fn milliseconds_to_seconds(milliseconds: u64) -> f64 {
     milliseconds as f64 / 1_000.0
 }
-
 extern "C" fn timer_fired(_timer: CFRunLoopTimerRef, raw_context: *mut c_void) {
     let result = catch_unwind(AssertUnwindSafe(|| unsafe {
-        let context = raw_context.cast::<TimerContext>();
-        if context.is_null() {
-            return;
+        let ptr = raw_context.cast::<TimerContext>();
+        Rc::increment_strong_count(ptr);
+        let context = Rc::from_raw(ptr);
+        // Timer callbacks never borrow Runtime, including during initialization
+        // and nested AppKit loops. Each token fires once and is invalidated on
+        // cancellation; a deferred old generation cannot cancel a newer timer.
+        if context.active.get() && !context.fired.replace(true) {
+            context.queue.borrow_mut().push_back(context.clone());
+            context.notifier.notify();
         }
-        let runtime = (*context).runtime;
-        if runtime.is_null() {
-            return;
-        }
-        (*runtime).handle_timer((*context).kind);
     }));
-
     if result.is_err() {
         tracing::error!(error_category = "timer_callback_panic");
+    }
+}
+
+#[derive(Default)]
+struct PermissionRetry {
+    delay_ms: u64,
+}
+impl PermissionRetry {
+    fn restart(&mut self) {
+        self.delay_ms = 0;
+    }
+    fn next(&mut self, needed: bool) -> Option<u64> {
+        if !needed {
+            self.restart();
+            return None;
+        }
+        self.delay_ms = if self.delay_ms == 0 {
+            PERMISSION_POLL_MS
+        } else {
+            (self.delay_ms * 2).min(30_000)
+        };
+        Some(self.delay_ms)
+    }
+}
+
+fn asr_wake_deadline(
+    now: Instant,
+    operation: Option<Instant>,
+    cleanup_pending: bool,
+    scheduled: Option<Instant>,
+    cleanup_check_ms: &mut u64,
+) -> Option<Instant> {
+    if !cleanup_pending {
+        *cleanup_check_ms = 10;
+    }
+    operation.or_else(|| {
+        if !cleanup_pending {
+            return None;
+        }
+        scheduled.or_else(|| {
+            let deadline = now + Duration::from_millis(*cleanup_check_ms);
+            *cleanup_check_ms = (*cleanup_check_ms * 2).min(1_000);
+            Some(deadline)
+        })
+    })
+}
+
+const EVENT_LANES: usize = 11;
+const EVENTS_PER_LANE: usize = 32;
+const EVENTS_PER_PASS: usize = 128;
+const EVENT_BUDGET: Duration = Duration::from_millis(2);
+
+fn drain_event_lanes(
+    next_lane: &mut usize,
+    mut drain: impl FnMut(usize) -> bool,
+    mut elapsed: impl FnMut() -> Duration,
+) -> bool {
+    let mut counts = [0; EVENT_LANES];
+    let mut available = [true; EVENT_LANES];
+    let mut total = 0;
+    let mut continuation = false;
+    while available.iter().any(|ready| *ready) {
+        let lane = *next_lane;
+        *next_lane = (lane + 1) % EVENT_LANES;
+        if !available[lane] {
+            continue;
+        }
+        if drain(lane) {
+            counts[lane] += 1;
+            total += 1;
+            if counts[lane] == EVENTS_PER_LANE {
+                available[lane] = false;
+                continuation = true;
+            }
+            if total == EVENTS_PER_PASS || elapsed() >= EVENT_BUDGET {
+                continuation = true;
+                break;
+            }
+        } else {
+            available[lane] = false;
+        }
+    }
+    continuation
+}
+
+// FIFO fences bound the prefix without copying it or allowing later arrivals
+// to prolong it. At most one clipboard completion and one open preflight exist.
+#[derive(Default)]
+struct HotkeyPreflight {
+    next: u64,
+    paste: Option<(u64, u64, PasteOutcome)>,
+    restored: Option<(u64, PasteOutcome)>,
+    open: Option<(u64, UpdaterState)>,
+    assignment: Option<(u64, HotkeySignal)>,
+}
+impl HotkeyPreflight {
+    fn take_paste(&mut self, marker: u64) -> Option<(u64, PasteOutcome)> {
+        if self.paste.as_ref().is_none_or(|(id, _, _)| *id != marker) {
+            return None;
+        }
+        self.paste
+            .take()
+            .map(|(_, generation, outcome)| (generation, outcome))
+    }
+    fn take_open(&mut self, marker: u64) -> Option<UpdaterState> {
+        if self.open.as_ref().is_none_or(|(id, _)| *id != marker) {
+            return None;
+        }
+        self.open.take().map(|(_, state)| state)
+    }
+    fn marker(&mut self) -> u64 {
+        self.next = self
+            .next
+            .checked_add(1)
+            .expect("hotkey boundary identity exhausted");
+        self.next
     }
 }
 
@@ -816,6 +977,7 @@ pub struct Runtime {
     preferences: RuntimePreferences<SystemPreferenceStore>,
     output_preferences: OutputPreferenceController<SystemOutputPreferenceStore>,
     menu_commands: Receiver<MenuCommand>,
+    menu_sender: Sender<MenuCommand>,
     hotkey_control: HotkeyControl,
     assignment: AssignmentTracker,
     menu_readiness: MenuReadiness,
@@ -836,7 +998,16 @@ pub struct Runtime {
     updater: Option<SystemUpdaterLane>,
     orderly_quit: OrderlyQuitGate,
     run_loop: CFRunLoop,
-    drain_timer: Option<ScheduledTimer>,
+    event_source: Rc<EventSource>,
+    notifier: EventNotifier,
+    timer_events: Rc<RefCell<VecDeque<Rc<TimerContext>>>>,
+    next_lane: usize,
+    preflight: HotkeyPreflight,
+    asr_timer: Option<ScheduledTimer>,
+    asr_timer_deadline: Option<Instant>,
+    cleanup_check_ms: u64,
+    permission_retry: PermissionRetry,
+    permission_setup_started: bool,
     updater_timer: Option<ScheduledTimer>,
     permission_timer: Option<ScheduledTimer>,
     finish_timer: Option<ScheduledTimer>,
@@ -855,28 +1026,47 @@ pub struct Runtime {
 /// Completes shutdown after the application's outer run loop has returned.
 /// Borrow only the pinned allocation's owner handle across callback pumping:
 /// no `&mut Runtime` (including one nested in `Pin`) may span a nested run loop
-/// that can invoke timers through their previously stored Runtime pointers.
+/// that can invoke the event source through its stored Runtime pointer.
 pub fn finish_after_run(owner: &mut Pin<Box<Runtime>>) {
-    pump_until_cleanup(owner, Runtime::shutdown_after_run_step, || {
-        CFRunLoop::run_in_mode(
-            unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
-            Duration::from_millis(20),
-            true,
-        );
-    });
+    let source = owner.as_ref().event_source.clone();
+    pump_until_cleanup_guarded(
+        owner,
+        || source.suspend(),
+        Runtime::shutdown_after_run_step,
+        || {
+            CFRunLoop::run_in_mode(
+                unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+                Duration::from_millis(20),
+                true,
+            );
+        },
+    );
 }
 
 /// Every pointee borrow is created for one step and ends when that call returns.
 /// The higher-ranked step returns only a boolean, so it cannot retain its
 /// temporary `Pin<&mut T>` for use while the following pump invokes callbacks.
 /// The outer function retains only a reference to the stable owner handle.
+#[cfg(test)]
 fn pump_until_cleanup<T>(
     owner: &mut Pin<Box<T>>,
     mut step: impl for<'access> FnMut(Pin<&'access mut T>) -> bool,
     mut pump: impl FnMut(),
 ) {
+    pump_until_cleanup_guarded(owner, || (), &mut step, &mut pump);
+}
+
+fn pump_until_cleanup_guarded<T, G>(
+    owner: &mut Pin<Box<T>>,
+    mut guard: impl FnMut() -> G,
+    mut step: impl for<'access> FnMut(Pin<&'access mut T>) -> bool,
+    mut pump: impl FnMut(),
+) {
     loop {
-        let complete = step(owner.as_mut());
+        let complete = {
+            let _guard = guard();
+            step(owner.as_mut())
+        };
         if complete {
             return;
         }
@@ -905,10 +1095,15 @@ impl Runtime {
         _mtm: MainThreadMarker,
         updater_config: Option<UpdaterLaunchConfig>,
     ) -> Pin<Box<Self>> {
+        // Source allocation fails before any worker is launched. It is not
+        // callable until attach after the initialization pointee borrow ends.
+        let event_source = Rc::new(EventSource::new(CFRunLoop::get_main()));
+        let notifier = event_source.notifier();
         let (hotkey_sender, hotkey_events) = mpsc::channel();
         let (menu_sender, menu_commands) = mpsc::channel();
-        let asr = AsrTask::spawn();
-        let (model_preparation_events, model_preparation_worker) = spawn_model_preparation_worker();
+        let asr = AsrTask::spawn_notified(notifier.clone());
+        let (model_preparation_events, model_preparation_worker) =
+            spawn_model_preparation_worker(notifier.clone());
         let model_preparation =
             ModelPreparationTask::new(model_preparation_events, model_preparation_worker);
         let preference_repository = PreferenceRepository::new(SystemPreferenceStore::new());
@@ -919,25 +1114,28 @@ impl Runtime {
         let append_space = output_preferences.current().append_space;
         let hotkey_control = HotkeyControl::new(preferences);
         let menu_readiness = MenuReadiness::new(false);
-        let updater = updater_config.map(SystemUpdaterLane::production);
+        let updater =
+            updater_config.map(|config| SystemUpdaterLane::production(config, notifier.clone()));
 
         let mut runtime = Box::pin(Self {
             controller: AppController::new(),
-            menu: MenuBar::new(
+            menu: MenuBar::new_notified(
                 preferences,
                 append_space,
-                menu_sender,
+                menu_sender.clone(),
                 hotkey_control.clone(),
                 menu_readiness.clone(),
+                notifier.clone(),
             ),
             preferences: RuntimePreferences::new(preferences, preference_repository),
             output_preferences,
             menu_commands,
+            menu_sender,
             hotkey_control,
             assignment: AssignmentTracker::default(),
             menu_readiness,
             recorder: AudioRecorder::new(),
-            audio_preparation: AudioPreparationTask::spawn(),
+            audio_preparation: AudioPreparationTask::spawn_notified(notifier.clone()),
             dictation_capture: DictationCapture::default(),
             hotkey: None,
             hotkey_sender,
@@ -953,7 +1151,16 @@ impl Runtime {
             updater,
             orderly_quit: OrderlyQuitGate::default(),
             run_loop: CFRunLoop::get_main(),
-            drain_timer: None,
+            event_source: event_source.clone(),
+            notifier,
+            timer_events: Rc::default(),
+            next_lane: 0,
+            preflight: HotkeyPreflight::default(),
+            asr_timer: None,
+            asr_timer_deadline: None,
+            cleanup_check_ms: 10,
+            permission_retry: PermissionRetry::default(),
+            permission_setup_started: false,
             updater_timer: None,
             permission_timer: None,
             finish_timer: None,
@@ -970,27 +1177,22 @@ impl Runtime {
         });
 
         // SAFETY: The runtime has just been pinned, contains `PhantomPinned`,
-        // and is never exposed without its `Pin`. Its timers may therefore
-        // retain this address until `Drop` removes them.
+        // and is never exposed without its `Pin`. Its source may therefore
+        // retain this address until `Drop` closes the event source.
+        let initialization_guard = event_source.suspend();
         let runtime_ref = unsafe { Pin::as_mut(&mut runtime).get_unchecked_mut() };
-        runtime_ref.install_repeating_timers();
+        let pointer = runtime_ref as *mut Runtime;
         runtime_ref.initialize_updater();
         tracing::info!(
             lifecycle = "started",
             state = status_name(runtime_ref.controller.status())
         );
+        event_source.set_handler(move || unsafe { (*pointer).drain_events() });
+        // runtime_ref's last use is above. Release the setup guard only after
+        // initialization access ends, then register through the separate owner.
+        drop(initialization_guard);
+        event_source.attach();
         runtime
-    }
-
-    fn install_repeating_timers(&mut self) {
-        let runtime = self as *mut Self;
-        self.drain_timer = Some(ScheduledTimer::new(
-            &self.run_loop,
-            runtime,
-            TimerKind::DrainEvents,
-            EVENT_DRAIN_MS,
-            Some(EVENT_DRAIN_MS),
-        ));
     }
 
     fn initialize_updater(&mut self) {
@@ -1004,25 +1206,22 @@ impl Runtime {
     }
 
     fn start_permission_setup(&mut self) {
-        if self.permission_timer.is_some() {
-            return;
-        }
-        let runtime = self as *mut Self;
-        self.permission_timer = Some(ScheduledTimer::new(
-            &self.run_loop,
-            runtime,
-            TimerKind::PollPermissions,
-            PERMISSION_POLL_MS,
-            Some(PERMISSION_POLL_MS),
-        ));
+        self.permission_setup_started = true;
+        self.permission_retry.restart();
         self.poll_permissions();
     }
 
     fn handle_timer(&mut self, kind: TimerKind) {
         match kind {
-            TimerKind::DrainEvents => self.drain_events(),
+            TimerKind::AsrWatchdog => {
+                cancel_timer(&self.run_loop, &mut self.asr_timer);
+                self.asr_timer_deadline = None;
+            }
             TimerKind::AutomaticUpdateCheck => self.handle_automatic_update_timer(),
-            TimerKind::PollPermissions => self.poll_permissions(),
+            TimerKind::PollPermissions => {
+                cancel_timer(&self.run_loop, &mut self.permission_timer);
+                self.poll_permissions();
+            }
             TimerKind::FinishCapture => self.finish_capture(),
             TimerKind::CaptureLimit => {
                 self.dispatch(AppEvent::CaptureLimitReached);
@@ -1061,64 +1260,161 @@ impl Runtime {
         let delay_ms = deadline
             .saturating_sub(SystemClock.now())
             .saturating_mul(1_000);
-        let runtime = self as *mut Self;
         self.updater_timer = Some(ScheduledTimer::new(
             &self.run_loop,
-            runtime,
+            self.timer_events.clone(),
+            self.notifier.clone(),
             TimerKind::AutomaticUpdateCheck,
             delay_ms,
-            None,
         ));
     }
 
     fn drain_events(&mut self) {
-        self.drain_menu_actions();
-        if self.asr_shutdown.started.is_some() {
-            self.try_orderly_quit();
-            return;
-        }
-        self.drain_updater_worker_results();
-        self.drain_updater_actions();
-        self.drain_model_preparation();
-        self.drain_permission_migration();
-        self.drain_microphone_permission_completions();
-
-        self.drain_menu_commands();
-
-        self.drain_hotkey_events();
-
-        self.drain_audio_preparation();
-
-        while let Some(result) = self.asr.poll(Instant::now()) {
-            match result {
-                Ok(AsrEvent::Loaded(Ok(()))) => {
-                    self.asr_recovery.loaded();
-                    self.poll_permissions();
-                    self.dispatch(AppEvent::ModelLoaded(Ok(())));
-                }
-                Ok(AsrEvent::Loaded(Err(_))) => self.handle_asr_error(AsrTaskError::WorkerFailed),
-                Ok(AsrEvent::Recognized(result)) => {
-                    if self
-                        .dictation_capture
-                        .accept_recognition(self.asr_generation.take())
-                    {
-                        self.dispatch(AppEvent::RecognitionFinished(result));
-                    }
-                }
-                Err(error) => {
-                    self.handle_asr_error(error);
-                    break;
-                }
-            }
-        }
+        let started = Instant::now();
+        let mut next_lane = self.next_lane;
+        let continuation = drain_event_lanes(
+            &mut next_lane,
+            |lane| self.drain_lane(lane),
+            || started.elapsed(),
+        );
+        self.next_lane = next_lane;
         if self.controller.status() == &AppStatus::AsrCleanupPending && self.asr.retry_ready() {
             self.dispatch(AppEvent::AsrUnavailable);
         }
         self.try_orderly_quit();
+        self.refresh_asr_watchdog();
+        if continuation {
+            self.notifier.notify();
+        }
+    }
+
+    fn drain_lane(&mut self, lane: usize) -> bool {
+        if lane == 0 {
+            let event = self.timer_events.borrow_mut().pop_front();
+            if let Some(event) = event {
+                if event.active.get() {
+                    self.handle_timer(event.kind);
+                }
+                return true;
+            }
+            return false;
+        }
+        if self.asr_shutdown.started.is_some() {
+            return false;
+        }
+        match lane {
+            1 => self.drain_menu_actions(),
+            2 => self.drain_updater_worker_results(),
+            3 => self.drain_updater_actions(),
+            4 => self.drain_model_preparation(),
+            5 => self.drain_permission_migration(),
+            6 => self.drain_microphone_permission_completions(),
+            7 => match self.menu_commands.try_recv() {
+                Ok(command) => {
+                    self.handle_menu_command(command);
+                    true
+                }
+                Err(_) => false,
+            },
+            8 if self.preflight.assignment.is_some() => false,
+            8 => match self.hotkey_events.try_recv() {
+                Ok(signal) => {
+                    if matches!(
+                        signal,
+                        HotkeySignal::AssignmentSelected { .. }
+                            | HotkeySignal::AssignmentCancelled { .. }
+                    ) {
+                        let marker = self.preflight.marker();
+                        if self
+                            .notifier
+                            .send(&self.menu_sender, MenuCommand::Boundary(marker))
+                        {
+                            self.preflight.assignment = Some((marker, signal));
+                        } else {
+                            self.begin_shutdown();
+                        }
+                    } else {
+                        self.handle_hotkey(signal);
+                    }
+                    true
+                }
+                Err(_) => false,
+            },
+            9 => self.drain_audio_preparation(),
+            10 => self.drain_asr_result(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn drain_asr_result(&mut self) -> bool {
+        let Some(result) = self.asr.poll_one(Instant::now()) else {
+            return false;
+        };
+        match result {
+            Some(Ok(AsrEvent::Loaded(Ok(())))) => {
+                self.asr_recovery.loaded();
+                self.permission_retry.restart();
+                self.poll_permissions();
+                self.dispatch(AppEvent::ModelLoaded(Ok(())));
+                if self.tap_needs_retry {
+                    self.observe_tap_state(TapState::Lost);
+                }
+            }
+            Some(Ok(AsrEvent::Loaded(Err(_)))) => self.handle_asr_error(AsrTaskError::WorkerFailed),
+            Some(Ok(AsrEvent::Recognized(result))) => {
+                if self
+                    .dictation_capture
+                    .accept_recognition(self.asr_generation.take())
+                {
+                    self.dispatch(AppEvent::RecognitionFinished(result));
+                }
+            }
+            Some(Err(error)) => self.handle_asr_error(error),
+            None => {} // consumed stale completion still counts toward budget
+        }
+        true
+    }
+
+    fn refresh_asr_watchdog(&mut self) {
+        let cleanup_pending = (self.controller.status() == &AppStatus::AsrCleanupPending
+            && !self.asr.retry_ready())
+            || (self.asr_shutdown.started.is_some() && !self.asr.cleanup_complete());
+        let now = Instant::now();
+        let deadline = asr_wake_deadline(
+            now,
+            self.asr.next_deadline(),
+            cleanup_pending,
+            self.asr_timer_deadline,
+            &mut self.cleanup_check_ms,
+        );
+        if deadline == self.asr_timer_deadline {
+            return;
+        }
+        cancel_timer(&self.run_loop, &mut self.asr_timer);
+        self.asr_timer_deadline = deadline;
+        if let Some(deadline) = deadline {
+            // Ceiling, minimum 1 ms: an early CF firing cannot create a spin.
+            let delay = deadline
+                .saturating_duration_since(now)
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .max(1) as u64;
+            self.asr_timer = Some(ScheduledTimer::new(
+                &self.run_loop,
+                self.timer_events.clone(),
+                self.notifier.clone(),
+                TimerKind::AsrWatchdog,
+                delay,
+            ));
+        }
     }
 
     fn handle_asr_error(&mut self, error: AsrTaskError) {
         tracing::error!(error_category = "asr_worker", error = ?error);
+        // Cleanup checks must not inherit the retired operation's (possibly
+        // minutes-away) watchdog deadline.
+        cancel_timer(&self.run_loop, &mut self.asr_timer);
+        self.asr_timer_deadline = None;
         self.asr.invalidate();
         self.asr_generation = None;
         cancel_timer(&self.run_loop, &mut self.error_timer);
@@ -1159,7 +1455,7 @@ impl Runtime {
         }
     }
 
-    fn drain_model_preparation(&mut self) {
+    fn drain_model_preparation(&mut self) -> bool {
         let received = self
             .model_preparation
             .as_ref()
@@ -1172,14 +1468,10 @@ impl Runtime {
             Some(Err(TryRecvError::Empty)) | None => None,
         };
         let Some(result) = result else {
-            return;
+            return false;
         };
 
-        if let Some(task) = self.model_preparation.take() {
-            if task.join_completed().is_err() {
-                tracing::error!(error_category = "model_preparation_worker_panic");
-            }
-        }
+        self.model_preparation.take();
 
         let plan = model_preparation_plan(result);
         debug_assert_eq!(
@@ -1194,6 +1486,7 @@ impl Runtime {
                 self.dispatch(AppEvent::ModelPreparationFailed(failure));
             }
         }
+        true
     }
 
     fn begin_permission_migration(&mut self, paths: ModelPaths) {
@@ -1202,7 +1495,7 @@ impl Runtime {
         }
         self.dispatch(AppEvent::PermissionMigrationStarted);
         self.prepared_model_paths = Some(paths.clone());
-        let (events, worker) = spawn_permission_migration_worker(paths);
+        let (events, worker) = spawn_permission_migration_worker(paths, self.notifier.clone());
         self.permission_migration = Some(PermissionMigrationTask::new(events, worker));
     }
 
@@ -1216,7 +1509,7 @@ impl Runtime {
         self.begin_permission_migration(paths);
     }
 
-    fn drain_permission_migration(&mut self) {
+    fn drain_permission_migration(&mut self) -> bool {
         let received = self
             .permission_migration
             .as_ref()
@@ -1227,19 +1520,15 @@ impl Runtime {
             Some(Err(TryRecvError::Empty)) | None => None,
         };
         let Some(completed) = completed else {
-            return;
+            return false;
         };
 
-        if let Some(task) = self.permission_migration.take() {
-            if task.join_completed().is_err() {
-                tracing::error!(error_category = "permission_migration_worker_panic");
-            }
-        }
+        self.permission_migration.take();
 
         let Some(result) = completed else {
             tracing::error!(error_category = "permission_migration_worker_disconnected");
             self.dispatch(AppEvent::PermissionMigrationFailed);
-            return;
+            return true;
         };
         match result.migration {
             Ok(success) => {
@@ -1264,6 +1553,7 @@ impl Runtime {
                 self.dispatch(AppEvent::PermissionMigrationFailed);
             }
         }
+        true
     }
 
     fn begin_model_preparation(&mut self) {
@@ -1271,58 +1561,53 @@ impl Runtime {
             return;
         }
         self.dispatch(AppEvent::ModelPreparationStarted);
-        let (events, worker) = spawn_model_preparation_worker();
+        let (events, worker) = spawn_model_preparation_worker(self.notifier.clone());
         self.model_preparation = Some(ModelPreparationTask::new(events, worker));
     }
 
-    fn drain_hotkey_events(&mut self) {
-        let hotkey_events: Vec<_> = self.hotkey_events.try_iter().collect();
-        for signal in hotkey_events {
-            self.handle_hotkey(signal);
-        }
-    }
-
-    fn drain_menu_commands(&mut self) {
-        let menu_commands: Vec<_> = self.menu_commands.try_iter().collect();
-        for command in menu_commands {
-            self.handle_menu_command(command);
-        }
-    }
-
-    fn drain_menu_actions(&mut self) {
-        while let Some(action) = self.menu.take_action() {
-            if self.asr_shutdown.started.is_some() {
-                continue;
-            }
-            match action {
-                MenuAction::Quit => self.begin_shutdown(),
-                MenuAction::RetryAsr => self.retry_asr(),
-                MenuAction::OpenPermission(permission) => {
-                    if !permissions::open_settings(permission) {
-                        tracing::warn!(error_category = "open_permission_settings");
-                    }
-                }
-                MenuAction::RetryModelPreparation => self.begin_model_preparation(),
-                MenuAction::RetryPermissionMigration => self.retry_permission_migration(),
-            }
-        }
-    }
-
-    fn drain_updater_worker_results(&mut self) {
-        let Some(updater) = self.updater.as_mut() else {
-            return;
+    fn drain_menu_actions(&mut self) -> bool {
+        let Some(action) = self.menu.take_action() else {
+            return false;
         };
-        let (effects, handled) = updater.drain_worker_results();
+        match action {
+            MenuAction::Quit => self.begin_shutdown(),
+            MenuAction::RefreshPermissions => self.refresh_permissions_from_interaction(),
+            MenuAction::RetryAsr => {
+                self.refresh_permissions_from_interaction();
+                self.retry_asr();
+            }
+            MenuAction::OpenPermission(permission) => {
+                self.refresh_permissions_from_interaction();
+                if !permissions::open_settings(permission) {
+                    tracing::warn!(error_category = "open_permission_settings");
+                }
+            }
+            MenuAction::RetryModelPreparation => self.begin_model_preparation(),
+            MenuAction::RetryPermissionMigration => self.retry_permission_migration(),
+        }
+        true
+    }
+
+    fn drain_updater_worker_results(&mut self) -> bool {
+        let Some(updater) = self.updater.as_mut() else {
+            return false;
+        };
+        let (effects, handled) = updater.poll_worker_result();
         self.apply_updater_effects(effects);
         if handled {
             self.render_updater_menu();
         }
+        handled
     }
 
-    fn drain_updater_actions(&mut self) {
-        while let Some(action) = self.menu.take_updater_action() {
+    fn drain_updater_actions(&mut self) -> bool {
+        // Park only the already-queued open preflight, preserving FIFO actions.
+        if self.preflight.open.is_some() {
+            return false;
+        }
+        if let Some(action) = self.menu.take_updater_action() {
             if self.updater.is_none() {
-                continue;
+                return true;
             }
             let effects = match action {
                 UpdaterMenuAction::CheckForUpdates => self
@@ -1356,19 +1641,25 @@ impl Runtime {
                     }
                 }
                 UpdaterMenuAction::OpenDownloadedUpdate => {
-                    self.drain_hotkey_events();
-                    if updater_open_allowed(self.controller.status(), self.clipboard_busy()) {
-                        self.updater
-                            .as_mut()
-                            .map(SystemUpdaterLane::request_open)
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
+                    if !updater_open_allowed(self.controller.status(), self.clipboard_busy()) {
+                        return true;
                     }
+                    let marker = self.preflight.marker();
+                    let state = self.updater.as_ref().unwrap().state().clone();
+                    if self
+                        .notifier
+                        .send(&self.hotkey_sender, HotkeySignal::Boundary(marker))
+                    {
+                        self.preflight.open = Some((marker, state));
+                    }
+                    Vec::new()
                 }
             };
             self.apply_updater_effects(effects);
             self.render_updater_menu();
+            true
+        } else {
+            false
         }
     }
 
@@ -1392,6 +1683,7 @@ impl Runtime {
         self.dictation_capture.abandon();
         self.asr_generation = None;
         self.insertion_queue.0 = None;
+        self.preflight = HotkeyPreflight::default();
         self.audio_preparation.stop();
         self.recorder.abort();
         self.hotkey.take();
@@ -1406,6 +1698,8 @@ impl Runtime {
                 tracing::warn!(error_category = "pasteboard_restore_on_shutdown");
             }
         }
+        cancel_timer(&self.run_loop, &mut self.asr_timer);
+        self.asr_timer_deadline = None;
         self.asr.stop();
     }
 
@@ -1436,10 +1730,12 @@ impl Runtime {
     }
 
     /// One scoped pointee access for the owner-handle shutdown pump. This
-    /// function never pumps callbacks, and its mutable argument ends on return.
+    /// function never explicitly pumps callbacks. Native restoration may pump;
+    /// the owner-handle caller holds the shared source guard for that interval.
     fn shutdown_after_run_step(self: Pin<&mut Self>) -> bool {
         let runtime = unsafe { self.get_unchecked_mut() };
         runtime.begin_shutdown();
+        runtime.refresh_asr_watchdog();
         let cleaned = runtime.asr.cleanup_complete();
         if runtime.asr_shutdown.report_failure(
             Instant::now(),
@@ -1451,8 +1747,9 @@ impl Runtime {
         cleaned
     }
 
-    fn drain_microphone_permission_completions(&mut self) {
+    fn drain_microphone_permission_completions(&mut self) -> bool {
         let mut boundary = SystemMicrophonePermissionBoundary {
+            notifier: self.notifier.clone(),
             completion_sender: self.microphone_permissions.completion_sender(),
         };
         let should_repoll = self.microphone_permissions.drain_completions(
@@ -1460,13 +1757,21 @@ impl Runtime {
             &mut boundary,
         );
         if should_repoll {
-            self.poll_permissions();
+            self.refresh_permissions_from_interaction();
         }
+        should_repoll
     }
 
     fn handle_hotkey(&mut self, signal: HotkeySignal) {
         match signal {
+            HotkeySignal::Boundary(marker) => self.complete_hotkey_preflight(marker),
             HotkeySignal::Pressed => {
+                // Probe before TriggerPressed changes Ready to Recording.
+                if self.controller.status() == &AppStatus::Ready
+                    || matches!(self.controller.status(), AppStatus::PermissionBlocked(_))
+                {
+                    self.refresh_permissions_from_interaction();
+                }
                 if capture_start_allowed(
                     self.controller.status(),
                     self.pending_insertion.as_ref().map(|flow| flow.state),
@@ -1484,10 +1789,12 @@ impl Runtime {
             HotkeySignal::TapLost => {
                 self.tap_needs_retry = true;
                 self.observe_tap_state(TapState::Lost);
+                self.refresh_permissions_from_interaction();
             }
             HotkeySignal::TapRestored => {
                 self.tap_needs_retry = false;
                 self.observe_tap_state(TapState::Restored);
+                self.refresh_permissions_from_interaction();
             }
             HotkeySignal::AssignmentSelected { trigger, epoch } => {
                 if let Some(trigger) =
@@ -1509,6 +1816,35 @@ impl Runtime {
     }
 
     fn handle_menu_command(&mut self, command: MenuCommand) {
+        if let MenuCommand::Boundary(marker) = command {
+            if self
+                .preflight
+                .assignment
+                .as_ref()
+                .is_some_and(|(id, _)| *id == marker)
+            {
+                let (_, signal) = self.preflight.assignment.take().unwrap();
+                self.handle_hotkey(signal);
+                self.notifier.notify();
+            }
+            return;
+        }
+        if command == MenuCommand::ResetTrigger {
+            let pending_epoch =
+                self.preflight
+                    .assignment
+                    .as_ref()
+                    .and_then(|(_, signal)| match signal {
+                        HotkeySignal::AssignmentSelected { epoch, .. }
+                        | HotkeySignal::AssignmentCancelled { epoch } => Some(*epoch),
+                        _ => None,
+                    });
+            if pending_epoch.is_some() && pending_epoch == self.assignment.active_epoch {
+                self.preflight.assignment = None;
+                self.notifier.notify();
+            }
+            self.assignment.active_epoch = None;
+        }
         if let MenuCommand::BeginTriggerAssignment { epoch } = command {
             if self.controller.status() == &AppStatus::Ready {
                 self.assignment.begin(epoch);
@@ -1547,7 +1883,16 @@ impl Runtime {
         }
     }
 
+    fn refresh_permissions_from_interaction(&mut self) {
+        self.permission_retry.restart();
+        self.poll_permissions();
+    }
+
     fn poll_permissions(&mut self) {
+        if !self.permission_setup_started || self.asr_shutdown.started.is_some() {
+            return;
+        }
+        cancel_timer(&self.run_loop, &mut self.permission_timer);
         let permissions = SystemPermissionProbe::check();
         if let Some(identity) = self.permission_build_identity.as_ref() {
             let mut marker_store = SystemPermissionMigrationStore::standard();
@@ -1559,6 +1904,7 @@ impl Runtime {
         }
         if permissions.microphone {
             let mut boundary = SystemMicrophonePermissionBoundary {
+                notifier: self.notifier.clone(),
                 completion_sender: self.microphone_permissions.completion_sender(),
             };
             self.microphone_permissions
@@ -1575,17 +1921,30 @@ impl Runtime {
 
         if !permissions.input_monitoring {
             self.tap_needs_retry = false;
-            reset_hotkey_before_drop(&self.hotkey_control, &self.hotkey_sender);
+            reset_hotkey_before_drop_notified(
+                &self.hotkey_control,
+                &self.hotkey_sender,
+                &self.notifier,
+            );
             self.hotkey.take();
+            self.schedule_permission_retry(permissions);
             return;
         }
 
         if self.tap_needs_retry {
-            reset_hotkey_before_drop(&self.hotkey_control, &self.hotkey_sender);
+            reset_hotkey_before_drop_notified(
+                &self.hotkey_control,
+                &self.hotkey_sender,
+                &self.notifier,
+            );
             self.hotkey.take();
         }
         if self.hotkey.is_none() {
-            match HotkeyListener::install(self.hotkey_sender.clone(), self.hotkey_control.clone()) {
+            match HotkeyListener::install_notified(
+                self.hotkey_sender.clone(),
+                self.hotkey_control.clone(),
+                self.notifier.clone(),
+            ) {
                 Ok(listener) => {
                     self.hotkey = Some(listener);
                     self.tap_needs_retry = false;
@@ -1596,6 +1955,22 @@ impl Runtime {
                     self.observe_tap_state(TapState::Lost);
                 }
             }
+        }
+        self.schedule_permission_retry(permissions);
+    }
+
+    fn schedule_permission_retry(&mut self, permissions: PermissionSnapshot) {
+        if let Some(delay) = self
+            .permission_retry
+            .next(permissions != PermissionSnapshot::all() || self.tap_needs_retry)
+        {
+            self.permission_timer = Some(ScheduledTimer::new(
+                &self.run_loop,
+                self.timer_events.clone(),
+                self.notifier.clone(),
+                TimerKind::PollPermissions,
+                delay,
+            ));
         }
     }
 
@@ -1609,6 +1984,15 @@ impl Runtime {
             self.cancel_finish_timer();
             self.cancel_capture_limit_timer();
             self.recorder.abort();
+        }
+        if self
+            .preflight
+            .paste
+            .as_ref()
+            .is_some_and(|(_, generation, _)| *generation != self.dictation_capture.generation)
+        {
+            self.preflight.paste = None;
+            self.preflight.restored = None;
         }
         self.insertion_queue
             .discard_unless_current(&self.dictation_capture, self.controller.status());
@@ -1652,6 +2036,7 @@ impl Runtime {
                 if permission == crate::state::PermissionKind::Microphone {
                     let authorization = SystemPermissionProbe::microphone_authorization();
                     let mut boundary = SystemMicrophonePermissionBoundary {
+                        notifier: self.notifier.clone(),
                         completion_sender: self.microphone_permissions.completion_sender(),
                     };
                     self.microphone_permissions
@@ -1744,13 +2129,16 @@ impl Runtime {
         }
     }
 
-    fn drain_audio_preparation(&mut self) {
-        while let Some(prepared) = self.audio_preparation.poll() {
+    fn drain_audio_preparation(&mut self) -> bool {
+        let Some(prepared) = self.audio_preparation.poll_one() else {
+            return false;
+        };
+        if let Some(prepared) = prepared {
             if !self
                 .dictation_capture
                 .accept(prepared.generation, self.controller.status())
             {
-                continue;
+                return true;
             }
             tracing::debug!(
                 native_sample_count = prepared.native_sample_count,
@@ -1768,53 +2156,50 @@ impl Runtime {
             }
             self.dispatch(capture_result_event(prepared.result));
         }
+        true
     }
 
     fn replace_finish_timer(&mut self, delay_ms: u64) {
         cancel_timer(&self.run_loop, &mut self.finish_timer);
-        let runtime = self as *mut Self;
         self.finish_timer = Some(ScheduledTimer::new(
             &self.run_loop,
-            runtime,
+            self.timer_events.clone(),
+            self.notifier.clone(),
             TimerKind::FinishCapture,
             delay_ms,
-            None,
         ));
     }
 
     fn replace_capture_limit_timer(&mut self, delay_ms: u64) {
         cancel_timer(&self.run_loop, &mut self.capture_limit_timer);
-        let runtime = self as *mut Self;
         self.capture_limit_timer = Some(ScheduledTimer::new(
             &self.run_loop,
-            runtime,
+            self.timer_events.clone(),
+            self.notifier.clone(),
             TimerKind::CaptureLimit,
             delay_ms,
-            None,
         ));
     }
 
     fn replace_error_timer(&mut self, delay_ms: u64) {
         cancel_timer(&self.run_loop, &mut self.error_timer);
-        let runtime = self as *mut Self;
         self.error_timer = Some(ScheduledTimer::new(
             &self.run_loop,
-            runtime,
+            self.timer_events.clone(),
+            self.notifier.clone(),
             TimerKind::ResetError,
             delay_ms,
-            None,
         ));
     }
 
     fn replace_insertion_timer(&mut self, kind: TimerKind, delay_ms: u64) {
         cancel_timer(&self.run_loop, &mut self.insertion_timer);
-        let runtime = self as *mut Self;
         self.insertion_timer = Some(ScheduledTimer::new(
             &self.run_loop,
-            runtime,
+            self.timer_events.clone(),
+            self.notifier.clone(),
             kind,
             delay_ms,
-            None,
         ));
     }
 
@@ -1877,8 +2262,7 @@ impl Runtime {
                     generation
                 );
                 // Consume the busy prefix before Ready. Never replay a press
-                // made before Command-V, even when the drain timer has not run.
-                self.drain_hotkey_events();
+                // made before Command-V, even when a source pass was delayed.
             }
             PasteOutcome::PasteFailed(error) | PasteOutcome::Restored(Err(error)) => {
                 tracing::warn!(
@@ -1891,15 +2275,67 @@ impl Runtime {
                     }
                 );
                 log_text_insertion_error(*error);
-                if matches!(outcome, PasteOutcome::PasteFailed(_)) {
-                    self.drain_hotkey_events();
-                }
             }
             PasteOutcome::Restored(Ok(())) => {}
+        }
+        if matches!(outcome, PasteOutcome::Restored(_))
+            && self
+                .preflight
+                .paste
+                .as_ref()
+                .is_some_and(|(_, origin, _)| *origin == generation)
+        {
+            self.preflight.restored = Some((generation, outcome));
+            return;
+        }
+        if matches!(
+            outcome,
+            PasteOutcome::Delivered | PasteOutcome::PasteFailed(_)
+        ) {
+            let marker = self.preflight.marker();
+            if self
+                .notifier
+                .send(&self.hotkey_sender, HotkeySignal::Boundary(marker))
+            {
+                debug_assert!(self.preflight.paste.is_none());
+                self.preflight.paste = Some((marker, generation, outcome));
+                return;
+            }
+            // A broken local hotkey channel cannot establish a safe prefix.
+            // Fail closed, without leaving clipboard/shutdown ownership parked.
+            self.begin_shutdown();
+            return;
         }
         if let Some(event) = outcome.foreground_event(generation, &self.dictation_capture) {
             self.dispatch(event);
         }
+    }
+
+    fn complete_hotkey_preflight(&mut self, marker: u64) {
+        if let Some((generation, outcome)) = self.preflight.take_paste(marker) {
+            if let Some(event) = outcome.foreground_event(generation, &self.dictation_capture) {
+                self.dispatch(event);
+            }
+            if let Some((origin, restored)) = self.preflight.restored.take() {
+                if let Some(event) = restored.foreground_event(origin, &self.dictation_capture) {
+                    self.dispatch(event);
+                }
+            }
+            self.drain_insertion_queue();
+        }
+        if let Some(state) = self.preflight.take_open(marker) {
+            if updater_open_allowed(self.controller.status(), self.clipboard_busy())
+                && self
+                    .updater
+                    .as_ref()
+                    .is_some_and(|updater| updater.state() == &state)
+            {
+                let effects = self.updater.as_mut().unwrap().request_open();
+                self.apply_updater_effects(effects);
+            }
+            self.notifier.notify();
+        }
+        self.render_updater_menu();
     }
 
     fn cancel_finish_timer(&mut self) {
@@ -1911,9 +2347,17 @@ impl Runtime {
     }
 }
 
+#[cfg(test)]
 fn reset_hotkey_before_drop(control: &HotkeyControl, sender: &Sender<HotkeySignal>) {
+    reset_hotkey_before_drop_notified(control, sender, &EventNotifier::default());
+}
+fn reset_hotkey_before_drop_notified(
+    control: &HotkeyControl,
+    sender: &Sender<HotkeySignal>,
+    notifier: &EventNotifier,
+) {
     if control.reset_for_listener_removal() {
-        let _ = sender.send(HotkeySignal::Cancelled);
+        notifier.send(sender, HotkeySignal::Cancelled);
     }
 }
 
@@ -1953,15 +2397,17 @@ pub(crate) fn capture_result_event<E>(result: Result<Option<Vec<f32>>, E>) -> Ap
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        self.event_source.close();
         self.dictation_capture.abandon();
         self.audio_preparation.stop();
-        cancel_timer(&self.run_loop, &mut self.drain_timer);
+        cancel_timer(&self.run_loop, &mut self.asr_timer);
         cancel_timer(&self.run_loop, &mut self.updater_timer);
         cancel_timer(&self.run_loop, &mut self.permission_timer);
         cancel_timer(&self.run_loop, &mut self.finish_timer);
         cancel_timer(&self.run_loop, &mut self.capture_limit_timer);
         cancel_timer(&self.run_loop, &mut self.insertion_timer);
         cancel_timer(&self.run_loop, &mut self.error_timer);
+        self.timer_events.borrow_mut().clear();
         if let Some(mut flow) = self.pending_insertion.take() {
             if flow.restore_on_shutdown().is_err() {
                 tracing::warn!(error_category = "pasteboard_restore_on_shutdown");
@@ -2089,8 +2535,7 @@ mod tests {
         spawn_permission_migration_worker_with, status_name, wait_for_smoke_child,
         AssignmentTracker, DeferredTapState, MicrophonePermissionRuntime, ModelPreparationPlan,
         ModelPreparationTask, PasteFlow, PasteFlowBoundary, PasteInsertion,
-        PermissionMigrationTask, RuntimePreferences, TapState, TimerKind, EVENT_DRAIN_MS,
-        PERMISSION_POLL_MS,
+        PermissionMigrationTask, RuntimePreferences, TapState, TimerKind, PERMISSION_POLL_MS,
     };
     use crate::audio::AudioError;
     use crate::constants::{ERROR_VISIBLE_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS};
@@ -2169,7 +2614,7 @@ mod tests {
         }
 
         extern "C" fn callback(_timer: CFRunLoopTimerRef, context: *mut c_void) {
-            // Same lifetime shape as TimerContext.runtime: this pointer was
+            // Same lifetime shape as the source handler: this pointer was
             // obtained before the owner-handle pump, and the pinned allocation
             // outlives its timer. No probe reference is held by that pump.
             let probe = unsafe { &mut *context.cast::<Probe>() };
@@ -2764,7 +3209,9 @@ mod tests {
 
     #[test]
     fn runtime_timings_match_the_product_contract() {
-        assert_eq!(EVENT_DRAIN_MS, 50);
+        assert_eq!(super::EVENTS_PER_LANE, 32);
+        assert_eq!(super::EVENTS_PER_PASS, 128);
+        assert_eq!(super::EVENT_BUDGET, Duration::from_millis(2));
         assert_eq!(PERMISSION_POLL_MS, 1_000);
         assert_eq!(RELEASE_GRACE_MS, 180);
         assert_eq!(MAX_CAPTURE_MS, 25_000);
@@ -3518,5 +3965,567 @@ mod tests {
             controller.handle(AppEvent::TriggerPressed),
             vec![Effect::StartCapture]
         );
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    use core_foundation::runloop::kCFRunLoopDefaultMode;
+
+    fn ready() -> AppController {
+        let mut controller = AppController::new();
+        controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
+        controller.handle(AppEvent::ModelLoaded(Ok(())));
+        controller
+    }
+
+    #[test]
+    fn lane_and_pass_caps_are_fair_and_consumed_suppression_continues() {
+        let mut cursor = 0;
+        let mut counts = [0; EVENT_LANES];
+        assert!(drain_event_lanes(
+            &mut cursor,
+            |lane| {
+                counts[lane] += 1;
+                true
+            },
+            || Duration::ZERO
+        ));
+        assert_eq!(counts.iter().sum::<usize>(), EVENTS_PER_PASS);
+        assert!(counts.iter().all(|count| (11..=12).contains(count)));
+        let mut remaining = 65;
+        let mut passes = 0;
+        loop {
+            let mut consumed = 0;
+            let more = drain_event_lanes(
+                &mut cursor,
+                |lane| {
+                    if lane == 8 && remaining != 0 {
+                        remaining -= 1;
+                        consumed += 1;
+                        true
+                    } else {
+                        false
+                    }
+                },
+                || Duration::ZERO,
+            );
+            assert!(consumed <= 32);
+            passes += 1;
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(passes, 3);
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn cooperative_time_budget_rotates_even_if_one_handler_takes_two_ms() {
+        let mut cursor = 0;
+        let mut serviced = Vec::new();
+        for _ in 0..EVENT_LANES {
+            assert!(drain_event_lanes(
+                &mut cursor,
+                |lane| {
+                    serviced.push(lane);
+                    true
+                },
+                || EVENT_BUDGET
+            ));
+        }
+        assert_eq!(serviced, (0..EVENT_LANES).collect::<Vec<_>>());
+        assert!(!drain_event_lanes(&mut cursor, |_| false, || EVENT_BUDGET));
+    }
+
+    #[test]
+    fn bounded_paste_and_open_fences_preserve_busy_prefix_and_later_press() {
+        let mut controller = ready();
+        controller.handle(AppEvent::TriggerPressed);
+        controller.handle(AppEvent::TriggerReleased { short: false });
+        let mut capture = DictationCapture::default();
+        capture.begin();
+        capture.phase = CapturePhase::Inserting;
+        let mut preflight = HotkeyPreflight::default();
+        let paste = preflight.marker();
+        let open = preflight.marker();
+        preflight.paste = Some((paste, capture.generation, PasteOutcome::Delivered));
+        preflight.open = Some((open, UpdaterState::Current));
+        let mut hotkeys = VecDeque::from(vec![HotkeySignal::Pressed; 70]);
+        hotkeys.push_back(HotkeySignal::Boundary(open));
+        hotkeys.push_back(HotkeySignal::Boundary(paste));
+        hotkeys.push_back(HotkeySignal::Pressed);
+        let mut cursor = 0;
+        let mut presses = 0;
+        let mut opened = false;
+        let mut passes = 0;
+        loop {
+            let more = drain_event_lanes(
+                &mut cursor,
+                |lane| {
+                    if lane != 8 {
+                        return false;
+                    }
+                    let Some(signal) = hotkeys.pop_front() else {
+                        return false;
+                    };
+                    match signal {
+                        HotkeySignal::Boundary(marker) => {
+                            if preflight.take_open(marker).is_some() {
+                                opened = updater_open_allowed(controller.status(), false);
+                            }
+                            if let Some((generation, outcome)) = preflight.take_paste(marker) {
+                                assert_eq!(presses, 0);
+                                controller.handle(
+                                    outcome.foreground_event(generation, &capture).unwrap(),
+                                );
+                            }
+                        }
+                        HotkeySignal::Pressed => {
+                            if capture_start_allowed(
+                                controller.status(),
+                                Some(PasteFlowState::AwaitingRestore),
+                                false,
+                            ) {
+                                presses += 1;
+                                controller.handle(AppEvent::TriggerPressed);
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    true
+                },
+                || Duration::ZERO,
+            );
+            passes += 1;
+            if passes <= 2 {
+                assert_eq!(controller.status(), &AppStatus::Recognizing);
+                assert!(preflight.paste.is_some());
+                assert!(!opened);
+            }
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(passes, 3);
+        assert_eq!(presses, 1);
+        assert!(
+            !opened,
+            "open prefix was completed while foreground remained busy"
+        );
+        assert!(preflight.take_paste(paste).is_none());
+        assert!(preflight.take_open(open).is_none());
+        assert_eq!(controller.status(), &AppStatus::Recording);
+    }
+
+    #[test]
+    fn assignment_waits_for_bounded_command_prefix_and_keeps_other_lanes_live() {
+        let control = HotkeyControl::new(Preferences::default());
+        let epoch = control.begin_assignment().unwrap();
+        let mut assignment = AssignmentTracker::default();
+        let mut preflight = HotkeyPreflight::default();
+        let marker = preflight.marker();
+        let selected = TriggerKey::FnGlobe;
+        preflight.assignment = Some((
+            marker,
+            HotkeySignal::AssignmentSelected {
+                trigger: selected,
+                epoch,
+            },
+        ));
+        let mut commands = VecDeque::from(vec![MenuCommand::SetAppendSpace(true); 40]);
+        commands.push_back(MenuCommand::BeginTriggerAssignment { epoch });
+        commands.push_back(MenuCommand::Boundary(marker));
+        let mut cursor = 8; // hotkey lane can be first on this continuation
+        let mut accepted = None;
+        let mut other_results = 1;
+        let mut passes = 0;
+        loop {
+            let more = drain_event_lanes(
+                &mut cursor,
+                |lane| match lane {
+                    7 => {
+                        let Some(command) = commands.pop_front() else {
+                            return false;
+                        };
+                        match command {
+                            MenuCommand::BeginTriggerAssignment { epoch } => {
+                                assignment.begin(epoch)
+                            }
+                            MenuCommand::Boundary(id) if id == marker => {
+                                let (_, signal) = preflight.assignment.take().unwrap();
+                                if let HotkeySignal::AssignmentSelected { trigger, epoch } = signal
+                                {
+                                    accepted = assignment.accept_selection(
+                                        trigger,
+                                        epoch,
+                                        &AppStatus::Ready,
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                        true
+                    }
+                    8 => {
+                        assert!(preflight.assignment.is_some() || accepted.is_some());
+                        false
+                    }
+                    10 if other_results != 0 => {
+                        other_results -= 1;
+                        true
+                    }
+                    _ => false,
+                },
+                || Duration::ZERO,
+            );
+            passes += 1;
+            if passes == 1 {
+                assert!(accepted.is_none());
+                assert_eq!(other_results, 0);
+            }
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(accepted, Some(selected));
+        assert_eq!(passes, 2);
+        assert!(assignment
+            .accept_selection(selected, epoch, &AppStatus::Ready)
+            .is_none());
+        assert!(!assignment.accept_cancellation(epoch));
+    }
+
+    #[test]
+    fn permission_backoff_keeps_late_grants_observable_and_healthy_idle_has_no_timer() {
+        let mut retry = PermissionRetry::default();
+        assert_eq!(
+            (0..8)
+                .map(|_| retry.next(true).unwrap())
+                .collect::<Vec<_>>(),
+            [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]
+        );
+        for _ in 0..100 {
+            assert_eq!(retry.next(true), Some(30_000));
+        }
+        assert_eq!(retry.next(false), None);
+        for _ in 0..100 {
+            assert_eq!(retry.next(false), None);
+        }
+        retry.restart();
+        assert_eq!(retry.next(true), Some(1_000));
+        let mut controller = ready();
+        let revoked = PermissionSnapshot {
+            microphone: false,
+            ..PermissionSnapshot::all()
+        };
+        // Runtime probes before sending TriggerPressed, and before ModelLoaded.
+        controller.handle(AppEvent::PermissionsChanged(revoked));
+        assert!(!capture_start_allowed(controller.status(), None, false));
+        assert!(controller.handle(AppEvent::TriggerPressed).is_empty());
+        controller.handle(AppEvent::AsrRecoveryStarted);
+        controller.handle(AppEvent::PermissionsChanged(revoked));
+        controller.handle(AppEvent::ModelLoaded(Ok(())));
+        assert!(matches!(
+            controller.status(),
+            AppStatus::PermissionBlocked(_)
+        ));
+    }
+
+    #[test]
+    fn timer_tokens_defer_during_initialization_and_cancel_old_generation() {
+        let source = EventSource::new(CFRunLoop::get_current());
+        let queue = Rc::new(RefCell::new(VecDeque::new()));
+        let old = ScheduledTimer::new(
+            &CFRunLoop::get_current(),
+            queue.clone(),
+            source.notifier(),
+            TimerKind::ResetError,
+            0,
+        );
+        CFRunLoop::run_in_mode(
+            unsafe { kCFRunLoopDefaultMode },
+            Duration::from_millis(10),
+            true,
+        );
+        assert_eq!(
+            queue.borrow().len(),
+            1,
+            "timer queues before source registration"
+        );
+        old.remove(&CFRunLoop::get_current());
+        let timer = ScheduledTimer::new(
+            &CFRunLoop::get_current(),
+            queue.clone(),
+            source.notifier(),
+            TimerKind::FinishCapture,
+            0,
+        );
+        let calls = Rc::new(Cell::new(0));
+        let seen = calls.clone();
+        let pending = queue.clone();
+        source.set_handler(move || {
+            while let Some(event) = pending.borrow_mut().pop_front() {
+                if event.active.get() {
+                    assert_eq!(event.kind, TimerKind::FinishCapture);
+                    seen.set(seen.get() + 1);
+                }
+            }
+        });
+        source.attach();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while calls.get() == 0 {
+            assert!(Instant::now() < deadline);
+            CFRunLoop::run_in_mode(
+                unsafe { kCFRunLoopDefaultMode },
+                Duration::from_millis(10),
+                true,
+            );
+        }
+        assert_eq!(calls.get(), 1);
+        timer.remove(&CFRunLoop::get_current());
+        source.close();
+    }
+
+    #[test]
+    fn guarded_owner_step_can_pump_timers_without_reborrowing_pointee() {
+        let source = EventSource::new(CFRunLoop::get_current());
+        let mut owner = Box::pin(0usize);
+        let pointer = &mut *owner as *mut usize;
+        source.set_handler(move || unsafe {
+            *pointer += 1;
+        });
+        source.attach();
+        pump_until_cleanup_guarded(
+            &mut owner,
+            || source.suspend(),
+            |probe| {
+                if *probe == 1 {
+                    return true;
+                }
+                // Deliberately pump the source inside the exclusive step access.
+                // The callback is deferred before it constructs another reference.
+                CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, Duration::ZERO, true);
+                assert_eq!(*probe, 0);
+                false
+            },
+            || {
+                CFRunLoop::run_in_mode(
+                    unsafe { kCFRunLoopDefaultMode },
+                    Duration::from_millis(10),
+                    true,
+                );
+            },
+        );
+        assert_eq!(*owner, 1);
+        source.close();
+    }
+}
+
+#[cfg(test)]
+mod producer_wake_tests {
+    use super::*;
+    use crate::event_wake::tests::pump_until;
+
+    #[test]
+    fn microphone_completion_reaches_flow_and_late_callback_is_inert() {
+        struct Boundary;
+        impl MicrophonePermissionBoundary for Boundary {
+            fn request_access(&mut self) -> bool {
+                true
+            }
+            fn open_settings(&mut self) -> bool {
+                true
+            }
+        }
+        let source = EventSource::new(CFRunLoop::get_current());
+        let mut microphone = MicrophonePermissionRuntime::default();
+        let system = SystemMicrophonePermissionBoundary {
+            notifier: source.notifier(),
+            completion_sender: microphone.completion_sender(),
+        };
+        let first = system.completion();
+        let late = system.completion();
+        let calls = Rc::new(Cell::new(0));
+        let seen = calls.clone();
+        source.set_handler(move || {
+            if microphone.drain_completions(|| MicrophoneAuthorization::Authorized, &mut Boundary) {
+                seen.set(seen.get() + 1);
+            }
+        });
+        source.attach();
+        CFRunLoop::run_in_mode(
+            unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+            Duration::ZERO,
+            true,
+        );
+        thread::spawn(first).join().unwrap();
+        pump_until(|| calls.get() == 1);
+        source.close();
+        thread::spawn(late).join().unwrap();
+        CFRunLoop::run_in_mode(
+            unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+            Duration::ZERO,
+            true,
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn model_and_migration_success_or_panic_are_observed_without_periodic_poll() {
+        for panics in [false, true] {
+            let source = EventSource::new(CFRunLoop::get_current());
+            let (release, blocked) = mpsc::channel();
+            let (events, worker) = spawn_model_preparation_notified(
+                move || {
+                    blocked.recv().unwrap();
+                    if panics {
+                        panic!("synthetic model preparation panic");
+                    }
+                    Err(ModelStoreError::RepairRequired)
+                },
+                source.notifier(),
+            );
+            let seen = Rc::new(Cell::new(false));
+            let result = seen.clone();
+            source.set_handler(move || match events.try_recv() {
+                Ok(Err(ModelStoreError::RepairRequired)) if !panics => result.set(true),
+                Err(TryRecvError::Disconnected) if panics => result.set(true),
+                Err(TryRecvError::Empty) => {}
+                other => panic!("unexpected model completion: {other:?}"),
+            });
+            source.attach();
+            CFRunLoop::run_in_mode(
+                unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+                Duration::ZERO,
+                true,
+            );
+            assert!(!seen.get());
+            release.send(()).unwrap();
+            pump_until(|| seen.get());
+            assert_eq!(worker.join().is_err(), panics);
+            source.close();
+
+            let source = EventSource::new(CFRunLoop::get_current());
+            let (release, blocked) = mpsc::channel();
+            let paths = ModelPaths::from_verified_directory(std::path::Path::new(
+                "/synthetic-unused-model",
+            ));
+            let (events, worker) = spawn_permission_migration_notified(
+                paths,
+                move || {
+                    blocked.recv().unwrap();
+                    if panics {
+                        panic!("synthetic migration panic");
+                    }
+                    Ok(PermissionMigrationSuccess::DevelopmentBypass)
+                },
+                source.notifier(),
+            );
+            let seen = Rc::new(Cell::new(false));
+            let result = seen.clone();
+            source.set_handler(move || match events.try_recv() {
+                Ok(result_value) if !panics => {
+                    assert!(matches!(
+                        result_value.migration,
+                        Ok(PermissionMigrationSuccess::DevelopmentBypass)
+                    ));
+                    result.set(true);
+                }
+                Err(TryRecvError::Disconnected) if panics => result.set(true),
+                Err(TryRecvError::Empty) => {}
+                _ => panic!("unexpected migration completion"),
+            });
+            source.attach();
+            CFRunLoop::run_in_mode(
+                unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+                Duration::ZERO,
+                true,
+            );
+            assert!(!seen.get());
+            release.send(()).unwrap();
+            pump_until(|| seen.get());
+            assert_eq!(worker.join().is_err(), panics);
+        }
+    }
+
+    #[test]
+    fn completion_watchdog_backoff_is_pending_only_and_keeps_exact_operation_deadline() {
+        let now = Instant::now();
+        let mut delay = 10;
+        assert_eq!(asr_wake_deadline(now, None, false, None, &mut delay), None);
+        let operation = now + Duration::from_secs(60);
+        assert_eq!(
+            asr_wake_deadline(now, Some(operation), false, None, &mut delay),
+            Some(operation)
+        );
+        assert_eq!(
+            asr_wake_deadline(now, None, false, Some(operation), &mut delay),
+            None
+        );
+        let first = asr_wake_deadline(now, None, true, None, &mut delay).unwrap();
+        assert_eq!(first, now + Duration::from_millis(10));
+        assert_eq!(
+            asr_wake_deadline(now, None, true, Some(first), &mut delay),
+            Some(first)
+        );
+        assert_eq!(delay, 20);
+        let mut instant = first;
+        for _ in 0..20 {
+            let next = asr_wake_deadline(instant, None, true, None, &mut delay).unwrap();
+            assert!(next > instant);
+            assert!(next <= instant + Duration::from_secs(1));
+            instant = next;
+        }
+        assert_eq!(
+            asr_wake_deadline(instant, None, false, Some(instant), &mut delay),
+            None
+        );
+        assert_eq!(delay, 10);
+    }
+
+    #[test]
+    fn nested_timer_is_queued_once_and_never_calls_runtime_during_outer_access() {
+        let source = Rc::new(EventSource::new(CFRunLoop::get_current()));
+        let queue = Rc::new(RefCell::new(VecDeque::new()));
+        let mut timer = Some(ScheduledTimer::new(
+            &CFRunLoop::get_current(),
+            queue.clone(),
+            source.notifier(),
+            TimerKind::ResetError,
+            60_000,
+        ));
+        let context = timer.as_ref().unwrap().context.clone();
+        let weak = Rc::downgrade(&source);
+        let calls = Rc::new(Cell::new(0));
+        let seen = calls.clone();
+        source.set_handler(move || {
+            seen.set(seen.get() + 1);
+            if seen.get() == 1 {
+                for _ in 0..3 {
+                    timer_fired(std::ptr::null_mut(), Rc::as_ptr(&context).cast_mut().cast());
+                }
+                assert_eq!(queue.borrow().len(), 1);
+                // Nested source entry is deferred before handler/Runtime borrow.
+                let source = weak.upgrade().unwrap();
+                CFRunLoop::run_in_mode(
+                    unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+                    Duration::ZERO,
+                    true,
+                );
+                assert_eq!(seen.get(), 1);
+                source.notifier().notify();
+            } else {
+                let queued = queue.borrow_mut().pop_front().unwrap();
+                assert!(queued.active.get());
+                cancel_timer(&CFRunLoop::get_current(), &mut timer);
+                assert!(!queued.active.get());
+                assert!(queue.borrow().is_empty());
+            }
+        });
+        source.attach();
+        pump_until(|| calls.get() == 2);
+        source.close();
     }
 }

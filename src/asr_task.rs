@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::asr::{AsrCommand, AsrEvent};
 use crate::asr_process::{Request, SpawnSpec, Supervisor};
+use crate::event_wake::EventNotifier;
 
 pub const MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(180);
 pub const TRANSCRIPTION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -47,14 +48,20 @@ pub struct AsrTask {
     timeouts: Option<(Duration, Duration)>,
 }
 impl AsrTask {
+    #[cfg(feature = "test-support")]
     pub fn spawn() -> Self {
-        Self::new(Supervisor::spawn(std::env::current_exe().map(|program| {
-            SpawnSpec {
+        Self::spawn_notified(EventNotifier::default())
+    }
+    pub(crate) fn spawn_notified(notifier: EventNotifier) -> Self {
+        Self::new(Supervisor::spawn_notified(
+            std::env::current_exe().map(|program| SpawnSpec {
                 program,
                 args: vec!["--asr-worker".into()],
-            }
-        })))
+            }),
+            notifier,
+        ))
     }
+
     fn new(supervisor: Supervisor) -> Self {
         Self {
             supervisor,
@@ -107,7 +114,21 @@ impl AsrTask {
         self.pending = Some((self.next_id, operation, deadline));
         Ok(())
     }
+    #[cfg(feature = "test-support")]
     pub fn poll(&mut self, now: Instant) -> Option<Result<AsrEvent, AsrTaskError>> {
+        loop {
+            if let Some(result) = self.poll_one(now)? {
+                return Some(result);
+            }
+        }
+    }
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.pending.map(|(_, _, deadline)| deadline)
+    }
+    pub(crate) fn poll_one(
+        &mut self,
+        now: Instant,
+    ) -> Option<Option<Result<AsrEvent, AsrTaskError>>> {
         if self.stopped {
             return None;
         }
@@ -117,15 +138,15 @@ impl AsrTask {
                 self.pending = None;
                 self.ignore_through = id;
                 self.supervisor.cancel(id);
-                return Some(Err(AsrTaskError::TimedOut(operation)));
+                return Some(Some(Err(AsrTaskError::TimedOut(operation))));
             }
         }
-        loop {
+        {
             match self.supervisor.events.try_recv() {
                 Ok(completion)
                     if completion.id <= self.ignore_through || completion.id != self.next_id =>
                 {
-                    continue
+                    Some(None)
                 }
                 Ok(completion) => {
                     if let Ok(event) = &completion.result {
@@ -135,19 +156,19 @@ impl AsrTask {
                         {
                             self.supervisor.cancel(completion.id);
                             self.ignore_through = completion.id;
-                            return Some(Err(AsrTaskError::UnexpectedOperation));
+                            return Some(Some(Err(AsrTaskError::UnexpectedOperation)));
                         }
                     }
                     self.pending = None;
                     if completion.result.is_err() {
                         self.ignore_through = completion.id;
                     }
-                    return Some(completion.result);
+                    Some(Some(completion.result))
                 }
-                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => {
                     self.stop();
-                    return Some(Err(AsrTaskError::Disconnected));
+                    Some(Some(Err(AsrTaskError::Disconnected)))
                 }
             }
         }
@@ -228,5 +249,91 @@ mod tests {
     fn production_timeouts_are_unchanged() {
         assert_eq!(AsrOperation::Load.timeout(), Duration::from_secs(180));
         assert_eq!(AsrOperation::Transcribe.timeout(), Duration::from_secs(60));
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::asr_process::Completion;
+    use std::sync::mpsc;
+
+    fn task_with_queue() -> (AsrTask, mpsc::SyncSender<Completion>) {
+        let mut task = AsrTask::new(Supervisor::spawn(Err(std::io::Error::other(
+            "synthetic unavailable process",
+        ))));
+        let (sender, receiver) = mpsc::sync_channel(4);
+        task.supervisor.events = receiver;
+        (task, sender)
+    }
+
+    #[test]
+    fn deadline_wins_over_queued_success_and_clears_its_watchdog() {
+        let (mut task, sender) = task_with_queue();
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        task.next_id = 1;
+        task.pending = Some((1, AsrOperation::Load, deadline));
+        sender
+            .send(Completion {
+                id: 1,
+                result: Ok(AsrEvent::Loaded(Ok(()))),
+            })
+            .unwrap();
+        assert_eq!(task.next_deadline(), Some(deadline));
+        assert!(matches!(
+            task.poll_one(deadline),
+            Some(Some(Err(AsrTaskError::TimedOut(AsrOperation::Load))))
+        ));
+        assert_eq!(task.next_deadline(), None);
+        assert!(
+            matches!(task.poll_one(deadline), Some(None)),
+            "late success is consumed, not mistaken for empty"
+        );
+        assert!(task.poll_one(deadline).is_none());
+    }
+
+    #[test]
+    fn success_cancels_deadline_and_new_operation_has_new_identity() {
+        let (mut task, sender) = task_with_queue();
+        let now = Instant::now();
+        task.next_id = 1;
+        task.pending = Some((1, AsrOperation::Load, now + Duration::from_secs(1)));
+        sender
+            .send(Completion {
+                id: 1,
+                result: Ok(AsrEvent::Loaded(Ok(()))),
+            })
+            .unwrap();
+        assert!(matches!(
+            task.poll_one(now),
+            Some(Some(Ok(AsrEvent::Loaded(Ok(())))))
+        ));
+        assert_eq!(task.next_deadline(), None);
+        task.next_id = 2;
+        task.pending = Some((2, AsrOperation::Transcribe, now + Duration::from_secs(2)));
+        sender
+            .send(Completion {
+                id: 1,
+                result: Ok(AsrEvent::Loaded(Ok(()))),
+            })
+            .unwrap();
+        assert!(matches!(task.poll_one(now), Some(None)));
+        assert_eq!(task.next_deadline(), Some(now + Duration::from_secs(2)));
+        task.stop();
+        assert_eq!(task.next_deadline(), None);
+    }
+
+    #[test]
+    fn pending_operation_times_out_without_any_sender_event() {
+        let (mut task, _sender) = task_with_queue();
+        let now = Instant::now();
+        task.next_id = 1;
+        task.pending = Some((1, AsrOperation::Transcribe, now));
+        assert!(matches!(
+            task.poll_one(now),
+            Some(Some(Err(AsrTaskError::TimedOut(AsrOperation::Transcribe))))
+        ));
+        assert_eq!(task.next_deadline(), None);
     }
 }

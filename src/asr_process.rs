@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crate::asr::{AsrCommand, AsrEvent};
 use crate::asr_protocol::{self as wire, Frame, Header, Kind, HEADER_LEN};
 use crate::asr_task::{AsrOperation, AsrTaskError};
+use crate::event_wake::{EventNotifier, TerminalSender};
 
 pub(crate) struct Request {
     pub id: u64,
@@ -36,6 +37,7 @@ struct Control {
 }
 
 pub(crate) struct Supervisor {
+    notifier: EventNotifier,
     commands: SyncSender<Request>,
     pub events: Receiver<Completion>,
     wake: UnixStream,
@@ -51,7 +53,11 @@ pub(crate) struct SpawnSpec {
 }
 
 impl Supervisor {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn spawn(spec: io::Result<SpawnSpec>) -> Self {
+        Self::spawn_notified(spec, EventNotifier::default())
+    }
+    pub(crate) fn spawn_notified(spec: io::Result<SpawnSpec>, notifier: EventNotifier) -> Self {
         let (commands, requests) = mpsc::sync_channel(1);
         // One accepted result plus one idle failure; never an audio backlog.
         let (events, completions) = mpsc::sync_channel(2);
@@ -63,12 +69,23 @@ impl Supervisor {
             .expect("ASR wake nonblocking");
         let worker_control = control.clone();
         let saved_spec = spec.as_ref().ok().cloned();
+        let wake_main = notifier.clone();
         let worker = thread::spawn(move || {
+            let events = TerminalSender::new(events, wake_main.clone());
             acknowledge_after_cleanup(&worker_control, || {
-                supervise(spec, requests, events, &wake_reader, &worker_control);
+                supervise(
+                    spec,
+                    requests,
+                    &events,
+                    &wake_reader,
+                    &worker_control,
+                    &wake_main,
+                );
             });
+            wake_main.notify();
         });
         Self {
+            notifier,
             commands,
             events: completions,
             wake,
@@ -114,7 +131,7 @@ impl Supervisor {
         let Some(spec) = self.spec.clone() else {
             return false;
         };
-        *self = Self::spawn(Ok(spec));
+        *self = Self::spawn_notified(Ok(spec), self.notifier.clone());
         true
     }
     pub fn cleaned(&self) -> bool {
@@ -144,9 +161,10 @@ fn acknowledge_after_cleanup(control: &Control, body: impl FnOnce()) {
 fn supervise(
     spec: io::Result<SpawnSpec>,
     requests: Receiver<Request>,
-    events: SyncSender<Completion>,
+    events: &SyncSender<Completion>,
     wake: &UnixStream,
     control: &Arc<Control>,
+    notifier: &EventNotifier,
 ) {
     let mut process: Option<WorkerProcess> = None;
     let mut last_id = 0;
@@ -160,6 +178,7 @@ fn supervise(
             cleanup(&mut process, control);
             cancelled = cancel;
             control.retired_through.fetch_max(cancel, Ordering::Release);
+            notifier.notify();
         }
         match requests.try_recv() {
             Ok(request) => {
@@ -186,6 +205,7 @@ fn supervise(
                 {
                     break;
                 }
+                notifier.notify();
                 #[cfg(feature = "test-support")]
                 control.completions_sent.fetch_add(1, Ordering::Release);
             }
@@ -218,6 +238,7 @@ fn supervise(
                         {
                             break;
                         }
+                        notifier.notify();
                     }
                 }
             }
@@ -506,6 +527,7 @@ mod tests {
         let (_events, completions) = mpsc::sync_channel(2);
         let (wake, _reader) = UnixStream::pair().unwrap();
         let mut supervisor = Supervisor {
+            notifier: EventNotifier::default(),
             commands,
             events: completions,
             wake,
@@ -571,5 +593,142 @@ mod tests {
             io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD)
         );
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use crate::event_wake::{tests::pump_until, EventSource};
+    use core_foundation::runloop::CFRunLoop;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    #[test]
+    fn terminal_wake_before_thread_return_requires_later_completion_check() {
+        let source = EventSource::new(CFRunLoop::get_current());
+        source.attach();
+        CFRunLoop::run_in_mode(
+            unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+            Duration::ZERO,
+            true,
+        );
+        let control = Arc::new(Control::default());
+        let cloned = control.clone();
+        let notifier = source.notifier();
+        let terminal = notifier.clone();
+        let (release, blocked) = mpsc::channel();
+        let (ack, acknowledged) = mpsc::channel();
+        let (events, completions) = mpsc::sync_channel(2);
+        let worker = thread::spawn(move || {
+            let sender = TerminalSender::new(events, terminal);
+            acknowledge_after_cleanup(&cloned, || {});
+            drop(sender); // observable disconnect + wake, but not thread completion
+            ack.send(()).unwrap();
+            blocked.recv().unwrap();
+        });
+        let (commands, _requests) = mpsc::sync_channel(1);
+        let (wake, _reader) = UnixStream::pair().unwrap();
+        let supervisor = Rc::new(RefCell::new(Supervisor {
+            notifier: notifier.clone(),
+            commands,
+            events: completions,
+            wake,
+            control,
+            worker,
+            spec: Some(SpawnSpec {
+                program: "/bin/false".into(),
+                args: vec![],
+            }),
+        }));
+        let consumer = supervisor.clone();
+        let checks = Rc::new(Cell::new(0));
+        let seen = checks.clone();
+        let retry_ready = Rc::new(Cell::new(false));
+        let ready = retry_ready.clone();
+        source.set_handler(move || {
+            let supervisor = consumer.borrow();
+            assert!(supervisor.cleaned());
+            ready.set(supervisor.retry_ready(0));
+            seen.set(seen.get() + 1);
+        });
+        acknowledged.recv_timeout(Duration::from_secs(1)).unwrap();
+        pump_until(|| checks.get() == 1);
+        assert!(!retry_ready.get());
+        assert!(!supervisor.borrow_mut().restart_if_cleaned());
+        // Arm a pending-only one-shot before the held thread may return.
+        use core_foundation::runloop::{
+            kCFRunLoopCommonModes, CFRunLoopTimer, CFRunLoopTimerContext, CFRunLoopTimerRef,
+        };
+        extern "C" fn completion_check(_timer: CFRunLoopTimerRef, info: *mut std::ffi::c_void) {
+            unsafe { &*info.cast::<EventNotifier>() }.notify();
+        }
+        let mut timer_notifier = notifier.clone();
+        let mut context = CFRunLoopTimerContext {
+            version: 0,
+            info: (&mut timer_notifier as *mut EventNotifier).cast(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+        };
+        let timer = CFRunLoopTimer::new(
+            core_foundation::date::CFDate::now().abs_time() + 0.01,
+            0.0,
+            0,
+            0,
+            completion_check,
+            &mut context,
+        );
+        CFRunLoop::get_current().add_timer(&timer, unsafe { kCFRunLoopCommonModes });
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !supervisor.borrow().worker.is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        // No second terminal notification exists: the one-shot drives retry.
+        pump_until(|| checks.get() == 2);
+        CFRunLoop::get_current().remove_timer(&timer, unsafe { kCFRunLoopCommonModes });
+        assert!(retry_ready.get());
+        assert!(supervisor.borrow_mut().restart_if_cleaned());
+        source.close();
+        supervisor.borrow().stop();
+    }
+
+    #[test]
+    fn supervisor_result_and_shutdown_acknowledgment_wake_main_without_ticks() {
+        let source = EventSource::new(CFRunLoop::get_current());
+        let supervisor = Rc::new(RefCell::new(Supervisor::spawn_notified(
+            Err(io::Error::other("synthetic process failure")),
+            source.notifier(),
+        )));
+        let consumer = supervisor.clone();
+        let results = Rc::new(Cell::new(0));
+        let seen = results.clone();
+        let cleaned = Rc::new(Cell::new(false));
+        let cleanup = cleaned.clone();
+        source.set_handler(move || {
+            let supervisor = consumer.borrow();
+            if let Ok(completion) = supervisor.events.try_recv() {
+                assert!(completion.result.is_err());
+                seen.set(seen.get() + 1);
+            }
+            cleanup.set(supervisor.cleaned());
+        });
+        source.attach();
+        supervisor
+            .borrow()
+            .submit(Request {
+                id: 1,
+                deadline: Instant::now() + Duration::from_secs(1),
+                operation: AsrOperation::Load,
+                command: AsrCommand::Load(crate::model::ModelPaths::from_verified_directory(
+                    std::path::Path::new("/synthetic-unused-model"),
+                )),
+            })
+            .unwrap();
+        pump_until(|| results.get() == 1);
+        supervisor.borrow().stop();
+        pump_until(|| cleaned.get());
     }
 }

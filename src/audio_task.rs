@@ -5,6 +5,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::audio::CompletedCapture;
+use crate::event_wake::{EventNotifier, TerminalSender};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AudioPreparationError {
@@ -33,6 +34,7 @@ struct PendingPreparation {
 /// Cancellation discards relevance, not physical work. Until its completion is
 /// observed a cancelled job still owns the sole slot; no replacement is spawned.
 pub(crate) struct AudioPreparationTask {
+    notifier: EventNotifier,
     commands: Option<SyncSender<PreparationJob>>,
     events: Option<Receiver<AudioPreparationResult>>,
     pending: Option<PendingPreparation>,
@@ -40,18 +42,33 @@ pub(crate) struct AudioPreparationTask {
 }
 
 impl AudioPreparationTask {
+    #[cfg(test)]
     pub(crate) fn spawn() -> Self {
-        Self::spawn_with(CompletedCapture::prepare)
+        Self::spawn_notified(EventNotifier::default())
     }
 
-    fn spawn_with<F>(mut prepare: F) -> Self
+    pub(crate) fn spawn_notified(notifier: EventNotifier) -> Self {
+        Self::spawn_with_notifier(CompletedCapture::prepare, notifier)
+    }
+
+    #[cfg(test)]
+    fn spawn_with<F>(prepare: F) -> Self
+    where
+        F: FnMut(CompletedCapture) -> Option<Vec<f32>> + Send + 'static,
+    {
+        Self::spawn_with_notifier(prepare, EventNotifier::default())
+    }
+
+    fn spawn_with_notifier<F>(mut prepare: F, notifier: EventNotifier) -> Self
     where
         F: FnMut(CompletedCapture) -> Option<Vec<f32>> + Send + 'static,
     {
         let (commands, jobs) = mpsc::sync_channel::<PreparationJob>(1);
         let (results, events) = mpsc::sync_channel(1);
         // Retain liveness evidence for disconnect recovery; never join on AppKit.
+        let wake = notifier.clone();
         let worker = thread::spawn(move || {
+            let results = TerminalSender::new(results, wake.clone());
             while let Ok(job) = jobs.recv() {
                 let start = Instant::now();
                 let native_sample_count = job.capture.native_sample_count();
@@ -68,9 +85,12 @@ impl AudioPreparationTask {
                 {
                     break;
                 }
+                wake.notify();
             }
         });
-        Self::new(commands, events, worker)
+        let mut task = Self::new(commands, events, worker);
+        task.notifier = notifier;
+        task
     }
 
     fn new(
@@ -79,6 +99,7 @@ impl AudioPreparationTask {
         worker: JoinHandle<()>,
     ) -> Self {
         Self {
+            notifier: EventNotifier::default(),
             commands: Some(commands),
             events: Some(events),
             pending: None,
@@ -97,7 +118,7 @@ impl AudioPreparationTask {
         if self.commands.is_none() && self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
             // Channel disconnect alone is not proof of worker termination.
             // A stopped task has no handle and can never restart here.
-            *self = Self::spawn();
+            *self = Self::spawn_notified(self.notifier.clone());
         }
         let Some(commands) = &self.commands else {
             return Err(AudioPreparationError::Disconnected);
@@ -121,24 +142,29 @@ impl AudioPreparationTask {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn poll(&mut self) -> Option<AudioPreparationResult> {
+        self.poll_one().flatten()
+    }
+
+    // Outer Some reports consumption even when a cancelled result is suppressed.
+    pub(crate) fn poll_one(&mut self) -> Option<Option<AudioPreparationResult>> {
         match self.events.as_ref()?.try_recv() {
-            Ok(result) => {
-                let pending = self.pending.take()?;
+            Ok(result) => Some(self.pending.take().and_then(|pending| {
                 (!pending.cancelled && pending.generation == result.generation).then_some(result)
-            }
+            })),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => {
                 let pending = self.pending.take();
                 self.disconnect();
-                pending
-                    .filter(|pending| !pending.cancelled)
-                    .map(|pending| AudioPreparationResult {
+                Some(pending.filter(|pending| !pending.cancelled).map(|pending| {
+                    AudioPreparationResult {
                         generation: pending.generation,
                         result: Err(AudioPreparationError::Disconnected),
                         elapsed: Duration::ZERO,
                         native_sample_count: 0,
-                    })
+                    }
+                }))
             }
         }
     }
@@ -323,5 +349,108 @@ mod tests {
         let _ = release.send(());
         dropper.join().unwrap();
         assert!(result.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use crate::audio::AudioRecorder;
+    use crate::event_wake::{tests::pump_until, EventSource};
+    use core_foundation::runloop::CFRunLoop;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    #[test]
+    fn confirmed_worker_respawn_keeps_its_event_notifier() {
+        let source = EventSource::new(CFRunLoop::get_current());
+        let (commands, requests) = mpsc::sync_channel(1);
+        let (results, events) = mpsc::sync_channel(1);
+        let notifier = source.notifier();
+        let wake = notifier.clone();
+        let worker = thread::spawn(move || {
+            let _results = TerminalSender::new(results, wake);
+            requests.recv().unwrap();
+        });
+        let mut task = AudioPreparationTask::new(commands, events, worker);
+        task.notifier = notifier;
+        task.submit(1, AudioRecorder::new().finish().unwrap())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !task.worker.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(matches!(
+            task.poll_one(),
+            Some(Some(AudioPreparationResult {
+                result: Err(AudioPreparationError::Disconnected),
+                ..
+            }))
+        ));
+        let task = Rc::new(RefCell::new(task));
+        let consumer = task.clone();
+        let seen = Rc::new(Cell::new(false));
+        let completed = seen.clone();
+        source.set_handler(move || {
+            if let Some(Some(result)) = consumer.borrow_mut().poll_one() {
+                assert_eq!(result.generation, 2);
+                assert_eq!(result.result, Ok(None));
+                completed.set(true);
+            }
+        });
+        source.attach();
+        CFRunLoop::run_in_mode(
+            unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+            Duration::ZERO,
+            true,
+        );
+        task.borrow_mut()
+            .submit(2, AudioRecorder::new().finish().unwrap())
+            .unwrap();
+        pump_until(|| seen.get());
+    }
+
+    #[test]
+    fn cancelled_completion_notifies_and_releases_slot_without_poll_timer() {
+        let source = EventSource::new(CFRunLoop::get_current());
+        let (entered, entry) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let mut task = AudioPreparationTask::spawn_with_notifier(
+            move |_| {
+                entered.send(()).unwrap();
+                blocked.recv().unwrap();
+                None
+            },
+            source.notifier(),
+        );
+        task.submit(1, AudioRecorder::new().finish().unwrap())
+            .unwrap();
+        entry.recv_timeout(Duration::from_secs(1)).unwrap();
+        task.cancel();
+        let task = Rc::new(RefCell::new(task));
+        let consumer = task.clone();
+        let calls = Rc::new(Cell::new(0));
+        let seen = calls.clone();
+        source.set_handler(move || {
+            seen.set(seen.get() + 1);
+            if let Some(output) = consumer.borrow_mut().poll_one() {
+                assert!(output.is_none());
+            }
+        });
+        source.attach();
+        pump_until(|| calls.get() == 1);
+        release.send(()).unwrap();
+        pump_until(|| task.borrow().pending.is_none());
+        assert!(
+            calls.get() >= 2,
+            "worker completion needed its own event wake"
+        );
+        task.borrow_mut()
+            .submit(2, AudioRecorder::new().finish().unwrap())
+            .unwrap();
+        release.send(()).unwrap();
+        source.close();
+        task.borrow_mut().stop();
     }
 }
