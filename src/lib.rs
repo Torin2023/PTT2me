@@ -2,7 +2,14 @@
 compile_error!("PTT2me supports only aarch64-apple-darwin");
 
 pub mod asr;
+mod asr_process;
+mod asr_protocol;
 mod asr_task;
+
+/// Hidden worker entry point; dispatched before all application initialization.
+pub fn run_asr_worker_process() -> i32 {
+    asr_protocol::run_native_worker()
+}
 pub mod audio;
 mod audio_task;
 mod browser_accessibility;
@@ -25,3 +32,13 @@ pub(crate) mod text_inserter;
 pub mod update_manifest;
 pub mod updater;
 pub(crate) mod updater_runtime;
+
+/// Process fixtures are compiled only for explicit test-support builds.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod asr_test_support {
+    pub use crate::asr_protocol::{decode_samples, isolate_stdout, Frame, Kind, MAX_SAMPLES};
+    pub use crate::asr_task::{
+        AsrOperation, AsrTask, AsrTaskError, MODEL_LOAD_TIMEOUT, TRANSCRIPTION_TIMEOUT,
+    };
+}

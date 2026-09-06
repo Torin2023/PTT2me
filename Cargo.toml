@@ -1,5 +1,6 @@
 [package]
 name = "ptt2me"
+default-run = "ptt2me"
 version = "1.2.1"
 edition = "2021"
 description = "Minimal offline GigaAM v3 push-to-talk for macOS"
@@ -55,3 +56,13 @@ required-features = ["test-support"]
 opt-level = 3
 lto = true
 strip = true
+
+[[bin]]
+name = "asr-test-worker"
+path = "tests/support/asr_test_worker.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "asr_process"
+path = "tests/asr_process.rs"
+required-features = ["test-support"]

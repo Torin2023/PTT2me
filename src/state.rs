@@ -41,6 +41,8 @@ impl PermissionSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppStatus {
     PreparingModel,
+    AsrUnavailable,
+    AsrCleanupPending,
     ModelRepairRequired,
     ModelPreparationFailed,
     ResettingPermissions,
@@ -70,6 +72,9 @@ pub enum AppEvent {
     PermissionMigrationFailed,
     ModelLoaded(Result<(), String>),
     AsrTimedOut,
+    AsrRecoveryStarted,
+    AsrUnavailable,
+    AsrCleanupPending,
     PermissionsChanged(PermissionSnapshot),
     TriggerPressed,
     TriggerReleased { short: bool },
@@ -118,7 +123,7 @@ impl AppController {
 
     pub fn handle(&mut self, event: AppEvent) -> Vec<Effect> {
         match event {
-            AppEvent::ModelPreparationStarted => {
+            AppEvent::ModelPreparationStarted | AppEvent::AsrRecoveryStarted => {
                 self.model_ready = false;
                 self.status = AppStatus::PreparingModel;
                 Vec::new()
@@ -147,30 +152,26 @@ impl AppController {
                 self.status = AppStatus::PermissionResetFailed;
                 Vec::new()
             }
-            AppEvent::ModelLoaded(Ok(())) => {
+            AppEvent::ModelLoaded(Ok(())) if self.status == AppStatus::PreparingModel => {
                 self.model_ready = true;
                 self.enter_idle_state()
             }
-            AppEvent::AsrTimedOut => {
+            AppEvent::AsrCleanupPending => {
                 self.model_ready = false;
-                self.status = AppStatus::Error {
-                    message: "Распознавание не отвечает. Перезапустите PTT2me",
-                    recoverable: false,
-                };
+                self.status = AppStatus::AsrCleanupPending;
                 Vec::new()
             }
-            AppEvent::ModelLoaded(Err(_)) => {
+            AppEvent::AsrTimedOut | AppEvent::AsrUnavailable | AppEvent::ModelLoaded(Err(_)) => {
                 self.model_ready = false;
-                self.status = AppStatus::Error {
-                    message: "Не удалось загрузить модель",
-                    recoverable: false,
-                };
+                self.status = AppStatus::AsrUnavailable;
                 Vec::new()
             }
             AppEvent::PermissionsChanged(permissions) => {
                 self.permissions = permissions;
                 self.forget_granted_permission_panes();
-                if self.model_ready {
+                if self.model_ready
+                    && !matches!(self.status, AppStatus::Recording | AppStatus::Recognizing)
+                {
                     self.enter_idle_state()
                 } else {
                     Vec::new()
@@ -199,7 +200,11 @@ impl AppController {
                 self.status = AppStatus::Recognizing;
                 vec![Effect::FinishCaptureAfter { delay_ms: 0 }]
             }
-            AppEvent::CaptureFailed => self.show_recoverable_error("Не удалось записать звук"),
+            AppEvent::CaptureFailed
+                if matches!(self.status, AppStatus::Recording | AppStatus::Recognizing) =>
+            {
+                self.show_recoverable_error("Не удалось записать звук")
+            }
             AppEvent::AudioReady(None) if self.status == AppStatus::Recognizing => {
                 self.enter_idle_state()
             }
@@ -234,19 +239,7 @@ impl AppController {
             {
                 self.enter_idle_state()
             }
-            AppEvent::EventTapLost
-                if !matches!(
-                    self.status,
-                    AppStatus::ModelRepairRequired
-                        | AppStatus::ModelPreparationFailed
-                        | AppStatus::ResettingPermissions
-                        | AppStatus::PermissionResetFailed
-                        | AppStatus::Error {
-                            recoverable: false,
-                            ..
-                        }
-                ) =>
-            {
+            AppEvent::EventTapLost if self.model_ready => {
                 self.show_recoverable_error("Глобальная клавиша недоступна")
             }
             AppEvent::EventTapRestored if self.is_event_tap_error() => self.enter_idle_state(),
@@ -344,6 +337,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recovery_readiness_requires_loaded_and_current_permissions() {
+        let mut controller = AppController::recognizing_for_test();
+        controller.handle(AppEvent::AsrRecoveryStarted);
+        for event in [
+            AppEvent::PermissionsChanged(PermissionSnapshot::all()),
+            AppEvent::ErrorTimerFired,
+            AppEvent::EventTapLost,
+            AppEvent::EventTapRestored,
+            AppEvent::CaptureFailed,
+            AppEvent::RecognitionFinished(Ok("synthetic late text".into())),
+            AppEvent::TriggerPressed,
+        ] {
+            assert!(controller.handle(event).is_empty());
+            assert_eq!(controller.status(), &AppStatus::PreparingModel);
+        }
+        controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot {
+            microphone: false,
+            ..PermissionSnapshot::all()
+        }));
+        assert_eq!(
+            controller.handle(AppEvent::ModelLoaded(Ok(()))),
+            vec![Effect::OpenPermission(PermissionKind::Microphone)]
+        );
+        assert_eq!(
+            controller.status(),
+            &AppStatus::PermissionBlocked(PermissionKind::Microphone)
+        );
+        controller.handle(AppEvent::AsrUnavailable);
+        assert!(
+            controller.handle(AppEvent::ModelLoaded(Ok(()))).is_empty(),
+            "unsolicited old loaded cannot restore readiness"
+        );
+        assert_eq!(controller.status(), &AppStatus::AsrUnavailable);
+        controller.handle(AppEvent::AsrRecoveryStarted);
+        controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
+        controller.handle(AppEvent::ModelLoaded(Ok(())));
+        assert_eq!(controller.status(), &AppStatus::Ready);
+    }
+
+    #[test]
+    fn permission_notifications_do_not_abandon_active_dictation() {
+        for mut controller in [
+            AppController::recording_for_test(),
+            AppController::recognizing_for_test(),
+        ] {
+            let before = controller.status().clone();
+            assert!(controller
+                .handle(AppEvent::PermissionsChanged(PermissionSnapshot::default()))
+                .is_empty());
+            assert_eq!(controller.status(), &before);
+        }
+    }
+
+    #[test]
     fn model_preparation_failure_is_targeted_and_retryable() {
         let mut controller = AppController::new();
         assert_eq!(controller.status(), &AppStatus::PreparingModel);
@@ -434,21 +481,9 @@ mod tests {
         assert!(c
             .handle(AppEvent::ModelLoaded(Err("missing model".into())))
             .is_empty());
-        assert_eq!(
-            c.status(),
-            &AppStatus::Error {
-                message: "Не удалось загрузить модель",
-                recoverable: false,
-            }
-        );
+        assert_eq!(c.status(), &AppStatus::AsrUnavailable);
         assert!(c.handle(AppEvent::ErrorTimerFired).is_empty());
-        assert_eq!(
-            c.status(),
-            &AppStatus::Error {
-                message: "Не удалось загрузить модель",
-                recoverable: false,
-            }
-        );
+        assert_eq!(c.status(), &AppStatus::AsrUnavailable);
     }
 
     #[test]
@@ -457,13 +492,7 @@ mod tests {
         c.handle(AppEvent::ModelLoaded(Err("missing model".into())));
 
         assert!(c.handle(AppEvent::EventTapLost).is_empty());
-        assert_eq!(
-            c.status(),
-            &AppStatus::Error {
-                message: "Не удалось загрузить модель",
-                recoverable: false,
-            }
-        );
+        assert_eq!(c.status(), &AppStatus::AsrUnavailable);
     }
 
     #[test]
@@ -472,13 +501,7 @@ mod tests {
         c.handle(AppEvent::ModelLoaded(Err("missing model".into())));
 
         assert!(c.handle(AppEvent::EventTapRestored).is_empty());
-        assert_eq!(
-            c.status(),
-            &AppStatus::Error {
-                message: "Не удалось загрузить модель",
-                recoverable: false,
-            }
-        );
+        assert_eq!(c.status(), &AppStatus::AsrUnavailable);
     }
 
     #[test]
@@ -534,13 +557,7 @@ mod tests {
         let mut c = AppController::recognizing_for_test();
         assert!(c.handle(AppEvent::AsrTimedOut).is_empty());
         let timed_out = c.status().clone();
-        assert!(matches!(
-            timed_out,
-            AppStatus::Error {
-                recoverable: false,
-                ..
-            }
-        ));
+        assert!(matches!(timed_out, AppStatus::AsrUnavailable));
         for event in [
             AppEvent::ErrorTimerFired,
             AppEvent::TriggerPressed,

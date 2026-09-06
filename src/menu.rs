@@ -8,9 +8,8 @@ use objc2::{
     runtime::AnyObject, sel, ClassType, DeclaredClass,
 };
 use objc2_app_kit::{
-    NSApplication, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSImage,
-    NSImageSymbolConfiguration, NSMenu, NSMenuItem, NSStatusBar, NSStatusBarButton, NSStatusItem,
-    NSVariableStatusItemLength,
+    NSColor, NSControlStateValueOff, NSControlStateValueOn, NSImage, NSImageSymbolConfiguration,
+    NSMenu, NSMenuItem, NSStatusBar, NSStatusBarButton, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 
@@ -212,6 +211,7 @@ enum StatusActionKind {
     Permission(PermissionKind),
     RetryModelPreparation,
     RetryPermissionMigration,
+    RetryAsr,
 }
 
 impl StatusActionProjection {
@@ -228,6 +228,12 @@ impl StatusActionProjection {
                 visible: true,
                 enabled: true,
                 kind: Some(StatusActionKind::RetryModelPreparation),
+            },
+            AppStatus::AsrUnavailable => Self {
+                title: "Повторить запуск распознавания",
+                visible: true,
+                enabled: true,
+                kind: Some(StatusActionKind::RetryAsr),
             },
             AppStatus::PermissionResetFailed => Self {
                 title: "Повторить сброс разрешений",
@@ -248,6 +254,18 @@ impl StatusActionProjection {
 impl MenuProjection {
     pub fn from_status(status: &AppStatus) -> Self {
         let (title, symbol, pulse, style) = match status {
+            AppStatus::AsrCleanupPending => (
+                "● Ожидание остановки распознавания…".into(),
+                "hourglass",
+                false,
+                SymbolStyle::Template,
+            ),
+            AppStatus::AsrUnavailable => (
+                "● Распознавание недоступно".into(),
+                "exclamationmark.triangle.fill",
+                false,
+                SymbolStyle::Template,
+            ),
             AppStatus::PreparingModel => (
                 "● Подготовка модели…".into(),
                 "hourglass",
@@ -376,9 +394,11 @@ fn toggled_append_space(selected: bool) -> (bool, MenuCommand) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MenuAction {
+    Quit,
     OpenPermission(PermissionKind),
     RetryModelPreparation,
     RetryPermissionMigration,
+    RetryAsr,
 }
 
 #[derive(Clone)]
@@ -503,9 +523,8 @@ declare_class!(
     // invoked by AppKit on the main thread.
     unsafe impl MenuTarget {
         #[method(quit:)]
-        fn quit(&self, sender: &AnyObject) {
-            let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
-            unsafe { app.terminate(Some(sender)) };
+        fn quit(&self, _sender: &AnyObject) {
+            let _ = self.ivars().action_sender.send(MenuAction::Quit);
         }
 
         #[method(performStatusAction:)]
@@ -520,6 +539,7 @@ declare_class!(
                 Some(StatusActionKind::RetryPermissionMigration) => {
                     MenuAction::RetryPermissionMigration
                 }
+                Some(StatusActionKind::RetryAsr) => MenuAction::RetryAsr,
                 None => return,
             };
             let _ = self.ivars().action_sender.send(action);
@@ -1512,5 +1532,17 @@ mod tests {
             symbol_style(&MenuProjection::from_status(&AppStatus::Ready)),
             SymbolStyle::Template
         );
+    }
+}
+
+#[cfg(test)]
+mod asr_tests {
+    use super::*;
+    #[test]
+    fn unavailable_asr_offers_targeted_retry_only() {
+        let action = StatusActionProjection::from_status(&AppStatus::AsrUnavailable);
+        assert_eq!(action.kind, Some(StatusActionKind::RetryAsr));
+        assert!(action.visible && action.enabled);
+        assert!(!StatusActionProjection::from_status(&AppStatus::PreparingModel).visible);
     }
 }

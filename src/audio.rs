@@ -6,14 +6,9 @@ use std::sync::{
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::constants::{MAX_CAPTURE_MS, RELEASE_GRACE_MS, SAMPLE_RATE};
+use crate::constants::{CAPTURE_BUFFER_MARGIN_MS, MAX_CAPTURE_MS, RELEASE_GRACE_MS, SAMPLE_RATE};
 
 mod resampler;
-
-// The runtime still stops a capture at 25 seconds. Storage also covers the
-// release tail and delayed timer delivery so a valid near-limit capture is not
-// misclassified as overflow.
-const CAPTURE_BUFFER_MARGIN_MS: u64 = 1_000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AudioError {

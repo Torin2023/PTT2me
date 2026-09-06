@@ -26,24 +26,32 @@ pub fn spawn_asr_worker(
     thread::spawn(move || run_asr_worker(commands, events, SherpaRecognizerBackend::default()))
 }
 
-trait RecognizerBackend {
+pub(crate) trait RecognizerBackend {
     fn load(&mut self, paths: ModelPaths) -> Result<(), String>;
     fn transcribe(&mut self, samples: &[f32]) -> Result<String, String>;
 }
 
 #[derive(Default)]
-struct SherpaRecognizerBackend {
+pub(crate) struct SherpaRecognizerBackend {
     recognizer: Option<TransducerRecognizer>,
+}
+
+// sherpa-rs accepts UTF-8 Strings. Reject unsupported Unix bytes rather than
+// silently opening a different, unverified path through lossy conversion.
+fn native_model_path(path: &std::path::Path) -> Result<String, String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "model path encoding unsupported".to_owned())
 }
 
 impl RecognizerBackend for SherpaRecognizerBackend {
     fn load(&mut self, paths: ModelPaths) -> Result<(), String> {
         self.recognizer = None;
         let config = TransducerConfig {
-            encoder: paths.encoder().to_string_lossy().into_owned(),
-            decoder: paths.decoder().to_string_lossy().into_owned(),
-            joiner: paths.joiner().to_string_lossy().into_owned(),
-            tokens: paths.tokens().to_string_lossy().into_owned(),
+            encoder: native_model_path(paths.encoder())?,
+            decoder: native_model_path(paths.decoder())?,
+            joiner: native_model_path(paths.joiner())?,
+            tokens: native_model_path(paths.tokens())?,
             model_type: "nemo_transducer".into(),
             num_threads: 2,
             sample_rate: 16_000,
@@ -156,6 +164,17 @@ mod tests {
         commands_to_send(&command_sender);
         run_asr_worker(command_receiver, event_sender, backend);
         (event_receiver.try_iter().collect(), calls)
+    }
+
+    #[test]
+    fn native_configuration_never_changes_non_utf8_verified_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/model-\xff".to_vec()));
+        assert!(super::native_model_path(&path).is_err());
+        assert_eq!(
+            super::native_model_path(std::path::Path::new("/tmp/модель")).unwrap(),
+            "/tmp/модель"
+        );
     }
 
     #[test]

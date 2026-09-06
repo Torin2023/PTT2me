@@ -640,6 +640,72 @@ impl DictationCapture {
     }
 }
 
+#[derive(Default)]
+struct AsrRecovery {
+    paths: Option<ModelPaths>,
+    attempted: bool,
+    unavailable: bool,
+}
+
+impl AsrRecovery {
+    fn failure(&mut self) -> Option<ModelPaths> {
+        if self.attempted || self.unavailable {
+            self.unavailable = true;
+            return None;
+        }
+        self.attempted = true;
+        let paths = self.paths.clone();
+        self.unavailable = paths.is_none();
+        paths
+    }
+
+    fn retry(&mut self) -> Option<ModelPaths> {
+        if !self.unavailable {
+            return None;
+        }
+        let paths = self.paths.clone()?;
+        self.unavailable = false;
+        self.attempted = true;
+        Some(paths)
+    }
+
+    fn loaded(&mut self) {
+        self.attempted = false;
+        self.unavailable = false;
+    }
+}
+
+const ASR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Default)]
+struct AsrShutdown {
+    started: Option<Instant>,
+    failure_reported: bool,
+}
+impl AsrShutdown {
+    fn begin(&mut self, now: Instant) -> bool {
+        if self.started.is_some() {
+            return false;
+        }
+        self.started = Some(now);
+        true
+    }
+    fn report_failure(&mut self, now: Instant, cleaned: bool, cleanup_failed: bool) -> bool {
+        if cleaned || self.failure_reported {
+            return false;
+        }
+        if cleanup_failed
+            || self
+                .started
+                .is_some_and(|start| now.saturating_duration_since(start) >= ASR_SHUTDOWN_TIMEOUT)
+        {
+            self.failure_reported = true;
+            return true;
+        }
+        false
+    }
+}
+
 /// Main-thread owner of the reducer and every macOS UI/input component.
 pub struct Runtime {
     controller: AppController,
@@ -657,6 +723,9 @@ pub struct Runtime {
     hotkey_sender: Sender<HotkeySignal>,
     hotkey_events: Receiver<HotkeySignal>,
     asr: AsrTask,
+    asr_recovery: AsrRecovery,
+    asr_generation: Option<u64>,
+    asr_shutdown: AsrShutdown,
     model_preparation: Option<ModelPreparationTask>,
     permission_migration: Option<PermissionMigrationTask>,
     prepared_model_paths: Option<ModelPaths>,
@@ -738,6 +807,9 @@ impl Runtime {
             hotkey_sender,
             hotkey_events,
             asr,
+            asr_recovery: AsrRecovery::default(),
+            asr_generation: None,
+            asr_shutdown: AsrShutdown::default(),
             model_preparation: Some(model_preparation),
             permission_migration: None,
             prepared_model_paths: None,
@@ -864,6 +936,10 @@ impl Runtime {
 
     fn drain_events(&mut self) {
         self.drain_menu_actions();
+        if self.asr_shutdown.started.is_some() {
+            self.try_orderly_quit();
+            return;
+        }
         self.drain_updater_worker_results();
         self.drain_updater_actions();
         self.drain_model_preparation();
@@ -880,9 +956,18 @@ impl Runtime {
 
         while let Some(result) = self.asr.poll(Instant::now()) {
             match result {
-                Ok(AsrEvent::Loaded(result)) => self.dispatch(AppEvent::ModelLoaded(result)),
+                Ok(AsrEvent::Loaded(Ok(()))) => {
+                    self.asr_recovery.loaded();
+                    self.poll_permissions();
+                    self.dispatch(AppEvent::ModelLoaded(Ok(())));
+                }
+                Ok(AsrEvent::Loaded(Err(_))) => self.handle_asr_error(AsrTaskError::WorkerFailed),
                 Ok(AsrEvent::Recognized(result)) => {
-                    self.dispatch(AppEvent::RecognitionFinished(result));
+                    if self.asr_generation.take() == Some(self.dictation_capture.generation)
+                        && self.dictation_capture.phase == CapturePhase::Submitted
+                    {
+                        self.dispatch(AppEvent::RecognitionFinished(result));
+                    }
                 }
                 Err(error) => {
                     self.handle_asr_error(error);
@@ -890,18 +975,51 @@ impl Runtime {
                 }
             }
         }
+        if self.controller.status() == &AppStatus::AsrCleanupPending && self.asr.retry_ready() {
+            self.dispatch(AppEvent::AsrUnavailable);
+        }
         self.try_orderly_quit();
     }
 
     fn handle_asr_error(&mut self, error: AsrTaskError) {
         tracing::error!(error_category = "asr_worker", error = ?error);
-        match error {
-            AsrTaskError::TimedOut(_) => self.dispatch(AppEvent::AsrTimedOut),
-            AsrTaskError::Disconnected | AsrTaskError::UnexpectedOperation => {
-                self.dispatch(AppEvent::ModelLoaded(Err(
-                    "ASR worker unavailable".to_owned()
-                )));
+        self.asr.invalidate();
+        self.asr_generation = None;
+        cancel_timer(&self.run_loop, &mut self.error_timer);
+        self.dispatch(AppEvent::AsrUnavailable);
+        if let Some(paths) = self.asr_recovery.failure() {
+            self.reload_asr(paths);
+        } else if !self.asr.retry_ready() {
+            self.dispatch(AppEvent::AsrCleanupPending);
+        }
+    }
+
+    fn reload_asr(&mut self, paths: ModelPaths) {
+        if self.asr_shutdown.started.is_some() {
+            return;
+        }
+        self.dispatch(AppEvent::AsrRecoveryStarted);
+        if let Err(error) = self.asr.send(AsrCommand::Load(paths), Instant::now()) {
+            tracing::error!(error_category = "asr_reload", error = ?error);
+            self.asr_recovery.unavailable = true;
+            self.dispatch(if self.asr.retry_ready() {
+                AppEvent::AsrUnavailable
+            } else {
+                AppEvent::AsrCleanupPending
+            });
+        }
+    }
+
+    fn retry_asr(&mut self) {
+        if self.controller.status() != &AppStatus::AsrUnavailable {
+            return;
+        }
+        if self.asr.prepare_explicit_retry() {
+            if let Some(paths) = self.asr_recovery.retry() {
+                self.reload_asr(paths);
             }
+        } else {
+            self.dispatch(AppEvent::AsrCleanupPending);
         }
     }
 
@@ -996,6 +1114,7 @@ impl Runtime {
                 };
                 self.dispatch(AppEvent::PermissionMigrationCompleted);
                 self.start_permission_setup();
+                self.asr_recovery.paths = Some(result.paths.clone());
                 if let Err(error) = self
                     .asr
                     .send(AsrCommand::Load(result.paths), Instant::now())
@@ -1036,7 +1155,12 @@ impl Runtime {
 
     fn drain_menu_actions(&mut self) {
         while let Some(action) = self.menu.take_action() {
+            if self.asr_shutdown.started.is_some() {
+                continue;
+            }
             match action {
+                MenuAction::Quit => self.begin_shutdown(),
+                MenuAction::RetryAsr => self.retry_asr(),
                 MenuAction::OpenPermission(permission) => {
                     if !permissions::open_settings(permission) {
                         tracing::warn!(error_category = "open_permission_settings");
@@ -1126,18 +1250,81 @@ impl Runtime {
         );
     }
 
-    fn try_orderly_quit(&mut self) {
-        if !self
-            .orderly_quit
-            .take_if_ready(self.controller.status(), self.pending_insertion.is_some())
-        {
+    fn begin_shutdown(&mut self) {
+        if !self.asr_shutdown.begin(Instant::now()) {
             return;
         }
+        self.menu_readiness.set_ready(false);
         self.dictation_capture.abandon();
+        self.asr_generation = None;
         self.audio_preparation.stop();
-        let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        let application = NSApplication::sharedApplication(mtm);
-        unsafe { application.terminate(None) };
+        self.recorder.abort();
+        self.hotkey.take();
+        self.cancel_finish_timer();
+        self.cancel_capture_limit_timer();
+        cancel_timer(&self.run_loop, &mut self.permission_timer);
+        cancel_timer(&self.run_loop, &mut self.updater_timer);
+        cancel_timer(&self.run_loop, &mut self.error_timer);
+        cancel_timer(&self.run_loop, &mut self.insertion_timer);
+        if let Some(mut flow) = self.pending_insertion.take() {
+            if flow.restore_on_shutdown().is_err() {
+                tracing::warn!(error_category = "pasteboard_restore_on_shutdown");
+            }
+        }
+        self.asr.stop();
+    }
+
+    fn try_orderly_quit(&mut self) {
+        if self.asr_shutdown.started.is_none()
+            && self
+                .orderly_quit
+                .take_if_ready(self.controller.status(), self.pending_insertion.is_some())
+        {
+            self.begin_shutdown();
+        }
+        if self.asr_shutdown.started.is_none() {
+            return;
+        }
+        let cleaned = self.asr.cleanup_complete();
+        if self
+            .asr_shutdown
+            .report_failure(Instant::now(), cleaned, self.asr.cleanup_failed())
+        {
+            tracing::error!(error_category = "asr_shutdown_cleanup_pending");
+        }
+        if cleaned {
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            let application = NSApplication::sharedApplication(mtm);
+            unsafe { application.terminate(None) };
+        }
+    }
+
+    /// Covers a run loop stopped without the menu/updater termination route.
+    /// Keep the pinned runtime and run-loop sources alive until the child is
+    /// reaped. Drop alone only signals cancellation and cannot keep a process alive.
+    pub fn finish_after_run(mut self: Pin<&mut Self>) {
+        unsafe { self.as_mut().get_unchecked_mut() }.begin_shutdown();
+        loop {
+            {
+                let runtime = unsafe { self.as_mut().get_unchecked_mut() };
+                if runtime.asr.cleanup_complete() {
+                    break;
+                }
+                if runtime.asr_shutdown.report_failure(
+                    Instant::now(),
+                    false,
+                    runtime.asr.cleanup_failed(),
+                ) {
+                    tracing::error!(error_category = "asr_shutdown_cleanup_pending");
+                }
+            }
+            // End the mutable borrow before timers can reenter Runtime.
+            CFRunLoop::run_in_mode(
+                unsafe { core_foundation::runloop::kCFRunLoopDefaultMode },
+                Duration::from_millis(20),
+                true,
+            );
+        }
     }
 
     fn drain_microphone_permission_completions(&mut self) {
@@ -1371,6 +1558,7 @@ impl Runtime {
                 }
             }
             Effect::Recognize(samples) => {
+                self.asr_generation = Some(self.dictation_capture.generation);
                 tracing::debug!(
                     sample_count = samples.len(),
                     lifecycle = "recognition_started"
@@ -1605,6 +1793,8 @@ fn cancel_timer(run_loop: &CFRunLoop, slot: &mut Option<ScheduledTimer>) {
 const fn status_name(status: &AppStatus) -> &'static str {
     match status {
         AppStatus::PreparingModel => "preparing_model",
+        AppStatus::AsrUnavailable => "asr_unavailable",
+        AppStatus::AsrCleanupPending => "asr_cleanup_pending",
         AppStatus::ModelRepairRequired => "model_repair_required",
         AppStatus::ModelPreparationFailed => "model_preparation_failed",
         AppStatus::ResettingPermissions => "resetting_permissions",
@@ -1731,7 +1921,48 @@ mod tests {
     use crate::state::{AppController, AppEvent, AppStatus, Effect, PermissionSnapshot};
 
     #[test]
-    fn permission_transition_invalidates_preparation_before_new_recognizing_state() {
+    fn asr_recovery_has_one_reload_and_explicit_retry_without_migration() {
+        let paths = crate::model::ModelPaths::from_verified_directory(std::path::Path::new(
+            "/tmp/synthetic-model",
+        ));
+        let mut recovery = super::AsrRecovery {
+            paths: Some(paths),
+            ..Default::default()
+        };
+        assert!(recovery.failure().is_some());
+        assert!(recovery.failure().is_none());
+        assert!(recovery.failure().is_none());
+        assert!(recovery.unavailable);
+        assert!(recovery.retry().is_some());
+        assert!(recovery.retry().is_none());
+        recovery.loaded();
+        assert!(
+            recovery.failure().is_some(),
+            "new episode gets one recovery after success"
+        );
+        assert!(recovery.failure().is_none());
+        // Recovery owns only retained paths/attempt state; it cannot call model
+        // preparation or permission migration and never stores PCM for replay.
+    }
+
+    #[test]
+    fn asynchronous_shutdown_reports_deadline_once_and_keeps_waiting_for_ack() {
+        let now = std::time::Instant::now();
+        let mut shutdown = super::AsrShutdown::default();
+        assert!(shutdown.begin(now));
+        assert!(!shutdown.begin(now));
+        assert!(!shutdown.report_failure(now, false, false));
+        assert!(shutdown.report_failure(now + super::ASR_SHUTDOWN_TIMEOUT, false, false));
+        assert!(!shutdown.report_failure(now + super::ASR_SHUTDOWN_TIMEOUT, false, false));
+        assert!(
+            shutdown.started.is_some(),
+            "timeout must retain shutdown ownership"
+        );
+        assert!(!shutdown.report_failure(now, true, true));
+    }
+
+    #[test]
+    fn recovery_transition_invalidates_preparation_before_new_recognizing_state() {
         let mut capture = super::DictationCapture::default();
         let mut controller = AppController::new();
         controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
@@ -1740,8 +1971,9 @@ mod tests {
         capture.begin();
         controller.handle(AppEvent::TriggerReleased { short: false });
         let old = capture.expect_preparation().unwrap();
-        controller.handle(AppEvent::PermissionsChanged(PermissionSnapshot::all()));
+        controller.handle(AppEvent::AsrRecoveryStarted);
         assert!(capture.abandon_unless_active(controller.status()));
+        controller.handle(AppEvent::ModelLoaded(Ok(())));
         controller.handle(AppEvent::TriggerPressed);
         capture.begin();
         controller.handle(AppEvent::TriggerReleased { short: false });
