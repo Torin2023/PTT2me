@@ -1,7 +1,7 @@
 //! One bounded background lane for completed microphone captures.
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::audio::CompletedCapture;
@@ -36,6 +36,7 @@ pub(crate) struct AudioPreparationTask {
     commands: Option<SyncSender<PreparationJob>>,
     events: Option<Receiver<AudioPreparationResult>>,
     pending: Option<PendingPreparation>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl AudioPreparationTask {
@@ -49,8 +50,8 @@ impl AudioPreparationTask {
     {
         let (commands, jobs) = mpsc::sync_channel::<PreparationJob>(1);
         let (results, events) = mpsc::sync_channel(1);
-        // Deliberately detach: stop/Drop never join potentially blocked work.
-        thread::spawn(move || {
+        // Retain liveness evidence for disconnect recovery; never join on AppKit.
+        let worker = thread::spawn(move || {
             while let Ok(job) = jobs.recv() {
                 let start = Instant::now();
                 let native_sample_count = job.capture.native_sample_count();
@@ -69,14 +70,19 @@ impl AudioPreparationTask {
                 }
             }
         });
-        Self::new(commands, events)
+        Self::new(commands, events, worker)
     }
 
-    fn new(commands: SyncSender<PreparationJob>, events: Receiver<AudioPreparationResult>) -> Self {
+    fn new(
+        commands: SyncSender<PreparationJob>,
+        events: Receiver<AudioPreparationResult>,
+        worker: JoinHandle<()>,
+    ) -> Self {
         Self {
             commands: Some(commands),
             events: Some(events),
             pending: None,
+            worker: Some(worker),
         }
     }
 
@@ -87,6 +93,11 @@ impl AudioPreparationTask {
     ) -> Result<(), AudioPreparationError> {
         if self.pending.is_some() {
             return Err(AudioPreparationError::Busy);
+        }
+        if self.commands.is_none() && self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            // Channel disconnect alone is not proof of worker termination.
+            // A stopped task has no handle and can never restart here.
+            *self = Self::spawn();
         }
         let Some(commands) = &self.commands else {
             return Err(AudioPreparationError::Disconnected);
@@ -104,7 +115,7 @@ impl AudioPreparationTask {
             }
             Err(TrySendError::Full(_)) => Err(AudioPreparationError::Busy),
             Err(TrySendError::Disconnected(_)) => {
-                self.stop();
+                self.disconnect();
                 Err(AudioPreparationError::Disconnected)
             }
         }
@@ -119,7 +130,7 @@ impl AudioPreparationTask {
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => {
                 let pending = self.pending.take();
-                self.stop();
+                self.disconnect();
                 pending
                     .filter(|pending| !pending.cancelled)
                     .map(|pending| AudioPreparationResult {
@@ -138,10 +149,17 @@ impl AudioPreparationTask {
         }
     }
 
-    pub(crate) fn stop(&mut self) {
+    fn disconnect(&mut self) {
         self.commands.take();
         self.events.take();
         self.pending = None;
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.disconnect();
+        // Dropping a handle detaches even a blocked thread. Its absence also
+        // disables replacement forever for this stopped task.
+        self.worker.take();
     }
 }
 
@@ -236,12 +254,23 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_pending_worker_reports_failure_once() {
-        let (commands, _receiver) = mpsc::sync_channel(1);
+    fn disconnect_restarts_only_after_old_worker_is_confirmed_finished() {
+        let (commands, receiver) = mpsc::sync_channel(1);
         let (sender, events) = mpsc::sync_channel(1);
-        let mut task = AudioPreparationTask::new(commands, events);
+        let (disconnected, observed_disconnect) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            receiver.recv().unwrap();
+            drop(sender);
+            drop(receiver);
+            disconnected.send(()).unwrap();
+            blocked.recv().unwrap();
+        });
+        let mut task = AudioPreparationTask::new(commands, events, worker);
         task.submit(7, capture()).unwrap();
-        drop(sender);
+        observed_disconnect
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
         let result = task.poll().unwrap();
         assert_eq!(result.generation, 7);
         assert_eq!(result.result, Err(AudioPreparationError::Disconnected));
@@ -250,6 +279,28 @@ mod tests {
             task.submit(8, capture()),
             Err(AudioPreparationError::Disconnected)
         );
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !task.worker.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        task.submit(9, capture()).unwrap();
+        let result = wait(&mut task);
+        assert_eq!(result.generation, 9);
+        assert_eq!(result.result, Ok(None));
+    }
+
+    #[test]
+    fn shutdown_never_spawns_a_replacement() {
+        let mut task = AudioPreparationTask::spawn();
+        task.stop();
+        assert_eq!(
+            task.submit(1, capture()),
+            Err(AudioPreparationError::Disconnected)
+        );
+        assert!(task.worker.is_none());
+        assert!(task.poll().is_none());
     }
 
     #[test]
