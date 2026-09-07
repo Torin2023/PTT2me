@@ -1,7 +1,7 @@
 const DOWNLOAD_URL =
-  "https://github.com/Torin2023/PTT2me/releases/download/v1.2.1/PTT2me-1.2.1-full-macos-arm64.dmg";
+  "https://github.com/Torin2023/PTT2me/releases/download/v1.3.0/PTT2me-1.3.0-full-macos-arm64.dmg";
 const REPOSITORY_URL = "https://github.com/Torin2023/PTT2me";
-const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.2.1`;
+const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.3.0`;
 
 const steps = [
   ["01", "Удерживайте", "Нажмите и удерживайте выбранную клавишу."],
@@ -27,7 +27,7 @@ export default function Home() {
         </a>
         <nav aria-label="Разделы сайта">
           <a href="#how">Как работает</a>
-          <a href="#updates">Обновления 1.2.1</a>
+          <a href="#updates">Обновления 1.3.0</a>
           <a href={REPOSITORY_URL}>GitHub</a>
           <a className="button button-small" href={DOWNLOAD_URL}>
             Скачать
@@ -41,7 +41,7 @@ export default function Home() {
           <p className="eyebrow">
             <span className="eyebrow-line" aria-hidden="true" />
             Локальная диктовка для macOS
-            <span className="preview-badge">Preview 1.2.1</span>
+            <span className="preview-badge">Preview 1.3.0</span>
           </p>
           <h1>
             Говорите —
@@ -55,7 +55,7 @@ export default function Home() {
           </p>
           <div className="hero-actions">
             <a className="button" href={DOWNLOAD_URL}>
-              Скачать PTT2me 1.2.1
+              Скачать PTT2me 1.3.0
               <span aria-hidden="true">↘</span>
             </a>
             <a className="text-link" href={REPOSITORY_URL}>
@@ -64,7 +64,7 @@ export default function Home() {
             </a>
           </div>
           <p className="compatibility">
-            Apple Silicon <i /> macOS 13+ <i /> 184,5 МиБ <i /> без облака
+            Apple Silicon <i /> macOS 13+ <i /> 175,1 МиБ <i /> без облака
           </p>
         </div>
 
@@ -168,8 +168,9 @@ export default function Home() {
           <p>
             Accessibility проверяет активное поле и отклоняет защищённый ввод.
             В обычные поля PTT2me вставляет текст через системный Command-V:
-            это работает в нативных приложениях, браузерных input, textarea и
-            contenteditable, а также в строке ввода Codex. После вставки PTT2me
+            этот способ используется для нативных полей и браузерных input,
+            textarea и contenteditable. Вставка в ChatGPT в этой версии ещё
+            не подтверждена ручной проверкой. После вставки PTT2me
             восстанавливает все прежние элементы и форматы буфера и никогда не
             перезаписывает более новые изменения.
           </p>
@@ -223,15 +224,18 @@ export default function Home() {
 
       <section className="section updates-section" id="updates">
         <div className="section-heading">
-          <p className="eyebrow">PTT2me 1.2.1 опубликована</p>
+          <p className="eyebrow">PTT2me 1.3.0 опубликована</p>
           <div>
-            <h2>Исправлена вставка текста в Chrome.</h2>
+            <h2>Меньше размер, устойчивее работа.</h2>
             <p className="release-boundary">
-              Версиям 1.1.0 и 1.1.1 нужен один ручной переход на 1.2.1 через
+              Версиям 1.1.0 и 1.1.1 нужен один ручной переход на 1.3.0 через
               Full DMG: прежний updater не может скачать сборку с собственным
-              исправлением. Версии начиная с 1.1.2 могут загрузить 1.2.1 через
-              меню обновлений. В 1.2.1 исправлена вставка в поля страниц Chrome:
-              браузер подготавливается к вставке во время записи речи.
+              исправлением. Версии начиная с 1.1.2 могут загрузить 1.3.0 через
+              меню обновлений. По сравнению с 1.2.1 приложение без модели стало
+              меньше на 49%, а Update DMG — на 48,6%, до 10,8 МиБ.
+              Обработка записи вынесена из потока меню; при сбое распознавания
+              приложение выполняет ограниченную попытку восстановления.
+              Модель распознавания осталась прежней.
             </p>
           </div>
         </div>
@@ -342,15 +346,17 @@ export default function Home() {
 
       <section className="section install" id="install">
         <div className="install-copy">
-          <p className="eyebrow">PTT2me Preview 1.2.1</p>
+          <p className="eyebrow">PTT2me Preview 1.3.0</p>
           <h2>Готовы говорить?</h2>
           <p>Для Mac с Apple Silicon и macOS 13 Ventura или новее.</p>
           <p className="fine-print">
-            Ручные проверки этой версии пропущены по решению владельца.
+            Релиз опубликован по решению владельца. Полный набор ручных проверок
+            не завершён; вставка в ChatGPT ещё не подтверждена. Сборка без
+            нотариализации Apple.
             {" "}<a href={RELEASE_URL}>Подробности и ограничения preview.</a>
           </p>
           <a className="button" href={DOWNLOAD_URL}>
-            Скачать Full DMG · 184,5 МиБ
+            Скачать Full DMG · 175,1 МиБ
             <span aria-hidden="true">↘</span>
           </a>
         </div>
@@ -394,11 +400,11 @@ export default function Home() {
         <p>
           SHA-256{" "}
           <code>
-            53076f0253a4f710cc0fc3fb3151802a43514110f2035d46b90c8d8f3c914fba
+            36c374264e924537faa0d3fbb74dd5abf98ab808d2d3aa7f27a970e79566b363
           </code>
         </p>
         <div>
-          <a href={RELEASE_URL}>Preview-релиз 1.2.1</a>
+          <a href={RELEASE_URL}>Preview-релиз 1.3.0</a>
           <a href={REPOSITORY_URL}>GitHub</a>
         </div>
       </footer>
