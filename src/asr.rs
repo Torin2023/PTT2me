@@ -6,6 +6,9 @@ use sherpa_rs::transducer::{TransducerConfig, TransducerRecognizer};
 use crate::constants::SAMPLE_RATE;
 use crate::model::ModelPaths;
 
+pub const DEFAULT_CPU_THREADS: i32 = 2;
+pub const SUPPORTED_CPU_THREADS: [i32; 3] = [1, 2, 4];
+
 #[derive(Debug)]
 pub enum AsrCommand {
     Load(ModelPaths),
@@ -26,35 +29,28 @@ pub fn spawn_asr_worker(
     thread::spawn(move || run_asr_worker(commands, events, SherpaRecognizerBackend::default()))
 }
 
-trait RecognizerBackend {
+pub(crate) trait RecognizerBackend {
     fn load(&mut self, paths: ModelPaths) -> Result<(), String>;
     fn transcribe(&mut self, samples: &[f32]) -> Result<String, String>;
 }
 
 #[derive(Default)]
-struct SherpaRecognizerBackend {
+pub(crate) struct SherpaRecognizerBackend {
     recognizer: Option<TransducerRecognizer>,
+}
+
+// sherpa-rs accepts UTF-8 Strings. Reject unsupported Unix bytes rather than
+// silently opening a different, unverified path through lossy conversion.
+fn native_model_path(path: &std::path::Path) -> Result<String, String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "model path encoding unsupported".to_owned())
 }
 
 impl RecognizerBackend for SherpaRecognizerBackend {
     fn load(&mut self, paths: ModelPaths) -> Result<(), String> {
         self.recognizer = None;
-        let config = TransducerConfig {
-            encoder: paths.encoder().to_string_lossy().into_owned(),
-            decoder: paths.decoder().to_string_lossy().into_owned(),
-            joiner: paths.joiner().to_string_lossy().into_owned(),
-            tokens: paths.tokens().to_string_lossy().into_owned(),
-            model_type: "nemo_transducer".into(),
-            num_threads: 2,
-            sample_rate: 16_000,
-            feature_dim: 80,
-            decoding_method: "greedy_search".into(),
-            debug: false,
-            provider: None,
-            ..Default::default()
-        };
-        self.recognizer =
-            Some(TransducerRecognizer::new(config).map_err(|error| error.to_string())?);
+        self.recognizer = Some(load_sherpa_recognizer(&paths, DEFAULT_CPU_THREADS)?);
         Ok(())
     }
 
@@ -65,6 +61,43 @@ impl RecognizerBackend for SherpaRecognizerBackend {
             .ok_or_else(|| "model is not loaded".to_owned())?;
         Ok(recognizer.transcribe(SAMPLE_RATE, samples))
     }
+}
+
+#[doc(hidden)]
+pub fn load_sherpa_recognizer(
+    paths: &ModelPaths,
+    num_threads: i32,
+) -> Result<TransducerRecognizer, String> {
+    TransducerRecognizer::new(transducer_config(paths, num_threads)?)
+        .map_err(|error| error.to_string())
+}
+
+fn transducer_config(paths: &ModelPaths, num_threads: i32) -> Result<TransducerConfig, String> {
+    if !SUPPORTED_CPU_THREADS.contains(&num_threads) {
+        return Err("unsupported ASR CPU thread count".to_owned());
+    }
+    Ok(TransducerConfig {
+        encoder: native_model_path(paths.encoder())?,
+        decoder: native_model_path(paths.decoder())?,
+        joiner: native_model_path(paths.joiner())?,
+        tokens: native_model_path(paths.tokens())?,
+        model_type: "nemo_transducer".into(),
+        num_threads,
+        sample_rate: 16_000,
+        feature_dim: 80,
+        decoding_method: "greedy_search".into(),
+        debug: false,
+        provider: None,
+        ..Default::default()
+    })
+}
+
+#[cfg(test)]
+fn transducer_config_for_test(
+    paths: &ModelPaths,
+    num_threads: i32,
+) -> Result<TransducerConfig, String> {
+    transducer_config(paths, num_threads)
 }
 
 fn run_asr_worker<B: RecognizerBackend>(
@@ -156,6 +189,35 @@ mod tests {
         commands_to_send(&command_sender);
         run_asr_worker(command_receiver, event_sender, backend);
         (event_receiver.try_iter().collect(), calls)
+    }
+
+    #[test]
+    fn native_configuration_never_changes_non_utf8_verified_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/model-\xff".to_vec()));
+        assert!(super::native_model_path(&path).is_err());
+        assert_eq!(
+            super::native_model_path(std::path::Path::new("/tmp/модель")).unwrap(),
+            "/tmp/модель"
+        );
+    }
+
+    #[test]
+    fn supported_performance_thread_counts_do_not_change_the_cpu2_product_default() {
+        assert_eq!(super::DEFAULT_CPU_THREADS, 2);
+        assert_eq!(super::SUPPORTED_CPU_THREADS, [1, 2, 4]);
+        let paths = model_paths();
+        for threads in super::SUPPORTED_CPU_THREADS {
+            assert_eq!(
+                super::transducer_config_for_test(&paths, threads)
+                    .unwrap()
+                    .num_threads,
+                threads
+            );
+        }
+        for threads in [-1, 0, 3, 8] {
+            assert!(super::transducer_config_for_test(&paths, threads).is_err());
+        }
     }
 
     #[test]

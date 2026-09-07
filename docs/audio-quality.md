@@ -77,9 +77,10 @@ model/decoder configuration for the old and new conversion paths:
 3. Listen to converted samples around both endpoints and loud transients.
    Check there are no missing syllables, clipping artifacts or audible clicks.
 4. Measure conversion and end-to-text latency in an optimized build for 1-,
-   10- and 25-second recordings at 44.1/48/96 kHz. Conversion currently runs
-   after stopping the stream on the AppKit thread; verify menu responsiveness
-   on the slowest supported Mac before release.
+   10- and 25-second recordings at 44.1/48/96 kHz. After AppKit stops and drops
+   the stream, bounded audio preparation and conversion run in a background
+   worker. Verify menu responsiveness and cancellation of stale preparation on
+   the slowest supported Mac before release.
 5. Record the tested commit, model, microphones, corpus size, WER counts and
    latency distribution. Investigate regressions by recording/condition before
    claiming a recognition-quality improvement.

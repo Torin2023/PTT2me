@@ -118,6 +118,27 @@ require_nonempty_file() {
     }
 }
 
+install_arm64_library() {
+    local source="$1"
+    local destination="$2"
+    local architectures
+
+    architectures="$(lipo -archs "$source" 2>/dev/null)" ||
+        fail "could not inspect native library architectures: $source"
+    case " $architectures " in
+        *" arm64 "*) ;;
+        *) fail "native library $source does not contain arm64" ;;
+    esac
+
+    if [[ "$architectures" == "arm64" ]]; then
+        install -m 755 "$source" "$destination"
+    else
+        lipo "$source" -thin arm64 -output "$destination" ||
+            fail "could not extract arm64 from native library: $source"
+        chmod 755 "$destination"
+    fi
+}
+
 for license_file in \
     GIGAAM-MIT.txt \
     RTRB-MIT.txt \
@@ -191,8 +212,10 @@ for license_file in \
     ONNXRUNTIME-NOTICES.txt; do
     install -m 644 "$LICENSE_SOURCE/$license_file" "$LICENSE_DESTINATION/$license_file"
 done
-install -m 755 "$RELEASE_DIR/$SHERPA_DYLIB" "$FRAMEWORKS/$SHERPA_DYLIB"
-install -m 755 "$RELEASE_DIR/$ONNX_DYLIB" "$FRAMEWORKS/$ONNX_DYLIB"
+install_arm64_library \
+    "$RELEASE_DIR/$SHERPA_DYLIB" "$FRAMEWORKS/$SHERPA_DYLIB"
+install_arm64_library \
+    "$RELEASE_DIR/$ONNX_DYLIB" "$FRAMEWORKS/$ONNX_DYLIB"
 install -m 644 "$ICON_SOURCE" "$RESOURCES/PTT2me.icns"
 
 lipo "$MACOS/$PRODUCT" -verify_arch arm64

@@ -60,11 +60,15 @@ require_file() {
     [[ -f "$path" ]] || fail "missing $relative"
 }
 
-require_arm64() {
+require_exact_arm64() {
     local path="$1"
     local relative="${path#"$APP_PATH"/}"
-    lipo "$path" -verify_arch arm64 >/dev/null 2>&1 ||
-        fail "$relative is not arm64"
+    local architectures
+
+    architectures="$(lipo -archs "$path" 2>/dev/null)" ||
+        fail "could not inspect architectures for $relative"
+    [[ "$architectures" == "arm64" ]] ||
+        fail "$relative architectures must be exactly arm64 (found: $architectures)"
 }
 
 assert_plist() {
@@ -199,14 +203,14 @@ require_exact_executable_rpath() {
     --resources "$RESOURCES" || fail "$VARIANT model layout is invalid"
 
 require_file "$EXECUTABLE"
-require_arm64 "$EXECUTABLE"
+require_exact_arm64 "$EXECUTABLE"
 
 SHERPA_DYLIB="$FRAMEWORKS/libsherpa-onnx-c-api.dylib"
 ONNX_DYLIB="$FRAMEWORKS/libonnxruntime.1.17.1.dylib"
 require_file "$SHERPA_DYLIB"
-require_arm64 "$SHERPA_DYLIB"
+require_exact_arm64 "$SHERPA_DYLIB"
 require_file "$ONNX_DYLIB"
-require_arm64 "$ONNX_DYLIB"
+require_exact_arm64 "$ONNX_DYLIB"
 
 require_file "$PLIST"
 "$SCRIPT_DIR/check-app-icon.sh" "$REPO_ROOT/assets/PTT2me.icns" "$ICON" ||

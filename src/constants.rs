@@ -1,3 +1,5 @@
+// Storage and ASR wire bounds share this allowance for delayed capture stop.
+pub const CAPTURE_BUFFER_MARGIN_MS: u64 = 1_000;
 pub const SAMPLE_RATE: u32 = 16_000;
 pub const RELEASE_GRACE_MS: u64 = 180;
 pub const MAX_CAPTURE_MS: u64 = 25_000;

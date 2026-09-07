@@ -52,6 +52,103 @@ expect_failure_containing() {
     }
 }
 
+expect_exact_architecture() {
+    local expected="$1"
+    local path="$2"
+    local actual
+    actual="$(lipo -archs "$path")"
+    [[ "$actual" == "$expected" ]] || {
+        echo "expected $path architecture '$expected', got '$actual'" >&2
+        exit 1
+    }
+}
+
+compile_macho_fixture() {
+    local architecture="$1"
+    local output_directory="$2"
+    mkdir -p "$output_directory"
+
+    printf '%s\n' 'int onnx_symbol(void) { return 0; }' |
+        xcrun clang \
+            -arch "$architecture" \
+            -mmacosx-version-min=13.0 \
+            -x c - \
+            -dynamiclib \
+            -Wl,-install_name,@rpath/libonnxruntime.1.17.1.dylib \
+            -o "$output_directory/libonnxruntime.1.17.1.dylib"
+    printf '%s\n' \
+        'extern int onnx_symbol(void);' \
+        'int sherpa_symbol(void) { return onnx_symbol(); }' |
+        xcrun clang \
+            -arch "$architecture" \
+            -mmacosx-version-min=13.0 \
+            -x c - \
+            -x none \
+            -dynamiclib \
+            "$output_directory/libonnxruntime.1.17.1.dylib" \
+            -Wl,-install_name,@rpath/libsherpa-onnx-c-api.dylib \
+            -o "$output_directory/libsherpa-onnx-c-api.dylib"
+    printf '%s\n' \
+        'extern int onnx_symbol(void);' \
+        'extern int sherpa_symbol(void);' \
+        'int main(void) { return onnx_symbol() + sherpa_symbol(); }' |
+        xcrun clang \
+            -arch "$architecture" \
+            -mmacosx-version-min=13.0 \
+            -x c - \
+            -x none \
+            "$output_directory/libsherpa-onnx-c-api.dylib" \
+            "$output_directory/libonnxruntime.1.17.1.dylib" \
+            -Wl,-rpath,@executable_path/../Frameworks \
+            -o "$output_directory/PTT2me"
+}
+
+create_update_bundle_fixture() {
+    local app="$1"
+    local executable="$2"
+    local sherpa_dylib="$3"
+    local onnx_dylib="$4"
+    local contents="$app/Contents"
+    local plist="$contents/Info.plist"
+
+    mkdir -p \
+        "$contents/MacOS" \
+        "$contents/Frameworks" \
+        "$contents/Resources"
+    install -m 755 "$executable" "$contents/MacOS/PTT2me"
+    install -m 755 "$sherpa_dylib" \
+        "$contents/Frameworks/libsherpa-onnx-c-api.dylib"
+    install -m 755 "$onnx_dylib" \
+        "$contents/Frameworks/libonnxruntime.1.17.1.dylib"
+    install -m 644 "$REPO_ROOT/assets/PTT2me.icns" \
+        "$contents/Resources/PTT2me.icns"
+
+    plutil -create xml1 "$plist"
+    /usr/libexec/PlistBuddy -c \
+        "Add :CFBundleIdentifier string com.ptt2me.app" "$plist"
+    /usr/libexec/PlistBuddy -c \
+        "Add :CFBundleIconFile string PTT2me.icns" "$plist"
+    /usr/libexec/PlistBuddy -c \
+        "Add :CFBundleShortVersionString string $CURRENT_VERSION" "$plist"
+    /usr/libexec/PlistBuddy -c \
+        "Add :CFBundleVersion string 202609061200" "$plist"
+    /usr/libexec/PlistBuddy -c \
+        "Add :PTT2meSourceCommit string 0000000000000000000000000000000000000000" \
+        "$plist"
+    /usr/libexec/PlistBuddy -c \
+        "Add :PTT2meDistributionVariant string update" "$plist"
+    /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$plist"
+    /usr/libexec/PlistBuddy -c \
+        "Add :LSMinimumSystemVersion string 13.0" "$plist"
+
+    codesign --force --sign - \
+        "$contents/Frameworks/libonnxruntime.1.17.1.dylib"
+    codesign --force --sign - \
+        "$contents/Frameworks/libsherpa-onnx-c-api.dylib"
+    codesign --force --sign - "$contents/MacOS/PTT2me"
+    codesign --force --sign - "$app"
+}
+
 FAKE_TOOLS="$TEMP_ROOT/fake-tools"
 mkdir "$FAKE_TOOLS"
 printf '%s\n' \
@@ -66,12 +163,168 @@ printf '%s\n' \
     '#!/bin/bash' \
     'echo "cargo must not run before source commit validation" >&2' \
     'exit 93' >"$FAKE_TOOLS/cargo"
-printf '%s\n' '#!/bin/bash' 'exit 0' >"$FAKE_TOOLS/lipo"
+printf '%s\n' \
+    '#!/bin/bash' \
+    '[[ "$*" == *"-archs"* ]] && printf "%s\\n" arm64' \
+    'exit 0' >"$FAKE_TOOLS/lipo"
 printf '%s\n' \
     '#!/bin/bash' \
     'echo "otool must not run before source commit validation" >&2' \
     'exit 94' >"$FAKE_TOOLS/otool"
 chmod 755 "$FAKE_TOOLS"/*
+
+ARM64_FIXTURE="$TEMP_ROOT/macho-arm64"
+X86_64_FIXTURE="$TEMP_ROOT/macho-x86_64"
+UNIVERSAL_FIXTURE="$TEMP_ROOT/macho-universal"
+compile_macho_fixture arm64 "$ARM64_FIXTURE"
+compile_macho_fixture x86_64 "$X86_64_FIXTURE"
+mkdir "$UNIVERSAL_FIXTURE"
+for macho_name in \
+    PTT2me \
+    libsherpa-onnx-c-api.dylib \
+    libonnxruntime.1.17.1.dylib; do
+    lipo -create \
+        "$ARM64_FIXTURE/$macho_name" \
+        "$X86_64_FIXTURE/$macho_name" \
+        -output "$UNIVERSAL_FIXTURE/$macho_name"
+    lipo "$UNIVERSAL_FIXTURE/$macho_name" -verify_arch arm64 >/dev/null 2>&1 || {
+        echo "former arm64-presence check must accept universal $macho_name" >&2
+        exit 1
+    }
+done
+
+THIN_BUNDLE="$TEMP_ROOT/thin-arm64.app"
+create_update_bundle_fixture \
+    "$THIN_BUNDLE" \
+    "$ARM64_FIXTURE/PTT2me" \
+    "$ARM64_FIXTURE/libsherpa-onnx-c-api.dylib" \
+    "$ARM64_FIXTURE/libonnxruntime.1.17.1.dylib"
+"$REPO_ROOT/scripts/check-bundle.sh" \
+    --variant update \
+    --model-manifest "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json" \
+    "$THIN_BUNDLE"
+
+for universal_name in \
+    Contents/MacOS/PTT2me \
+    Contents/Frameworks/libsherpa-onnx-c-api.dylib \
+    Contents/Frameworks/libonnxruntime.1.17.1.dylib; do
+    UNIVERSAL_BUNDLE="$TEMP_ROOT/universal-$(basename "$universal_name").app"
+    case "$universal_name" in
+        Contents/MacOS/PTT2me)
+            create_update_bundle_fixture \
+                "$UNIVERSAL_BUNDLE" \
+                "$UNIVERSAL_FIXTURE/PTT2me" \
+                "$ARM64_FIXTURE/libsherpa-onnx-c-api.dylib" \
+                "$ARM64_FIXTURE/libonnxruntime.1.17.1.dylib"
+            ;;
+        Contents/Frameworks/libsherpa-onnx-c-api.dylib)
+            create_update_bundle_fixture \
+                "$UNIVERSAL_BUNDLE" \
+                "$ARM64_FIXTURE/PTT2me" \
+                "$UNIVERSAL_FIXTURE/libsherpa-onnx-c-api.dylib" \
+                "$ARM64_FIXTURE/libonnxruntime.1.17.1.dylib"
+            ;;
+        Contents/Frameworks/libonnxruntime.1.17.1.dylib)
+            create_update_bundle_fixture \
+                "$UNIVERSAL_BUNDLE" \
+                "$ARM64_FIXTURE/PTT2me" \
+                "$ARM64_FIXTURE/libsherpa-onnx-c-api.dylib" \
+                "$UNIVERSAL_FIXTURE/libonnxruntime.1.17.1.dylib"
+            ;;
+    esac
+    expect_failure_containing \
+        "$universal_name architectures must be exactly arm64" \
+        "$REPO_ROOT/scripts/check-bundle.sh" \
+        --variant update \
+        --model-manifest "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json" \
+        "$UNIVERSAL_BUNDLE"
+done
+
+BUILD_FIXTURE_REPO="$TEMP_ROOT/build-fixture-repo"
+mkdir -p \
+    "$BUILD_FIXTURE_REPO/scripts" \
+    "$BUILD_FIXTURE_REPO/models/manifests" \
+    "$BUILD_FIXTURE_REPO/assets" \
+    "$BUILD_FIXTURE_REPO/licenses" \
+    "$BUILD_FIXTURE_REPO/fake-tools"
+cp "$REPO_ROOT/Cargo.toml" "$BUILD_FIXTURE_REPO/Cargo.toml"
+cp "$REPO_ROOT/assets/PTT2me.icns" "$BUILD_FIXTURE_REPO/assets/PTT2me.icns"
+cp "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json" \
+    "$BUILD_FIXTURE_REPO/models/manifests/gigaam-v3-rnnt-v1.json"
+cp "$REPO_ROOT"/licenses/* "$BUILD_FIXTURE_REPO/licenses/"
+for fixture_script in \
+    build-app.sh \
+    check-app-icon.sh \
+    check-bundle.sh \
+    check-model-variant.sh \
+    check-production-model-manifest.sh; do
+    cp "$REPO_ROOT/scripts/$fixture_script" "$BUILD_FIXTURE_REPO/scripts/$fixture_script"
+done
+printf '%s\n' \
+    '#!/bin/bash' \
+    'set -euo pipefail' \
+    '[[ "$*" == "build --release --target aarch64-apple-darwin" ]] || exit 91' \
+    'release="$PWD/target/aarch64-apple-darwin/release"' \
+    'mkdir -p "$release"' \
+    'cp "$FIXTURE_BIN_DIR/PTT2me" "$release/ptt2me"' \
+    'cp "$FIXTURE_BIN_DIR/libsherpa-onnx-c-api.dylib" "$release/"' \
+    'cp "$FIXTURE_BIN_DIR/libonnxruntime.1.17.1.dylib" "$release/"' \
+    >"$BUILD_FIXTURE_REPO/fake-tools/cargo"
+printf '%s\n' \
+    '#!/bin/bash' \
+    '[[ "$*" == "rev-parse --verify HEAD^{commit}" ]] || exit 92' \
+    'printf "%s\\n" 1111111111111111111111111111111111111111' \
+    >"$BUILD_FIXTURE_REPO/fake-tools/git"
+chmod 755 "$BUILD_FIXTURE_REPO/fake-tools"/*
+
+UNIVERSAL_LIBRARY_INPUT="$TEMP_ROOT/universal-library-input"
+mkdir "$UNIVERSAL_LIBRARY_INPUT"
+cp "$ARM64_FIXTURE/PTT2me" "$UNIVERSAL_LIBRARY_INPUT/PTT2me"
+cp "$UNIVERSAL_FIXTURE/libsherpa-onnx-c-api.dylib" "$UNIVERSAL_LIBRARY_INPUT/"
+cp "$UNIVERSAL_FIXTURE/libonnxruntime.1.17.1.dylib" "$UNIVERSAL_LIBRARY_INPUT/"
+PACKAGED_APP="$TEMP_ROOT/packaged-universal-input.app"
+env \
+    PATH="$BUILD_FIXTURE_REPO/fake-tools:$PATH" \
+    FIXTURE_BIN_DIR="$UNIVERSAL_LIBRARY_INPUT" \
+    "$BUILD_FIXTURE_REPO/scripts/build-app.sh" \
+    --variant update \
+    --model-manifest \
+    "$BUILD_FIXTURE_REPO/models/manifests/gigaam-v3-rnnt-v1.json" \
+    --output "$PACKAGED_APP"
+expect_exact_architecture \
+    arm64 "$PACKAGED_APP/Contents/Frameworks/libsherpa-onnx-c-api.dylib"
+expect_exact_architecture \
+    arm64 "$PACKAGED_APP/Contents/Frameworks/libonnxruntime.1.17.1.dylib"
+
+PACKAGED_THIN_APP="$TEMP_ROOT/packaged-thin-input.app"
+env \
+    PATH="$BUILD_FIXTURE_REPO/fake-tools:$PATH" \
+    FIXTURE_BIN_DIR="$ARM64_FIXTURE" \
+    "$BUILD_FIXTURE_REPO/scripts/build-app.sh" \
+    --variant update \
+    --model-manifest \
+    "$BUILD_FIXTURE_REPO/models/manifests/gigaam-v3-rnnt-v1.json" \
+    --output "$PACKAGED_THIN_APP"
+expect_exact_architecture \
+    arm64 "$PACKAGED_THIN_APP/Contents/Frameworks/libsherpa-onnx-c-api.dylib"
+expect_exact_architecture \
+    arm64 "$PACKAGED_THIN_APP/Contents/Frameworks/libonnxruntime.1.17.1.dylib"
+
+X86_64_LIBRARY_INPUT="$TEMP_ROOT/x86_64-library-input"
+mkdir "$X86_64_LIBRARY_INPUT"
+cp "$ARM64_FIXTURE/PTT2me" "$X86_64_LIBRARY_INPUT/PTT2me"
+cp "$X86_64_FIXTURE/libsherpa-onnx-c-api.dylib" "$X86_64_LIBRARY_INPUT/"
+cp "$X86_64_FIXTURE/libonnxruntime.1.17.1.dylib" "$X86_64_LIBRARY_INPUT/"
+expect_failure_containing \
+    "does not contain arm64" \
+    env \
+    PATH="$BUILD_FIXTURE_REPO/fake-tools:$PATH" \
+    FIXTURE_BIN_DIR="$X86_64_LIBRARY_INPUT" \
+    "$BUILD_FIXTURE_REPO/scripts/build-app.sh" \
+    --variant update \
+    --model-manifest \
+    "$BUILD_FIXTURE_REPO/models/manifests/gigaam-v3-rnnt-v1.json" \
+    --output "$TEMP_ROOT/packaged-x86_64-input.app"
 
 "$CHECK_PRODUCTION_MANIFEST" \
     "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
