@@ -10,9 +10,9 @@ mod asr_task;
 pub fn run_asr_worker_process() -> i32 {
     asr_protocol::run_native_worker()
 }
+mod accessibility_preparation;
 pub mod audio;
 mod audio_task;
-mod browser_accessibility;
 pub mod constants;
 mod event_wake;
 pub mod hotkey;
