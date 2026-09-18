@@ -13,28 +13,34 @@ const MAX_NODES: usize = 128;
 const MAX_DEPTH: usize = 12;
 const PREPARATION_BUDGET: Duration = Duration::from_millis(500);
 const CALL_BUDGET: Duration = Duration::from_millis(50);
-static PREPARING: AtomicBool = AtomicBool::new(false);
+static AX_PROBE_BUSY: AtomicBool = AtomicBool::new(false);
 
 /// Start preparation alongside recording. Only the process ID is needed; apps
 /// without bundle identifiers use exactly the same path. Results are diagnostic
 /// only. text_inserter independently checks fresh system focus and secure status
 /// at both begin and paste time; no discovered node is ever an insertion target.
-pub(crate) fn prepare_focused_application() {
+/// Only the worker deadline is returned, for nonblocking runtime contention.
+/// The deadline includes thread scheduling and is never a readiness result.
+pub(crate) fn prepare_focused_application() -> Option<Instant> {
     let pid = unsafe { NSWorkspace::sharedWorkspace().frontmostApplication() }
         .map(|application| unsafe { objc2::msg_send![&*application, processIdentifier] });
-    dispatch_preparation(pid, request_preparation);
+    dispatch_preparation(pid, request_preparation).flatten()
 }
 
-fn dispatch_preparation(pid: Option<libc::pid_t>, request: impl FnOnce(libc::pid_t)) {
-    if let Some(pid) = pid.filter(|pid| *pid > 0) {
-        request(pid);
-    }
+fn dispatch_preparation<R>(
+    pid: Option<libc::pid_t>,
+    request: impl FnOnce(libc::pid_t) -> R,
+) -> Option<R> {
+    pid.filter(|pid| *pid > 0).map(request)
 }
 
-struct PreparationGuard<'a>(&'a AtomicBool);
+// System-wide AX messaging timeouts are process-global. Both runtime insertion
+// and this worker must hold this lease, including across begin-to-paste delay.
+// Acquisition never waits; the runtime retries its existing one-entry queue.
+pub(crate) struct AxProbeLease<'a>(&'a AtomicBool);
 
-impl<'a> PreparationGuard<'a> {
-    fn acquire(preparing: &'a AtomicBool) -> Option<Self> {
+impl<'a> AxProbeLease<'a> {
+    pub(crate) fn acquire(preparing: &'a AtomicBool) -> Option<Self> {
         preparing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
@@ -42,32 +48,36 @@ impl<'a> PreparationGuard<'a> {
     }
 }
 
-impl Drop for PreparationGuard<'_> {
+impl Drop for AxProbeLease<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
 }
 
-fn request_preparation(pid: libc::pid_t) {
-    let Some(guard) = PreparationGuard::acquire(&PREPARING) else {
-        return;
-    };
+pub(crate) fn try_acquire_insertion_probe() -> Option<AxProbeLease<'static>> {
+    AxProbeLease::acquire(&AX_PROBE_BUSY)
+}
+
+fn request_preparation(pid: libc::pid_t) -> Option<Instant> {
+    let guard = AxProbeLease::acquire(&AX_PROBE_BUSY)?;
+    let deadline = Instant::now() + PREPARATION_BUDGET;
     // AX IPC never holds the audio/menu run loop. Dropping the captured guard
     // clears single-flight state on success, panic, and failed thread creation.
-    let _ = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("accessibility-preparation".into())
         .spawn(move || {
             let _guard = guard;
-            let outcome = prepare_application(pid);
+            let outcome = prepare_application(pid, deadline);
             tracing::debug!(
                 lifecycle = "accessibility_preparation_finished",
                 outcome = outcome.diagnostic(),
             );
-        });
+        })
+        .ok()?;
+    Some(deadline)
 }
 
-fn prepare_application(pid: libc::pid_t) -> PreparationOutcome {
-    let deadline = Instant::now() + PREPARATION_BUDGET;
+fn prepare_application(pid: libc::pid_t, deadline: Instant) -> PreparationOutcome {
     let Some(root) = (unsafe { AxElement::from_created(AXUIElementCreateApplication(pid)) }) else {
         return PreparationOutcome::Unavailable;
     };
@@ -748,12 +758,12 @@ mod tests {
     #[test]
     fn singleflight_releases_on_return_unwind_and_rejected_spawn() {
         let busy = AtomicBool::new(false);
-        let guard = PreparationGuard::acquire(&busy).unwrap();
-        assert!(PreparationGuard::acquire(&busy).is_none());
+        let guard = AxProbeLease::acquire(&busy).unwrap();
+        assert!(AxProbeLease::acquire(&busy).is_none());
         drop(guard);
         assert!(!busy.load(Ordering::Acquire));
         let panic = std::panic::catch_unwind(|| {
-            let _guard = PreparationGuard::acquire(&busy).unwrap();
+            let _guard = AxProbeLease::acquire(&busy).unwrap();
             panic!("simulated worker panic");
         });
         assert!(panic.is_err());
@@ -761,13 +771,13 @@ mod tests {
         fn failed_spawn(_work: impl FnOnce()) -> std::io::Result<()> {
             Err(std::io::Error::other("simulated thread creation failure"))
         }
-        let guard = PreparationGuard::acquire(&busy).unwrap();
+        let guard = AxProbeLease::acquire(&busy).unwrap();
         assert!(failed_spawn(move || {
             let _guard = guard;
         })
         .is_err());
         assert!(!busy.load(Ordering::Acquire));
-        assert!(PreparationGuard::acquire(&busy).is_some());
+        assert!(AxProbeLease::acquire(&busy).is_some());
     }
 
     #[test]

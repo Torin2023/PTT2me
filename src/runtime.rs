@@ -62,6 +62,7 @@ use crate::updater_runtime::{
 };
 
 const PERMISSION_POLL_MS: u64 = 1_000;
+const INSERTION_PROBE_RETRY_MS: u64 = 10;
 const SMOKE_MODEL_TIMEOUT: Duration = Duration::from_secs(180);
 const SMOKE_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SMOKE_TIMEOUT_EXIT_CODE: i32 = 124;
@@ -449,6 +450,7 @@ enum TimerKind {
     PollPermissions,
     FinishCapture,
     CaptureLimit,
+    RetryInsertion,
     PasteCommand(u64),
     RestorePasteboard(u64),
     ResetError,
@@ -471,6 +473,61 @@ impl PasteInsertion for PendingTextInsertion {
 
     fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {
         PendingTextInsertion::restore_after_paste_failure(self, primary)
+    }
+}
+
+// The lease covers both fresh AX security probes. Clipboard restoration does
+// not use AX, so the lease is released as soon as paste has returned.
+struct ProbeLeasedInsertion<I, G> {
+    insertion: I,
+    lease: Option<G>,
+}
+
+type LeasedTextInsertion = ProbeLeasedInsertion<
+    PendingTextInsertion,
+    crate::accessibility_preparation::AxProbeLease<'static>,
+>;
+
+impl<I, G> ProbeLeasedInsertion<I, G> {
+    fn new(insertion: I, lease: G) -> Self {
+        Self {
+            insertion,
+            lease: Some(lease),
+        }
+    }
+}
+
+impl<I: PasteInsertion, G> PasteInsertion for ProbeLeasedInsertion<I, G> {
+    fn paste(&mut self) -> Result<(), InsertError> {
+        let result = self.insertion.paste();
+        self.lease.take();
+        result
+    }
+
+    fn restore(&mut self) -> Result<(), InsertError> {
+        let result = self.insertion.restore();
+        self.lease.take();
+        result
+    }
+
+    fn restore_after_paste_failure(&mut self, primary: InsertError) -> InsertError {
+        let result = self.insertion.restore_after_paste_failure(primary);
+        self.lease.take();
+        result
+    }
+}
+
+enum ProbeAdmission<G> {
+    Idle,
+    Retry,
+    TimedOut(u64),
+    Ready(QueuedInsertion, G),
+}
+
+fn remember_preparation_deadline(current: &mut Option<Instant>, started: Option<Instant>) {
+    // A rejected second capture request must retain the first worker's bound.
+    if let Some(deadline) = started {
+        *current = Some(deadline);
     }
 }
 
@@ -611,6 +668,28 @@ impl InsertionQueue {
                 || *status != AppStatus::Recognizing
         }) {
             self.0 = None;
+        }
+    }
+
+    fn take_with_probe<G>(
+        &mut self,
+        paste_pending: bool,
+        preparation_deadline: Option<Instant>,
+        now: Instant,
+        acquire: impl FnOnce() -> Option<G>,
+    ) -> ProbeAdmission<G> {
+        if paste_pending || self.0.is_none() {
+            return ProbeAdmission::Idle;
+        }
+        if let Some(lease) = acquire() {
+            return ProbeAdmission::Ready(self.take_if_unblocked(false).unwrap(), lease);
+        }
+        // Never start AX while preparation owns the global timeout. A stalled
+        // OS call must not keep recognized text pending beyond its deadline.
+        if preparation_deadline.is_none_or(|deadline| now >= deadline) {
+            ProbeAdmission::TimedOut(self.take_if_unblocked(false).unwrap().generation)
+        } else {
+            ProbeAdmission::Retry
         }
     }
 
@@ -1016,8 +1095,9 @@ pub struct Runtime {
     capture_limit_timer: Option<ScheduledTimer>,
     insertion_timer: Option<ScheduledTimer>,
     error_timer: Option<ScheduledTimer>,
-    pending_insertion: Option<PasteFlow<PendingTextInsertion>>,
+    pending_insertion: Option<PasteFlow<LeasedTextInsertion>>,
     insertion_queue: InsertionQueue,
+    accessibility_preparation_deadline: Option<Instant>,
     applied_permissions: PermissionSnapshot,
     microphone_permissions: MicrophonePermissionRuntime,
     tap_needs_retry: bool,
@@ -1172,6 +1252,7 @@ impl Runtime {
             error_timer: None,
             pending_insertion: None,
             insertion_queue: InsertionQueue::default(),
+            accessibility_preparation_deadline: None,
             applied_permissions: PermissionSnapshot::default(),
             microphone_permissions: MicrophonePermissionRuntime::default(),
             tap_needs_retry: false,
@@ -1229,6 +1310,7 @@ impl Runtime {
             TimerKind::CaptureLimit => {
                 self.dispatch(AppEvent::CaptureLimitReached);
             }
+            TimerKind::RetryInsertion => self.drain_insertion_queue(),
             TimerKind::PasteCommand(_) | TimerKind::RestorePasteboard(_) => {
                 self.advance_pending_paste(kind);
             }
@@ -2070,7 +2152,10 @@ impl Runtime {
                 self.dictation_capture.begin();
                 match capture_start_result_event(self.recorder.start(), &self.hotkey_control) {
                     Ok(()) => {
-                        crate::accessibility_preparation::prepare_focused_application();
+                        remember_preparation_deadline(
+                            &mut self.accessibility_preparation_deadline,
+                            crate::accessibility_preparation::prepare_focused_application(),
+                        );
                         self.replace_capture_limit_timer(MAX_CAPTURE_MS);
                         tracing::debug!(lifecycle = "capture_started");
                     }
@@ -2238,12 +2323,43 @@ impl Runtime {
         if self.asr_shutdown.started.is_some() {
             return;
         }
-        let Some(queued) = self
-            .insertion_queue
-            .take_if_unblocked(self.pending_insertion.is_some())
-        else {
-            return;
+        let now = Instant::now();
+        let (queued, probe_lease) = match self.insertion_queue.take_with_probe(
+            self.pending_insertion.is_some(),
+            self.accessibility_preparation_deadline,
+            now,
+            crate::accessibility_preparation::try_acquire_insertion_probe,
+        ) {
+            ProbeAdmission::Idle => return,
+            ProbeAdmission::Retry => {
+                // Existing one-entry queue remains untouched. Never wait for AX
+                // on the main loop or start a second clipboard transaction.
+                let remaining_ms = self
+                    .accessibility_preparation_deadline
+                    .unwrap()
+                    .saturating_duration_since(now)
+                    .as_millis();
+                self.replace_insertion_timer(
+                    TimerKind::RetryInsertion,
+                    remaining_ms.clamp(1, u128::from(INSERTION_PROBE_RETRY_MS)) as u64,
+                );
+                return;
+            }
+            ProbeAdmission::TimedOut(generation) => {
+                cancel_timer(&self.run_loop, &mut self.insertion_timer);
+                self.handle_paste_outcome(
+                    generation,
+                    PasteOutcome::PasteFailed(InsertError::accessibility(
+                        "preparation_busy_timeout",
+                        None,
+                        None,
+                    )),
+                );
+                return;
+            }
+            ProbeAdmission::Ready(queued, lease) => (queued, lease),
         };
+        self.accessibility_preparation_deadline = None;
         let started = Instant::now();
         let insertion = text_inserter::begin(&queued.text, queued.append_space);
         performance_diagnostics::log(
@@ -2253,11 +2369,13 @@ impl Runtime {
         );
         match insertion {
             Ok(insertion) => {
+                let insertion = ProbeLeasedInsertion::new(insertion, probe_lease);
                 let flow = PasteFlow::begin(queued.generation, insertion, self);
                 self.pending_insertion = Some(flow);
                 self.render_updater_menu();
             }
             Err(error) => {
+                drop(probe_lease);
                 self.handle_paste_outcome(queued.generation, PasteOutcome::PasteFailed(error))
             }
         }
@@ -2577,7 +2695,7 @@ mod tests {
     use std::fs;
     use std::rc::Rc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         apply_output_menu_command, capture_start_result_event, milliseconds_to_seconds,
@@ -4016,6 +4134,195 @@ mod tests {
             controller.handle(AppEvent::TriggerPressed),
             vec![Effect::StartCapture]
         );
+    }
+    #[test]
+    fn insertion_waits_for_preparation_without_consuming_or_expanding_the_queue() {
+        use crate::accessibility_preparation::AxProbeLease;
+        use std::sync::atomic::AtomicBool;
+        let busy = AtomicBool::new(false);
+        let preparation = AxProbeLease::acquire(&busy).unwrap();
+        let now = Instant::now();
+        let mut queue = super::InsertionQueue::default();
+        assert!(queue.park(super::QueuedInsertion {
+            generation: 7,
+            text: "draft".into(),
+            append_space: false
+        }));
+        for _ in 0..3 {
+            assert!(matches!(
+                queue.take_with_probe(false, Some(now + Duration::from_millis(500)), now, || {
+                    AxProbeLease::acquire(&busy)
+                }),
+                super::ProbeAdmission::Retry
+            ));
+            assert_eq!(queue.0.as_ref().unwrap().generation, 7);
+            assert!(!queue.park(super::QueuedInsertion {
+                generation: 8,
+                text: "other".into(),
+                append_space: true
+            }));
+        }
+        drop(preparation);
+        let super::ProbeAdmission::Ready(queued, lease) =
+            queue.take_with_probe(false, Some(now), now, || AxProbeLease::acquire(&busy))
+        else {
+            panic!("completed preparation must allow a fresh insertion")
+        };
+        assert_eq!(queued.text, "draft");
+        assert!(!queued.append_space);
+        let mut timers = TestPasteTimers::default();
+        let mut flow = PasteFlow::begin(
+            queued.generation,
+            super::ProbeLeasedInsertion::new(synthetic_insertion(), lease),
+            &mut timers,
+        );
+        assert!(
+            AxProbeLease::acquire(&busy).is_none(),
+            "new preparation must be blocked until paste finishes"
+        );
+        assert!(matches!(
+            flow.handle_timer(TimerKind::PasteCommand(7), &mut timers),
+            Some(super::PasteOutcome::Delivered)
+        ));
+        assert!(
+            AxProbeLease::acquire(&busy).is_some(),
+            "restore-only phase does not need AX lease"
+        );
+        assert!(queue.0.is_none());
+    }
+
+    #[test]
+    fn preparation_deadline_expires_without_beginning_insertion() {
+        let now = Instant::now();
+        for deadline in [None, Some(now), Some(now - Duration::from_millis(1))] {
+            let mut queue = super::InsertionQueue::default();
+            assert!(queue.park(super::QueuedInsertion {
+                generation: 11,
+                text: "draft".into(),
+                append_space: false
+            }));
+            assert!(matches!(
+                queue.take_with_probe(false, deadline, now, || None::<()>),
+                super::ProbeAdmission::TimedOut(11)
+            ));
+            assert!(queue.0.is_none());
+            assert!(matches!(
+                queue.take_with_probe(false, deadline, now, || -> Option<()> {
+                    panic!("empty queue must not acquire")
+                }),
+                super::ProbeAdmission::Idle
+            ));
+        }
+    }
+
+    #[test]
+    fn next_capture_keeps_the_active_preparations_original_deadline() {
+        use crate::accessibility_preparation::AxProbeLease;
+        use std::sync::atomic::AtomicBool;
+        let busy = AtomicBool::new(false);
+        let preparation = AxProbeLease::acquire(&busy).unwrap();
+        let now = Instant::now();
+        let original_deadline = now + Duration::from_millis(20);
+        let mut deadline = Some(original_deadline);
+        let second_request = AxProbeLease::acquire(&busy).map(|_| now + Duration::from_millis(500));
+        super::remember_preparation_deadline(&mut deadline, second_request);
+        let mut queue = super::InsertionQueue::default();
+        assert!(queue.park(super::QueuedInsertion {
+            generation: 2,
+            text: "second capture".into(),
+            append_space: false
+        }));
+        assert!(matches!(
+            queue.take_with_probe(false, deadline, now, || AxProbeLease::acquire(&busy)),
+            super::ProbeAdmission::Retry
+        ));
+        assert_eq!(deadline, Some(original_deadline));
+        assert!(matches!(
+            queue.take_with_probe(
+                false,
+                deadline,
+                original_deadline,
+                || AxProbeLease::acquire(&busy)
+            ),
+            super::ProbeAdmission::TimedOut(2)
+        ));
+        drop(preparation);
+    }
+
+    #[test]
+    fn preparation_retry_respects_cancelled_generation_and_existing_paste() {
+        let now = Instant::now();
+        let mut capture = inserting_capture();
+        let mut queue = super::InsertionQueue::default();
+        assert!(queue.park(super::QueuedInsertion {
+            generation: capture.generation,
+            text: "draft".into(),
+            append_space: false
+        }));
+        assert!(matches!(
+            queue.take_with_probe(true, Some(now), now, || -> Option<()> {
+                panic!("pending paste must retain its lease and timer")
+            }),
+            super::ProbeAdmission::Idle
+        ));
+        assert!(queue.0.is_some());
+        assert!(matches!(
+            queue.take_with_probe(
+                false,
+                Some(now + Duration::from_millis(500)),
+                now,
+                || None::<()>
+            ),
+            super::ProbeAdmission::Retry
+        ));
+        capture.abandon();
+        queue.discard_unless_current(&capture, &AppStatus::Recognizing);
+        assert!(matches!(
+            queue.take_with_probe(false, Some(now), now, || -> Option<()> {
+                panic!("cancelled generation must never begin insertion")
+            }),
+            super::ProbeAdmission::Idle
+        ));
+        assert!(queue.0.is_none());
+    }
+
+    #[test]
+    fn insertion_lease_is_retained_until_failure_shutdown_or_unwind() {
+        use crate::accessibility_preparation::AxProbeLease;
+        use std::sync::atomic::AtomicBool;
+        for fail_paste in [false, true] {
+            let busy = AtomicBool::new(false);
+            let lease = AxProbeLease::acquire(&busy).unwrap();
+            let mut insertion = synthetic_insertion();
+            if fail_paste {
+                insertion.paste_error = Some(InsertError::KeyboardEvent);
+            }
+            let mut timers = TestPasteTimers::default();
+            let mut flow = PasteFlow::begin(
+                1,
+                super::ProbeLeasedInsertion::new(insertion, lease),
+                &mut timers,
+            );
+            assert!(AxProbeLease::acquire(&busy).is_none());
+            if fail_paste {
+                assert!(matches!(
+                    flow.handle_timer(TimerKind::PasteCommand(1), &mut timers),
+                    Some(super::PasteOutcome::PasteFailed(_))
+                ));
+            } else {
+                assert!(flow.restore_on_shutdown().is_ok());
+            }
+            assert!(AxProbeLease::acquire(&busy).is_some());
+        }
+        let busy = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(|| {
+            let lease = AxProbeLease::acquire(&busy).unwrap();
+            let _insertion = super::ProbeLeasedInsertion::new(synthetic_insertion(), lease);
+            assert!(AxProbeLease::acquire(&busy).is_none());
+            panic!("simulated insertion unwind");
+        });
+        assert!(result.is_err());
+        assert!(AxProbeLease::acquire(&busy).is_some());
     }
 }
 
