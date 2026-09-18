@@ -83,6 +83,7 @@ fn is_supported_chromium_app(identifier: &str) -> bool {
             | "com.google.Chrome.dev"
             | "com.google.Chrome.canary"
             | "com.openai.codex"
+            | "ru.yandex.desktop.yandex-browser"
     )
 }
 
@@ -212,6 +213,7 @@ mod tests {
             "com.google.Chrome.dev",
             "com.google.Chrome.canary",
             "com.openai.codex",
+            "ru.yandex.desktop.yandex-browser",
         ] {
             let mut requested = false;
 
