@@ -14,7 +14,7 @@ The previous pasteboard is restored unless newer contents appeared meanwhile.
 - Apple Silicon (`arm64`) Mac
 - macOS 13 Ventura or newer
 
-The current published version is Preview 1.3.0. The Full download, signed
+The current published version is Preview 1.3.1. The Full download, signed
 update channel, and menu snapshot below describe this version.
 
 ## Cloud development without Codespaces
@@ -97,7 +97,7 @@ The menu contains the trigger controls:
 
 ```text
 <status>
-PTT2me 1.3.0
+PTT2me 1.3.1
 Проверить обновления…
 Открыть настройки…   (only while a required permission is missing)
 Клавиша активации
@@ -113,7 +113,7 @@ PTT2me 1.3.0
 Выйти
 ```
 
-This menu snapshot describes the currently published Preview 1.3.0. The
+This menu snapshot describes the currently published Preview 1.3.1. The
 updater action changes when a signed release is available or downloaded.
 
 The status and version rows are informational. While a permission is missing,
@@ -138,29 +138,35 @@ punctuation is never added, removed, or rewritten by PTT2me.
 
 ## Published release
 
-The current public download is the Preview 1.3.0 Full DMG:
-[PTT2me-1.3.0-full-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.3.0/PTT2me-1.3.0-full-macos-arm64.dmg)
-(183,592,899 bytes / 175.1 MiB, SHA-256
-`36c374264e924537faa0d3fbb74dd5abf98ab808d2d3aa7f27a970e79566b363`).
-See the [v1.3.0 release page](https://github.com/Torin2023/PTT2me/releases/tag/v1.3.0)
+The current public download is the Preview 1.3.1 Full DMG:
+[PTT2me-1.3.1-full-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.3.1/PTT2me-1.3.1-full-macos-arm64.dmg)
+(183,583,909 bytes / 175.1 MiB, SHA-256
+`d29292f210997c4c2f6da90519b3b1fb01fa63d4009bcbf14e4d5083c0cf78cd`).
+See the [v1.3.1 release page](https://github.com/Torin2023/PTT2me/releases/tag/v1.3.1)
 for the model-free Update DMG and checksum files.
 
-Compared with 1.2.1, the model-free app is 49.04% smaller and the Update DMG
-is 48.62% smaller (11,360,157 bytes / 10.8 MiB). Audio preparation runs away
-from the menu thread; recognition uses one supervised child with bounded
-recovery. Clipboard and Accessibility work is bounded, and verified installer
-cache retention prevents old downloads from accumulating. The fixed model and
-recognition thread policy are unchanged.
+Version 1.3.1 prepares Accessibility metadata for the frontmost application
+by PID, without an app allowlist. A single bounded worker performs metadata
+checks and a limited tree traversal; preparation and fresh insertion security
+probes share exclusive access to the process-wide AX timeout. Fresh focus and
+secure-field checks, clipboard ownership/restoration, and PTT semantics remain
+in place. The fixed model is unchanged. The model-free Update DMG is
+11,356,380 bytes / 10.8 MiB.
 
-Automated Rust/macOS, AppKit/WebKit fixture (12/12), native recognition and
-worker recovery, signature, bundle, and Full/Update DMG checks passed on the
-exact source commit `05ad255ad3392631846aa5c40a08addc28ffdd5e`.
-The Manual P0 gate remains incomplete: physical hotkey/TCC workflows and actual
-ChatGPT insertion have not been confirmed. This preview is published following
-the owner's explicit publication instruction with those limits disclosed;
-unperformed checks are not reported as passed. The ChatGPT compatibility fix
-is included, but resolution in the actual app is still unverified.
-This build is ad-hoc signed and is not Apple-notarized.
+The locked TLS dependency rustls is updated to 0.23.45 to fix
+[RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285).
+Its required rustls-webpki dependency is updated to 0.103.15.
+
+Automated Rust/macOS tests (488), shell contracts, fresh-database RustSec audit,
+AppKit/WebKit fixture build-only, model initialization smoke, signature,
+bundle, and Full/Update DMG checks passed for source commit
+`16f2b1b68801f7b06b153aeb28fec7ed67ffd818` (build `202609181910`).
+The fixture was not executed. The Manual P0 gate remains unverified: physical
+hotkey/TCC workflows, real audio/recognition, and insertion in Chrome, Yandex,
+ChatGPT/Codex, unknown apps, or embedded browsers were not manually checked
+for this candidate. PID-based preparation is not a compatibility guarantee;
+unperformed checks are not reported as passed. This is an unsigned preview:
+the app is ad-hoc signed and is not Apple-notarized.
 
 ## Build
 
@@ -227,7 +233,7 @@ use Full only. Update is selected only inside an already installed PTT2me.
 The release coordinator requires an explicit stable version, 12-digit UTC
 build, exact clean `HEAD`, model source, committed model manifest, publication
 timestamp, and matching key pair. The private signing key must remain outside
-Git. The currently published stable package version is exactly 1.3.0.
+Git. The currently published stable package version is exactly 1.3.1.
 
 ### Reproducible release gates
 
@@ -293,11 +299,11 @@ preservation through the production insertion modules. CI builds the fixture;
 execution requires a macOS GUI session with Accessibility and event-posting
 access. The manual P0 checklist also includes a short ChatGPT draft check.
 
-## Updating (PTT2me 1.3.0)
+## Updating (PTT2me 1.3.1)
 
 Preview 1.0.5 cannot discover this release. Versions 1.1.0 and 1.1.1 can check
 the signed stable channel, but their updater cannot download the build that
-contains its fix. Replace any of these versions once with the published 1.3.0
+contains its fix. Replace any of these versions once with the published 1.3.1
 Full DMG. Starting with 1.1.2, PTT2me can download subsequent signed updates
 through the flow described below.
 
