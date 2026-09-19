@@ -120,7 +120,7 @@ test("documents the published 1.3.1 recovery update flow", async () => {
   assert.doesNotMatch(html, /application_update/);
   assert.match(html, /Скачать PTT2me 1\.3\.1/);
   assert.match(html, /Версии начиная с 1\.1\.2 могут загрузить 1\.3\.1/);
-  assert.match(html, /Полный набор ручных проверок[\s\S]*не завершён/);
+  assert.match(html, /Ручные проверки Manual P0 пропущены по явному разрешению владельца[\s\S]*от 19 сентября 2026 года \(SKIPPED, не PASS\)/);
   assert.match(html, /без[\s\S]*нотариализации Apple/);
   assert.match(html, /175,1 МиБ/);
   assert.match(html, /подготовка вставки больше не[\s\S]*ограничена списком приложений/);

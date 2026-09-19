@@ -161,7 +161,8 @@ Automated Rust/macOS tests (488), shell contracts, fresh-database RustSec audit,
 AppKit/WebKit fixture build-only, model initialization smoke, signature,
 bundle, and Full/Update DMG checks passed for source commit
 `16f2b1b68801f7b06b153aeb28fec7ed67ffd818` (build `202609181910`).
-The fixture was not executed. The Manual P0 gate remains unverified: physical
+The fixture was not executed. Manual P0 is **SKIPPED by explicit owner
+authorization on 2026-09-19** for this unsigned preview, not PASS. Physical
 hotkey/TCC workflows, real audio/recognition, and insertion in Chrome, Yandex,
 ChatGPT/Codex, unknown apps, or embedded browsers were not manually checked
 for this candidate. PID-based preparation is not a compatibility guarantee;
