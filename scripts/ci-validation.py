@@ -89,8 +89,8 @@ def changed_scopes(base, head, force=False, event_name=None):
         return {"rust", "site"}
     selected = set().union(*(scopes(path) for path in paths))
     # Only hand site checks to Pages when its push path filter is known to
-    # match. GitHub limits those filters to 300 files; larger diffs stay here.
-    if (event_name == "push" and len(paths) <= 300
+    # match. GitHub limits those filters to 3,000 files; larger diffs stay here.
+    if (event_name == "push" and len(paths) <= 3000
             and any(fnmatch.fnmatchcase(path, pattern) for path in paths for pattern in PAGES_PATHS)):
         selected.discard("site")
     return selected

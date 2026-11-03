@@ -27,7 +27,8 @@ class ScopeTests(unittest.TestCase):
                  (["unknown-input"], {"rust", "site"}),
                  (["site/app/page.tsx", ".github/workflows/ci.yml"], {"rust"}),
                  (["README.md"], set()),
-                 ([f"site/{i}.tsx" for i in range(301)], {"site"}),
+                 ([f"site/{i}.tsx" for i in range(3000)], set()),
+                 ([f"site/{i}.tsx" for i in range(3001)], {"site"}),
                  (None, {"rust", "site"}))
         for paths, expected in cases:
             with self.subTest(paths=paths), patch.object(ci, "changed_paths", return_value=paths):
