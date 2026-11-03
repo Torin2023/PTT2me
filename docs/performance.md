@@ -45,7 +45,7 @@ JSON and corpus audio outside Git. The tool emits no transcript, audio sample,
 input path, or recognized-output digest.
 
 An actual measurement fails closed unless the build command embeds a source
-commit, dirty state, and compiler identity. Schema 2 records those compile-time
+commit, dirty state, and compiler identity. Schema 3 records those compile-time
 values under `provenance.build`, plus the SHA-256 and size of the executable
 opened by the benchmark process under `provenance.executable`. The separate
 `provenance.runtime_checkout` and `environment.runtime_rustc` fields describe
@@ -57,10 +57,61 @@ a non-symlink regular file, bounded to the production capture allowance,
 checked against its declared SHA-256, and decoded only if it is mono 16 kHz
 PCM16. Warmups are limited to 1..=3 and measured repeats to 1..=20.
 
-Schema 2 labels each configuration wall and CPU interval as recognizer load,
+Schema 3 labels each configuration wall and CPU interval as recognizer load,
 warmups, measured transcriptions, and the per-case quantile/RTF report
 bookkeeping through the final resource snapshot. Per-case transcription
 latencies remain timed around the recognizer call itself.
+
+## Recognition accuracy and fixed Russian corpus
+
+Schema 3 adds per-case and aggregate WER/CER, reference lengths, edit counts and
+the SHA-256 of the exact corpus manifest. `reference` is now a required string
+with at most 2,048 Unicode characters and a non-empty normalized form. Recognized
+text has the same scoring limit. Both remain in memory only. Public case IDs
+and source labels are report metadata; do not put private information in them.
+
+Normalization `ru-lower-yo-alnum-v1` lowercases Unicode characters, maps `ё` to
+`е`, replaces every non-alphanumeric character with a separator, and splits on
+whitespace. Inputs should use composed Unicode spelling. Digits are kept as
+digits, not expanded to words. Hyphens split words. CER counts Unicode scalar
+values after removing separators, not UTF-8 bytes. Levenshtein edits include
+substitution, deletion and insertion. Corpus rates divide total edits by total
+reference length; they are not an average of sentence rates and can exceed 1.
+
+Accuracy uses the first measured output per case/configuration; timing excludes
+scoring. Exact output comparison separately covers all warmups, repeats and
+configurations. `PASS` means a completed, repeatable measurement, not zero WER
+or a universal quality threshold. A changing output makes the run `FAIL` even
+when its reported first-output WER is low.
+
+The reproducible public subset uses [Google FLEURS](https://huggingface.co/datasets/google/fleurs),
+Conneau et al. (2022), Russian `ru_ru/test`, under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). It contains the first
+16 distinct sentence IDs with durations from 1 to 25 seconds in a pinned TSV,
+using the first eligible recording of each sentence. Selection is independent
+of recognition results. This is a small read-speech regression sample, not an
+estimate of real microphone dictation quality across speakers or noise levels.
+
+Download the two public inputs explicitly into a directory outside Git:
+
+```bash
+PTT2ME_CORPUS_ROOT=/path/to/asr-evidence
+PTT2ME_FLEURS_BASE=https://huggingface.co/datasets/google/fleurs/resolve/70bb2e84b976b7e960aa89f1c648e09c59f894dd/data/ru_ru
+curl --fail --location --proto '=https' --output "$PTT2ME_CORPUS_ROOT/test.tsv" "$PTT2ME_FLEURS_BASE/test.tsv"
+curl --fail --location --proto '=https' --output "$PTT2ME_CORPUS_ROOT/test.tar.gz" "$PTT2ME_FLEURS_BASE/audio/test.tar.gz"
+python3 scripts/prepare-fleurs-corpus.py \
+  --archive "$PTT2ME_CORPUS_ROOT/test.tar.gz" \
+  --tsv "$PTT2ME_CORPUS_ROOT/test.tsv" \
+  --output "$PTT2ME_CORPUS_ROOT/fleurs-ru-16"
+```
+
+The offline preparer checks pinned SHA-256 values, reads only selected regular
+archive members without extracting paths, and uses macOS `afconvert` to make
+PCM16 WAV files without trimming or normalizing. It refuses an existing output
+directory. The resulting `manifest.json` goes to `--corpus`; `provenance.json`
+retains attribution, source revision and selection policy. The source archive
+is about 433 MB; generated recordings/references remain outside Git. CI tests
+the scoring and input boundaries without downloading audio or models.
 
 ## Recorded result
 

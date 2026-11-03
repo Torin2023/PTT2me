@@ -59,7 +59,7 @@ To run the focused checks on an Apple Silicon Mac:
 cargo test --features test-support audio:: -- --test-threads=1
 ```
 
-## Recognition comparison before release
+## Automated recognition comparison
 
 Signal tests establish cleaner conversion, not a measured improvement in
 GigaAM word error rate (WER). Use the same consented recordings and fixed
@@ -72,19 +72,22 @@ model/decoder configuration for the old and new conversion paths:
 2. Transcribe every recording with both paths. Apply the same documented text
    normalization to reference and hypothesis (case, punctuation, numbers and
    `ё`/`е`), then report corpus WER as `(substitutions + deletions + insertions)
-   / reference words`, along with counts and per-condition results. Keep raw
-   hypotheses so a lower average cannot hide lost endings or damaged names.
-3. Listen to converted samples around both endpoints and loud transients.
-   Check there are no missing syllables, clipping artifacts or audible clicks.
+   / reference words`, along with counts and per-condition results. The bounded
+   [benchmark](performance.md) computes WER/CER in memory and emits counts only;
+   per-case results prevent an aggregate from hiding a regression in one case.
+3. Use the automated endpoint, impulse and mixed-tone tests above for conversion
+   regressions. These do not establish perceived audio quality.
 4. Measure conversion and end-to-text latency in an optimized build for 1-,
    10- and 25-second recordings at 44.1/48/96 kHz. After AppKit stops and drops
    the stream, bounded audio preparation and conversion run in a background
-   worker. Verify menu responsiveness and cancellation of stale preparation on
-   the slowest supported Mac before release.
+   worker. Existing automatic cancellation/FIFO tests cover stale preparation;
+   measurements on one Mac do not establish responsiveness on every supported Mac.
 5. Record the tested commit, model, microphones, corpus size, WER counts and
    latency distribution. Investigate regressions by recording/condition before
    claiming a recognition-quality improvement.
 
 No speech recordings, model assets, or recognized user text are logged or
-committed by this change. Manual listening, WER and latency results must be
-reported separately from automated macOS test results.
+committed by this change. Public licensed read-speech measurements, synthetic
+signal tests and native microphone coverage are reported separately. Manual
+testing is excluded from the release process. Missing microphone/noise/device
+coverage remains an explicit limitation, not a request for manual validation.

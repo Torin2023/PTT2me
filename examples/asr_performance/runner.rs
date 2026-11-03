@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use super::args::Arguments;
 use super::corpus;
+use super::quality::{self, Counts};
 use super::report::{
     self, BenchmarkReport, CasePerformance, ConfigurationReport, CorpusCaseReport, CorpusReport,
     CpuDelta, EqualityReport, MethodReport, ModelReport, Quantiles,
@@ -14,6 +15,7 @@ struct PreparedCase {
     duration_seconds: f64,
     preparation_ms: f64,
     samples: Vec<f32>,
+    reference: String,
 }
 
 pub(super) fn execute(arguments: Arguments) -> Result<(BenchmarkReport, File), String> {
@@ -28,8 +30,8 @@ pub(super) fn execute(arguments: Arguments) -> Result<(BenchmarkReport, File), S
         .map_err(|error| format!("model verification failed: {error}"))?;
     let verification_ms = milliseconds(verification_started.elapsed());
 
-    let mut prepared = Vec::with_capacity(corpus.len());
-    for case in corpus {
+    let mut prepared = Vec::with_capacity(corpus.cases.len());
+    for case in corpus.cases {
         let started = Instant::now();
         let samples = ptt2me::audio::prepare_samples_for_performance_measurement(
             case.samples,
@@ -42,6 +44,7 @@ pub(super) fn execute(arguments: Arguments) -> Result<(BenchmarkReport, File), S
             duration_seconds: case.duration_seconds,
             preparation_ms: milliseconds(started.elapsed()),
             samples,
+            reference: case.reference,
         });
     }
 
@@ -59,6 +62,7 @@ pub(super) fn execute(arguments: Arguments) -> Result<(BenchmarkReport, File), S
         let native_recognizer_load_ms = milliseconds(load_started.elapsed());
         let mut warmup_times = vec![Vec::new(); prepared.len()];
         let mut measured_times = vec![Vec::new(); prepared.len()];
+        let mut scores = vec![Counts::default(); prepared.len()];
 
         for _ in 0..arguments.warmups {
             transcribe_cases(
@@ -67,36 +71,44 @@ pub(super) fn execute(arguments: Arguments) -> Result<(BenchmarkReport, File), S
                 &mut warmup_times,
                 &mut canonical_outputs,
                 &mut equality,
-            );
+                None,
+            )?;
         }
-        for _ in 0..arguments.repeats {
+        for repeat in 0..arguments.repeats {
             transcribe_cases(
                 &mut recognizer,
                 &prepared,
                 &mut measured_times,
                 &mut canonical_outputs,
                 &mut equality,
-            );
+                (repeat == 0).then_some(scores.as_mut_slice()),
+            )?;
         }
 
-        let cases = case_reports(&prepared, &warmup_times, &measured_times);
+        let cases = case_reports(&prepared, &warmup_times, &measured_times, &scores);
+        let mut total = Counts::default();
+        for score in &scores {
+            total.add(score);
+        }
         let usage_after = report::usage_snapshot()?;
         configurations.push(ConfigurationReport {
             cpu_threads: threads,
             native_recognizer_load_ms,
             configuration_wall_ms: milliseconds(configuration_started.elapsed()),
-            configuration_wall_scope: "recognizer load, warmups, measured transcriptions, and per-case quantile/RTF report bookkeeping through the final resource snapshot",
+            configuration_wall_scope: "recognizer load, warmups, measured transcriptions, and quality scoring and per-case quantile/RTF report bookkeeping through the final resource snapshot",
             cpu_delta: CpuDelta {
                 user_ms: (usage_after.user_ms - usage_before.user_ms).max(0.0),
                 system_ms: (usage_after.system_ms - usage_before.system_ms).max(0.0),
-                scope: "delta for recognizer load, warmups, measured transcriptions, and per-case quantile/RTF report bookkeeping through the final resource snapshot",
+                scope: "delta for recognizer load, warmups, measured transcriptions, and quality scoring and per-case quantile/RTF report bookkeeping through the final resource snapshot",
             },
             cases,
+            quality: total.report(),
         });
     }
     let peak_rss = report::usage_snapshot()?.peak_rss_bytes;
     let status = if equality { "PASS" } else { "FAIL" };
     let corpus_report = CorpusReport {
+        manifest_sha256: corpus.manifest_sha256,
         cases: prepared
             .into_iter()
             .map(|case| CorpusCaseReport {
@@ -110,7 +122,7 @@ pub(super) fn execute(arguments: Arguments) -> Result<(BenchmarkReport, File), S
     };
     Ok((
         BenchmarkReport {
-            schema: 2,
+            schema: 3,
             status,
             benchmark: "ptt2me direct native ASR performance",
             ptt2me_version: env!("CARGO_PKG_VERSION"),
@@ -127,6 +139,8 @@ pub(super) fn execute(arguments: Arguments) -> Result<(BenchmarkReport, File), S
                 measured_repeats_per_case: arguments.repeats,
                 quantiles: "nearest-rank over measured repeats for each fixed case",
                 transport: "direct in-process recognizer; worker/process transport is not measured",
+                normalization: quality::NORMALIZATION,
+                quality_scope: "first measured output per case and CPU configuration; corpus rates use summed edit counts/reference lengths; CER excludes spaces; equality separately covers all warmups/repeats/configurations; scoring occurs outside transcription timing",
             },
             configurations,
             equality: EqualityReport {
@@ -137,7 +151,7 @@ pub(super) fn execute(arguments: Arguments) -> Result<(BenchmarkReport, File), S
             whole_process_peak_rss_scope: "ru_maxrss whole-process high-water mark; use one CPU configuration per invocation for an independent memory observation",
             privacy: "no transcript, audio sample, input path, or recognized-output digest is emitted",
             limitations: [
-                "synthetic corpus timing does not establish human recognition accuracy or WER",
+                "synthetic speech WER/CER do not establish human recognition accuracy",
                 "one machine does not establish cross-device performance",
                 "few repeats describe this run and do not estimate population tail latency",
             ],
@@ -152,7 +166,8 @@ fn transcribe_cases(
     times: &mut [Vec<f64>],
     canonical_outputs: &mut [Option<String>],
     equality: &mut bool,
-) {
+    mut scores: Option<&mut [Counts]>,
+) -> Result<(), String> {
     for (index, case) in prepared.iter().enumerate() {
         let started = Instant::now();
         let output = recognizer
@@ -160,14 +175,19 @@ fn transcribe_cases(
             .trim()
             .to_owned();
         times[index].push(milliseconds(started.elapsed()));
+        if let Some(scores) = scores.as_deref_mut() {
+            scores[index] = quality::score(&case.reference, &output)?;
+        }
         *equality &= observe_output(&mut canonical_outputs[index], output);
     }
+    Ok(())
 }
 
 fn case_reports(
     prepared: &[PreparedCase],
     warmup_times: &[Vec<f64>],
     measured_times: &[Vec<f64>],
+    scores: &[Counts],
 ) -> Vec<CasePerformance> {
     prepared
         .iter()
@@ -187,6 +207,7 @@ fn case_reports(
                     p50_rtf: nearest_rank(&rtf, 0.50),
                     p95_rtf: nearest_rank(&rtf, 0.95),
                 },
+                quality: scores[index].report(),
             }
         })
         .collect()
