@@ -42,7 +42,7 @@ body:
       options:
         - Только Linux cloud
         - macOS GitHub Actions
-        - Apple Silicon Mac и ручная проверка
+        - Автоматические проверки на Apple Silicon Mac
         - Release gate с model assets
     validations:
       required: true
@@ -51,7 +51,7 @@ body:
     id: verification
     attributes:
       label: Проверка
-      description: Какие автоматические и ручные проверки обязательны?
+      description: Какие автоматические проверки обязательны? Какие сценарии пока не покрыты автоматизацией? Ручное тестирование не является требованием релиза.
     validations:
       required: true
 

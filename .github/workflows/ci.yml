@@ -9,38 +9,130 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  scope:
+    name: Select affected checks
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      site: ${{ steps.scope.outputs.site }}
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Determine affected inputs
+        id: scope
+        run: python3 -B scripts/ci-validation.py scope
+
   quality:
     name: Format, test, lint, and audit
-    runs-on: macos-15
+    needs: scope
+    if: always()
+    runs-on: ${{ needs.scope.outputs.rust == 'true' && 'macos-15' || 'ubuntu-latest' }}
     timeout-minutes: 30
 
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Prepare repository toolchain
+      - name: Require a successful scope decision
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          RUST_AFFECTED: ${{ needs.scope.outputs.rust }}
+          SITE_SELECTED: ${{ needs.scope.outputs.site }}
+        run: |
+          test "$SCOPE_RESULT" = success
+          case "$RUST_AFFECTED:$SITE_SELECTED" in
+            true:true|true:false|false:true|false:false) ;;
+            *) echo "Missing or invalid check selection" >&2; exit 1 ;;
+          esac
+
+      - name: Check CI policy and release documentation
+        run: |
+          python3 -B -m unittest discover -s tests -p 'test_ci_validation.py'
+          bash tests/release_ci_contracts.sh
+          bash tests/release_documentation.sh
+
+      - name: Find reusable full validation
+        if: needs.scope.outputs.rust == 'true'
+        id: validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B scripts/ci-validation.py reuse
+
+      # cloud-setup already performs a strict audit after refreshing RustSec.
+      - name: Prepare repository toolchain and audit dependencies
+        if: needs.scope.outputs.rust == 'true' && steps.validation.outputs.reused != 'true'
         run: bash scripts/cloud-setup.sh
 
       - name: Check formatting
+        if: needs.scope.outputs.rust == 'true' && steps.validation.outputs.reused != 'true'
         run: cargo fmt --all -- --check
 
       - name: Run all tests
+        if: needs.scope.outputs.rust == 'true' && steps.validation.outputs.reused != 'true'
         run: cargo test --all-targets --features test-support -- --test-threads=1
 
       - name: Run shell contract tests
+        if: needs.scope.outputs.rust == 'true' && steps.validation.outputs.reused != 'true'
         run: bash scripts/test-shell-contracts.sh
 
       - name: Build AppKit and WebKit insertion fixture
+        if: needs.scope.outputs.rust == 'true' && steps.validation.outputs.reused != 'true'
         run: bash scripts/test-insertion-gui.sh --build-only
 
       - name: Deny Clippy warnings
+        if: needs.scope.outputs.rust == 'true' && steps.validation.outputs.reused != 'true'
         run: cargo clippy --all-targets --features test-support -- -D warnings
 
-      - name: Audit dependencies
-        run: cargo audit --no-fetch --deny warnings
+      - name: Record successful full validation
+        if: needs.scope.outputs.rust == 'true' && steps.validation.outputs.reused != 'true'
+        env:
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 -B scripts/ci-validation.py record
+
+      - name: Upload full validation evidence
+        if: needs.scope.outputs.rust == 'true' && steps.validation.outputs.reused != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-validation-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rust-validation/evidence.json
+          if-no-files-found: error
+          retention-days: 2
+
+      # Scope hands site checks to Pages only when that workflow will trigger.
+      - name: Select Node.js for site checks
+        if: needs.scope.outputs.site == 'true'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.13.0
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Build, test, lint, and export the affected site
+        if: needs.scope.outputs.site == 'true'
+        working-directory: site
+        env:
+          GITHUB_PAGES_BASE_PATH: /PTT2me
+          GITHUB_PAGES_ORIGIN: https://torin2023.github.io
+        run: |
+          npm ci
+          npm test
+          npm run lint
+          npm run export:pages
+
+      - name: Summarize selected checks
+        env:
+          RUST_AFFECTED: ${{ needs.scope.outputs.rust }}
+          SITE_SELECTED: ${{ needs.scope.outputs.site }}
+          RUST_REUSED: ${{ steps.validation.outputs.reused }}
+        run: |
+          printf 'Rust inputs affected: %s; full run reused: %s; site checks selected in CI: %s.\n' \
+            "$RUST_AFFECTED" "${RUST_REUSED:-not needed}" "$SITE_SELECTED" >> "$GITHUB_STEP_SUMMARY"

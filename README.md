@@ -194,10 +194,12 @@ and removes only `Contents/Resources/models`.
 
 ## Automated checks
 
-Pull requests and pushes to `main` run on an Apple Silicon macOS runner. The
-workflow checks formatting, runs all unit and integration tests (including the
-main-thread NSPasteboard round trip), denies Clippy warnings, and audits locked
-Rust dependencies:
+Every pull request and push to `main` reports the required
+`Format, test, lint, and audit` check. CI selects work from the changed inputs:
+documentation/release metadata uses lightweight policy checks; site changes
+run site checks; application, dependency, toolchain, model, key, test or workflow
+changes require the full Apple Silicon macOS gate. Unknown paths select the
+full gate. The complete commands remain available:
 
 ```bash
 bash scripts/test-shell-contracts.sh
@@ -206,6 +208,20 @@ cargo test --all-targets --features test-support -- --test-threads=1
 cargo clippy --all-targets --features test-support -- -D warnings
 cargo audit --no-fetch --deny warnings
 ```
+
+CI may reuse a successful full run for identical tracked application inputs,
+workflow/policy, macOS image and RustSec revision for at most 24 hours. It verifies
+the producer run, executed steps and evidence artifact; a cache hit alone is
+never sufficient. Missing or invalid evidence runs the full gate. A manual
+`workflow_dispatch` always forces all checks. See
+[`docs/release/AUTOMATED_RELEASE.md`](docs/release/AUTOMATED_RELEASE.md) for the
+selection table, provenance checks and limitations. `cloud-setup.sh` performs
+the fresh strict audit once; CI does not immediately repeat the same audit.
+
+Site PRs run build/tests, lint and export. On `main`, Pages owns those steps
+when its path filter matches; otherwise CI runs any selected site checks.
+Pages always retains the independent verification of the published signed
+record and DMGs. No application test result substitutes for delivery verification.
 
 These checks compile and test the program; they do not download or substitute
 an ASR model. Release builds consume the fixed GigaAM v3 RNNT files supplied
@@ -234,22 +250,14 @@ Git. The currently published stable package version is exactly 1.3.2.
 
 ### Reproducible release gates
 
-On a controlled Apple Silicon Mac, run the fail-closed preflight before the
-production builder. The model directory and private key are external release
-inputs; the scripts never download, generate, or replace them:
+On a controlled Apple Silicon Mac, run the production builder. It always calls
+the fail-closed `scripts/release-preflight.sh` internally; do not run the same
+preflight separately as another required step. Its standalone command remains
+available for diagnosing inputs before a build. The model directory and private
+key are external release inputs; the scripts never download, generate, or
+replace them:
 
 ```bash
-scripts/release-preflight.sh \
-  --version X.Y.Z \
-  --build YYYYMMDDHHMM \
-  --source-commit COMMIT \
-  --model-manifest models/manifests/gigaam-v3-rnnt-v1.json \
-  --model-source /absolute/path/to/gigaam-v3-rnnt \
-  --public-key updates/public-key.txt \
-  --private-key /absolute/path/outside/git/private-key.txt \
-  --published-at YYYY-MM-DDTHH:MM:SSZ \
-  --output-dir /absolute/path/to/empty-release-set
-
 scripts/build-release-artifacts.sh \
   --version X.Y.Z \
   --build YYYYMMDDHHMM \
@@ -262,11 +270,14 @@ scripts/build-release-artifacts.sh \
   --output-dir /absolute/path/to/empty-release-set
 ```
 
-The builder publishes exactly five no-overwrite outputs into the selected
-directory. Verify that closed set independently, without the private key or
-builder workspace:
+The builder writes exactly five no-overwrite outputs into the selected
+directory. Create the local tag for the exact binary source (do not move an
+existing tag), then verify that closed set once with the expected tag, without
+the private key or builder workspace:
 
 ```bash
+git tag vX.Y.Z COMMIT
+
 scripts/verify-release-artifacts.sh \
   --version X.Y.Z \
   --source-commit COMMIT \
@@ -276,28 +287,32 @@ scripts/verify-release-artifacts.sh \
   --update-checksum /absolute/path/to/release-set/PTT2me-X.Y.Z-update-macos-arm64.dmg.sha256 \
   --manifest /absolute/path/to/release-set/PTT2me-X.Y.Z-signed-update-manifest.json \
   --public-key updates/public-key.txt \
-  --model-manifest models/manifests/gigaam-v3-rnnt-v1.json
+  --model-manifest models/manifests/gigaam-v3-rnnt-v1.json \
+  --expected-tag vX.Y.Z
 ```
 
-This is the rehearsal form before the tag exists. Immediately before
-publication, repeat the same verifier command with `--expected-tag vX.Y.Z`; the
-tag must resolve to the signed source commit. Then complete a separate copy of
-[`docs/release/MANUAL_P0_CHECKLIST.md`](docs/release/MANUAL_P0_CHECKLIST.md)
-from the installed Full DMG. Filled checklists remain beside local release
-outputs and are not committed.
+The tag must resolve to the signed source commit. Retain the verifier result
+with the exact identity and hashes outside Git. Repeat it if artifacts,
+source/tag, key, model manifest, verifier or relevant environment change, or the
+previous result is incomplete. Documentation edits alone do not require another
+build or full verifier run. Public download/hash and Pages signature/tag/model
+checks still run at publication to verify the delivered bytes.
 
 The preflight, builder, and verifier do not publish GitHub Release or the Pages stable channel.
-Publication is a separate owner-authorized workflow after Gate A, Gate B,
-Gate C, and the manual P0 gate all pass.
-The [owner exception for Preview 1.3.2](docs/release/1.3.2-preview-exception.md)
-waives only that candidate's manual P0 publication requirement; the general
-release gate remains in effect for other releases.
+Publication is a separate owner-authorized workflow after the applicable CI,
+preflight/build and independent artifact verification pass. Manual testing is
+not a release or publication requirement; no manual P0 checklist or waiver is
+required. Follow the current
+[automated release process and coverage limits](docs/release/AUTOMATED_RELEASE.md).
+The [Preview 1.3.2 exception](docs/release/1.3.2-preview-exception.md) remains a
+historical record, not a requirement for future releases.
 
 The controlled [AppKit/WebKit insertion fixture](docs/testing/INSERTION_GUI.md)
 checks final field contents, focus changes, password rejection, and clipboard
 preservation through the production insertion modules. CI builds the fixture;
 execution requires a macOS GUI session with Accessibility and event-posting
-access. The manual P0 checklist also includes a short ChatGPT draft check.
+access. Executing it is an optional, separately scoped diagnostic, not a release
+gate. Build-only does not prove successful insertion into real applications.
 
 ## Updating (PTT2me 1.3.2)
 
