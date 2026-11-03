@@ -4,6 +4,13 @@ PTT2me defaults to two CPU threads. The Russian read-speech measurement below
 found lower latency with four threads on one Apple M5 at higher CPU cost.
 It supports an opt-in fast profile, not a universal default or an energy claim.
 
+In the next Preview, the menu `Распознавание` offers `Сбалансированный` (2)
+and `Быстрый (выше нагрузка)` (4). The selected value takes effect on the next
+application launch; the menu separately shows the active profile. Worker
+recovery during the current session retains that active profile. The model,
+decoder and audio conversion remain identical. An unsuccessful preference save
+is shown in the menu and does not change the running recognizer.
+
 ## Reproduce the measurement
 
 Build the benchmark from the locked dependencies on Apple Silicon macOS. It
