@@ -557,8 +557,8 @@ impl PasteOutcome {
             Self::Delivered if generation == capture.generation => {
                 Some(AppEvent::PasteFinished(Ok(())))
             }
-            Self::PasteFailed(_) if generation == capture.generation => {
-                Some(AppEvent::PasteFinished(Err("insert failed".to_owned())))
+            Self::PasteFailed(error) if generation == capture.generation => {
+                Some(AppEvent::PasteFinished(Err(*error)))
             }
             Self::Restored(Err(_))
                 if generation == capture.latest_started_generation
@@ -1782,6 +1782,9 @@ impl Runtime {
         self.menu.render_updater(
             self.updater.as_ref().map(SystemUpdaterLane::state),
             open_enabled,
+            self.updater
+                .as_ref()
+                .and_then(SystemUpdaterLane::last_open_failure),
         );
     }
 
@@ -3559,14 +3562,18 @@ mod tests {
         assert_eq!(timers.scheduled, [(30, TimerKind::PasteCommand(1))]);
         let mut controller = recognizing_controller();
         let mut capture = inserting_capture();
+        assert_eq!(
+            outcome.foreground_event(1, &capture),
+            Some(AppEvent::PasteFinished(Err(InsertError::KeyboardEvent)))
+        );
         apply_paste_outcome(&mut controller, &mut capture, 1, outcome);
-        assert!(matches!(
+        assert_eq!(
             controller.status(),
-            AppStatus::Error {
+            &AppStatus::Error {
+                message: "Не удалось отправить команду вставки. Повторите диктовку",
                 recoverable: true,
-                ..
             }
-        ));
+        );
     }
 
     #[test]

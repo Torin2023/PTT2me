@@ -686,6 +686,10 @@ impl<R: RawUpdateScheduleStore, C: UpdateClock> UpdaterLane<R, C> {
         self.updater.state()
     }
 
+    pub(crate) fn last_open_failure(&self) -> Option<UpdateFailure> {
+        self.updater.last_open_failure()
+    }
+
     pub(crate) fn launch(&mut self) -> Vec<UpdaterRuntimeEffect> {
         let now = self.clock.now();
         self.handle_event(UpdaterEvent::Launched {

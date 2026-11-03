@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 
 use crate::constants::{ERROR_VISIBLE_MS, RELEASE_GRACE_MS};
+use crate::diagnostics;
+use crate::inserter::InsertError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermissionKind {
@@ -84,7 +86,7 @@ pub enum AppEvent {
     AudioReady(Option<Vec<f32>>),
     RecognitionFinished(Result<String, String>),
     // Command-V completed; delayed clipboard restoration has its own event.
-    PasteFinished(Result<(), String>),
+    PasteFinished(Result<(), InsertError>),
     ClipboardRestoreFailed,
     ErrorTimerFired,
     EventTapLost,
@@ -227,8 +229,8 @@ impl AppController {
             AppEvent::PasteFinished(Ok(())) if self.status == AppStatus::Recognizing => {
                 self.enter_idle_state()
             }
-            AppEvent::PasteFinished(Err(_)) if self.status == AppStatus::Recognizing => {
-                self.show_recoverable_error("Не удалось вставить текст")
+            AppEvent::PasteFinished(Err(error)) if self.status == AppStatus::Recognizing => {
+                self.show_recoverable_error(diagnostics::insertion_message(error))
             }
             AppEvent::ClipboardRestoreFailed if self.status == AppStatus::Ready => self
                 .show_recoverable_error("Текст вставлен, но не удалось восстановить буфер обмена"),
@@ -578,18 +580,71 @@ mod tests {
     fn paste_failure_is_visible_then_resets() {
         let mut c = AppController::recognizing_for_test();
         assert_eq!(
-            c.handle(AppEvent::PasteFinished(Err("clipboard unavailable".into()))),
+            c.handle(AppEvent::PasteFinished(Err(InsertError::PasteboardWrite))),
             vec![Effect::ScheduleErrorReset { delay_ms: 3_000 }]
         );
         assert_eq!(
             c.status(),
             &AppStatus::Error {
-                message: "Не удалось вставить текст",
+                message: "Не удалось записать текст в буфер обмена",
                 recoverable: true,
             }
         );
         assert!(c.handle(AppEvent::ErrorTimerFired).is_empty());
         assert_eq!(c.status(), &AppStatus::Ready);
+    }
+
+    #[test]
+    fn insertion_diagnostics_reach_the_menu_without_private_text_or_native_details() {
+        let mut messages = std::collections::HashSet::new();
+        for error in [
+            InsertError::SecureField,
+            InsertError::PasteboardChanged,
+            InsertError::accessibility(
+                "private-window-title",
+                Some("/private/user/secret-file"),
+                Some(-25205),
+            ),
+        ] {
+            let mut controller = AppController::recognizing_for_test();
+            assert_eq!(
+                controller.handle(AppEvent::RecognitionFinished(Ok(
+                    "private-dictation-text".into()
+                ))),
+                vec![Effect::InsertText("private-dictation-text".into())]
+            );
+            assert_eq!(
+                controller.handle(AppEvent::PasteFinished(Err(error))),
+                vec![Effect::ScheduleErrorReset {
+                    delay_ms: ERROR_VISIBLE_MS
+                }]
+            );
+            let projection = crate::menu::MenuProjection::from_status(controller.status());
+            for private in [
+                "private-dictation-text",
+                "private-window-title",
+                "secret-file",
+                "/private/user",
+                "-25205",
+            ] {
+                assert!(!projection.title.contains(private));
+            }
+            assert!(messages.insert(projection.title));
+            assert!(matches!(
+                controller.status(),
+                AppStatus::Error {
+                    recoverable: true,
+                    ..
+                }
+            ));
+            assert!(controller.handle(AppEvent::ErrorTimerFired).is_empty());
+            assert_eq!(controller.status(), &AppStatus::Ready);
+            // A stale completion must not replace the next idle state.
+            assert!(controller
+                .handle(AppEvent::PasteFinished(Err(error)))
+                .is_empty());
+            assert_eq!(controller.status(), &AppStatus::Ready);
+        }
     }
 
     #[test]

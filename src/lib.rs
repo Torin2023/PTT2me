@@ -16,6 +16,7 @@ mod accessibility_preparation;
 pub mod audio;
 mod audio_task;
 pub mod constants;
+mod diagnostics;
 mod event_wake;
 pub mod hotkey;
 pub mod inserter;
