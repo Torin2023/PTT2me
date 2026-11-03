@@ -14,7 +14,7 @@ The previous pasteboard is restored unless newer contents appeared meanwhile.
 - Apple Silicon (`arm64`) Mac
 - macOS 13 Ventura or newer
 
-The current published version is Preview 1.3.1. The Full download, signed
+The current published version is Preview 1.3.2. The Full download, signed
 update channel, and menu snapshot below describe this version.
 
 ## Cloud development without Codespaces
@@ -97,7 +97,7 @@ The menu contains the trigger controls:
 
 ```text
 <status>
-PTT2me 1.3.1
+PTT2me 1.3.2
 Проверить обновления…
 Открыть настройки…   (only while a required permission is missing)
 Клавиша активации
@@ -113,7 +113,7 @@ PTT2me 1.3.1
 Выйти
 ```
 
-This menu snapshot describes the currently published Preview 1.3.1. The
+This menu snapshot describes the currently published Preview 1.3.2. The
 updater action changes when a signed release is available or downloaded.
 
 The status and version rows are informational. While a permission is missing,
@@ -138,36 +138,32 @@ punctuation is never added, removed, or rewritten by PTT2me.
 
 ## Published release
 
-The current public download is the Preview 1.3.1 Full DMG:
-[PTT2me-1.3.1-full-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.3.1/PTT2me-1.3.1-full-macos-arm64.dmg)
-(183,583,909 bytes / 175.1 MiB, SHA-256
-`d29292f210997c4c2f6da90519b3b1fb01fa63d4009bcbf14e4d5083c0cf78cd`).
-See the [v1.3.1 release page](https://github.com/Torin2023/PTT2me/releases/tag/v1.3.1)
+The current public download is the Preview 1.3.2 Full DMG:
+[PTT2me-1.3.2-full-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.3.2/PTT2me-1.3.2-full-macos-arm64.dmg)
+(183,587,123 bytes / 175.1 MiB, SHA-256
+`476cba2b3b505c4b1d12e3fcaea0004c901b680072702147dd05e0afb2c566fb`).
+See the [v1.3.2 release page](https://github.com/Torin2023/PTT2me/releases/tag/v1.3.2)
 for the model-free Update DMG and checksum files.
 
-Version 1.3.1 prepares Accessibility metadata for the frontmost application
-by PID, without an app allowlist. A single bounded worker performs metadata
-checks and a limited tree traversal; preparation and fresh insertion security
-probes share exclusive access to the process-wide AX timeout. Fresh focus and
-secure-field checks, clipboard ownership/restoration, and PTT semantics remain
-in place. The fixed model is unchanged. The model-free Update DMG is
-11,356,380 bytes / 10.8 MiB.
-
-The locked TLS dependency rustls is updated to 0.23.45 to fix
-[RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285).
-Its required rustls-webpki dependency is updated to 0.103.15.
+Version 1.3.2 updates the locked TLS dependencies to rustls 0.23.46,
+rustls-webpki 0.103.16, and webpki-roots 1.0.10 after the dependency audit
+fix in PR #59. Application behavior, the fixed GigaAM model, and the trusted
+update-verification public key are unchanged from 1.3.1. The model-free
+Update DMG is 11,360,108 bytes / 10.8 MiB.
 
 Automated Rust/macOS tests (488), shell contracts, fresh-database RustSec audit,
 AppKit/WebKit fixture build-only, model initialization smoke, signature,
 bundle, and Full/Update DMG checks passed for source commit
-`16f2b1b68801f7b06b153aeb28fec7ed67ffd818` (build `202609181910`).
+`361feb79e437be638e9f4a1b4a05d7a3af746be5` (build `202611031126`).
 The fixture was not executed. Manual P0 is **SKIPPED by explicit owner
-authorization on 2026-09-19** for this unsigned preview, not PASS. Physical
-hotkey/TCC workflows, real audio/recognition, and insertion in Chrome, Yandex,
-ChatGPT/Codex, unknown apps, or embedded browsers were not manually checked
-for this candidate. PID-based preparation is not a compatibility guarantee;
-unperformed checks are not reported as passed. This is an unsigned preview:
-the app is ad-hoc signed and is not Apple-notarized.
+authorization on 2026-11-03**, not PASS. This exception applies only to this
+candidate; its scope and unverified scenarios are recorded in
+[`docs/release/1.3.2-preview-exception.md`](docs/release/1.3.2-preview-exception.md).
+Installation, physical hotkey/TCC workflows, real audio/recognition, insertion
+in Chrome, Yandex, ChatGPT/Codex, unknown apps or embedded browsers, clipboard
+behavior, and updater replacement remain manually unverified. Automated
+checks do not confirm these scenarios. This is an unsigned preview: the app
+is ad-hoc signed and is not Apple-notarized.
 
 ## Build
 
@@ -234,7 +230,7 @@ use Full only. Update is selected only inside an already installed PTT2me.
 The release coordinator requires an explicit stable version, 12-digit UTC
 build, exact clean `HEAD`, model source, committed model manifest, publication
 timestamp, and matching key pair. The private signing key must remain outside
-Git. The currently published stable package version is exactly 1.3.1.
+Git. The currently published stable package version is exactly 1.3.2.
 
 ### Reproducible release gates
 
@@ -293,6 +289,9 @@ outputs and are not committed.
 The preflight, builder, and verifier do not publish GitHub Release or the Pages stable channel.
 Publication is a separate owner-authorized workflow after Gate A, Gate B,
 Gate C, and the manual P0 gate all pass.
+The [owner exception for Preview 1.3.2](docs/release/1.3.2-preview-exception.md)
+waives only that candidate's manual P0 publication requirement; the general
+release gate remains in effect for other releases.
 
 The controlled [AppKit/WebKit insertion fixture](docs/testing/INSERTION_GUI.md)
 checks final field contents, focus changes, password rejection, and clipboard
@@ -300,11 +299,11 @@ preservation through the production insertion modules. CI builds the fixture;
 execution requires a macOS GUI session with Accessibility and event-posting
 access. The manual P0 checklist also includes a short ChatGPT draft check.
 
-## Updating (PTT2me 1.3.1)
+## Updating (PTT2me 1.3.2)
 
 Preview 1.0.5 cannot discover this release. Versions 1.1.0 and 1.1.1 can check
 the signed stable channel, but their updater cannot download the build that
-contains its fix. Replace any of these versions once with the published 1.3.1
+contains its fix. Replace any of these versions once with the published 1.3.2
 Full DMG. Starting with 1.1.2, PTT2me can download subsequent signed updates
 through the flow described below.
 

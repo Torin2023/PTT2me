@@ -1,7 +1,7 @@
 const DOWNLOAD_URL =
-  "https://github.com/Torin2023/PTT2me/releases/download/v1.3.1/PTT2me-1.3.1-full-macos-arm64.dmg";
+  "https://github.com/Torin2023/PTT2me/releases/download/v1.3.2/PTT2me-1.3.2-full-macos-arm64.dmg";
 const REPOSITORY_URL = "https://github.com/Torin2023/PTT2me";
-const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.3.1`;
+const RELEASE_URL = `${REPOSITORY_URL}/releases/tag/v1.3.2`;
 
 const steps = [
   ["01", "Удерживайте", "Нажмите и удерживайте выбранную клавишу."],
@@ -27,7 +27,7 @@ export default function Home() {
         </a>
         <nav aria-label="Разделы сайта">
           <a href="#how">Как работает</a>
-          <a href="#updates">Обновления 1.3.1</a>
+          <a href="#updates">Обновления 1.3.2</a>
           <a href={REPOSITORY_URL}>GitHub</a>
           <a className="button button-small" href={DOWNLOAD_URL}>
             Скачать
@@ -41,7 +41,7 @@ export default function Home() {
           <p className="eyebrow">
             <span className="eyebrow-line" aria-hidden="true" />
             Локальная диктовка для macOS
-            <span className="preview-badge">Preview 1.3.1</span>
+            <span className="preview-badge">Preview 1.3.2</span>
           </p>
           <h1>
             Говорите —
@@ -55,7 +55,7 @@ export default function Home() {
           </p>
           <div className="hero-actions">
             <a className="button" href={DOWNLOAD_URL}>
-              Скачать PTT2me 1.3.1
+              Скачать PTT2me 1.3.2
               <span aria-hidden="true">↘</span>
             </a>
             <a className="text-link" href={REPOSITORY_URL}>
@@ -224,16 +224,17 @@ export default function Home() {
 
       <section className="section updates-section" id="updates">
         <div className="section-heading">
-          <p className="eyebrow">PTT2me 1.3.1 опубликована</p>
+          <p className="eyebrow">PTT2me 1.3.2 опубликована</p>
           <div>
-            <h2>Подготовка вставки в активное приложение.</h2>
+            <h2>Исправления безопасности обновлений.</h2>
             <p className="release-boundary">
-              Версиям 1.1.0 и 1.1.1 нужен один ручной переход на 1.3.1 через
+              Версиям 1.1.0 и 1.1.1 нужен один ручной переход на 1.3.2 через
               Full DMG: прежний updater не может скачать сборку с собственным
-              исправлением. Версии начиная с 1.1.2 могут загрузить 1.3.1 через
-              меню обновлений. В версии 1.3.1 подготовка вставки больше не
-              ограничена списком приложений: при старте записи PTT2me проверяет
-              данные Универсального доступа активного приложения.
+              исправлением. Версии начиная с 1.1.2 могут загрузить 1.3.2 через
+              меню обновлений. В версии 1.3.2 обновлены сетевые библиотеки,
+              используемые проверкой и загрузкой обновлений. Подготовка вставки
+              по-прежнему выбирает активное приложение без списка разрешённых
+              приложений; поведение диктовки не менялось.
               Это не гарантирует совместимость: фактическая вставка в Chrome,
               Yandex, ChatGPT/Codex и встроенные браузеры в этой версии не
               проверена. Модель распознавания осталась прежней.
@@ -347,13 +348,13 @@ export default function Home() {
 
       <section className="section install" id="install">
         <div className="install-copy">
-          <p className="eyebrow">PTT2me Preview 1.3.1</p>
+          <p className="eyebrow">PTT2me Preview 1.3.2</p>
           <h2>Готовы говорить?</h2>
           <p>Для Mac с Apple Silicon и macOS 13 Ventura или новее.</p>
           <p className="fine-print">
-            Ручные проверки этой версии пропущены по явному разрешению владельца.
-            Установка, разрешения, физическая клавиша и реальная
-            вставка в приложения в этой версии не проверены. Это unsigned preview
+            Ручные проверки этой версии пропущены по явному решению владельца.
+            Установка, разрешения, физическая клавиша, реальная диктовка,
+            вставка и обновление приложения в этой версии не проверены. Это unsigned preview
             с ad-hoc подписью, без
             нотариализации Apple.
             {" "}<a href={RELEASE_URL}>Подробности и ограничения preview.</a>
@@ -403,11 +404,11 @@ export default function Home() {
         <p>
           SHA-256{" "}
           <code>
-            d29292f210997c4c2f6da90519b3b1fb01fa63d4009bcbf14e4d5083c0cf78cd
+            476cba2b3b505c4b1d12e3fcaea0004c901b680072702147dd05e0afb2c566fb
           </code>
         </p>
         <div>
-          <a href={RELEASE_URL}>Preview-релиз 1.3.1</a>
+          <a href={RELEASE_URL}>Preview-релиз 1.3.2</a>
           <a href={REPOSITORY_URL}>GitHub</a>
         </div>
       </footer>
