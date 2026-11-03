@@ -15,6 +15,8 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 
+use crate::asr::AsrProfile;
+use crate::asr_preferences::AsrPreferenceSnapshot;
 use crate::hotkey::{AssignmentEpoch, HotkeyControl};
 use crate::preferences::{HoldThreshold, Preferences, TriggerKey};
 use crate::state::{AppStatus, PermissionKind};
@@ -364,11 +366,12 @@ pub enum MenuEntry {
     Trigger,
     Threshold,
     TrailingSpace,
+    AsrProfile,
     Separator,
     Quit,
 }
 
-pub const MENU_DESCRIPTOR: [MenuEntry; 10] = [
+pub const MENU_DESCRIPTOR: [MenuEntry; 11] = [
     MenuEntry::Status,
     MenuEntry::Version,
     MenuEntry::UpdaterInfo,
@@ -377,6 +380,7 @@ pub const MENU_DESCRIPTOR: [MenuEntry; 10] = [
     MenuEntry::Trigger,
     MenuEntry::Threshold,
     MenuEntry::TrailingSpace,
+    MenuEntry::AsrProfile,
     MenuEntry::Separator,
     MenuEntry::Quit,
 ];
@@ -392,6 +396,38 @@ pub enum MenuCommand {
     ResetTrigger,
     SetThreshold(HoldThreshold),
     SetAppendSpace(bool),
+    SetAsrProfile(AsrProfile),
+}
+
+fn profile_command_for_tag(tag: isize) -> Option<MenuCommand> {
+    let index = usize::try_from(tag).ok()?;
+    AsrProfile::OPTIONS
+        .get(index)
+        .copied()
+        .map(MenuCommand::SetAsrProfile)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AsrProfileMenuProjection {
+    active_title: String,
+    notice_title: String,
+    selected: [bool; 2],
+}
+
+impl AsrProfileMenuProjection {
+    fn from_snapshot(snapshot: AsrPreferenceSnapshot) -> Self {
+        Self {
+            active_title: format!("Сейчас: {}", snapshot.active.title()),
+            notice_title: if snapshot.save_failed {
+                "Не удалось сохранить выбор. Выберите профиль ещё раз".to_owned()
+            } else if snapshot.active != snapshot.selected {
+                format!("После перезапуска PTT2me: {}", snapshot.selected.title())
+            } else {
+                "Выбор применяется после перезапуска PTT2me".to_owned()
+            },
+            selected: AsrProfile::OPTIONS.map(|profile| profile == snapshot.selected),
+        }
+    }
 }
 
 fn toggled_append_space(selected: bool) -> (bool, MenuCommand) {
@@ -487,7 +523,9 @@ impl MenuCommandPublisher {
                 self.hotkey.set_threshold(threshold);
                 self.notifier.send(&self.sender, command)
             }
-            MenuCommand::SetAppendSpace(_) => self.notifier.send(&self.sender, command),
+            MenuCommand::SetAppendSpace(_) | MenuCommand::SetAsrProfile(_) => {
+                self.notifier.send(&self.sender, command)
+            }
         }
     }
 
@@ -600,6 +638,14 @@ declare_class!(
             self.ivars().append_space.set(selected);
             self.ivars().publisher.send(command);
         }
+
+        #[method(selectAsrProfile:)]
+        fn select_asr_profile(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            if let Some(command) = profile_command_for_tag(tag) {
+                self.ivars().publisher.send(command);
+            }
+        }
     }
 );
 
@@ -636,6 +682,9 @@ pub struct MenuBar {
     current_trigger_row: Retained<NSMenuItem>,
     threshold_rows: [Retained<NSMenuItem>; 3],
     trailing_space_row: Retained<NSMenuItem>,
+    asr_profile_rows: [Retained<NSMenuItem>; 2],
+    asr_profile_active_row: Retained<NSMenuItem>,
+    asr_profile_notice_row: Retained<NSMenuItem>,
     button: Retained<NSStatusBarButton>,
     _target: Retained<MenuTarget>,
     action_receiver: Receiver<MenuAction>,
@@ -700,6 +749,9 @@ impl MenuBar {
         let mut current_trigger_row = None;
         let mut threshold_rows = Vec::with_capacity(HoldThreshold::OPTIONS.len());
         let mut trailing_space_row = None;
+        let mut asr_profile_rows = Vec::with_capacity(AsrProfile::OPTIONS.len());
+        let mut asr_profile_active_row = None;
+        let mut asr_profile_notice_row = None;
         for entry in MENU_DESCRIPTOR {
             match entry {
                 MenuEntry::Status => {
@@ -806,6 +858,37 @@ impl MenuBar {
                     menu.addItem(&item);
                     trailing_space_row = Some(item);
                 }
+                MenuEntry::AsrProfile => {
+                    let parent = menu_item(mtm, "Распознавание", None);
+                    let submenu = unsafe {
+                        NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Распознавание"))
+                    };
+                    unsafe { submenu.setAutoenablesItems(false) };
+                    let active = menu_item(mtm, "", None);
+                    unsafe { active.setEnabled(false) };
+                    submenu.addItem(&active);
+                    asr_profile_active_row = Some(active);
+                    for (index, profile) in AsrProfile::OPTIONS.into_iter().enumerate() {
+                        let title = match profile {
+                            AsrProfile::Balanced => profile.title(),
+                            AsrProfile::Fast => "Быстрый (выше нагрузка)",
+                        };
+                        let item = menu_item(mtm, title, Some(sel!(selectAsrProfile:)));
+                        unsafe {
+                            item.setTarget(Some(&target));
+                            item.setTag(index as isize);
+                            item.setEnabled(true);
+                        }
+                        submenu.addItem(&item);
+                        asr_profile_rows.push(item);
+                    }
+                    let notice = menu_item(mtm, "", None);
+                    unsafe { notice.setEnabled(false) };
+                    submenu.addItem(&notice);
+                    asr_profile_notice_row = Some(notice);
+                    parent.setSubmenu(Some(&submenu));
+                    menu.addItem(&parent);
+                }
                 MenuEntry::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
                 MenuEntry::Quit => {
                     let item = menu_item(mtm, "Выйти", Some(sel!(quit:)));
@@ -848,6 +931,13 @@ impl MenuBar {
                 .unwrap_or_else(|_| panic!("menu descriptor must contain three threshold rows")),
             trailing_space_row: trailing_space_row
                 .expect("menu descriptor must contain the trailing-space row"),
+            asr_profile_rows: asr_profile_rows
+                .try_into()
+                .unwrap_or_else(|_| panic!("menu descriptor must contain two ASR profile rows")),
+            asr_profile_active_row: asr_profile_active_row
+                .expect("menu descriptor must contain the active ASR profile row"),
+            asr_profile_notice_row: asr_profile_notice_row
+                .expect("menu descriptor must contain the ASR profile notice row"),
             button,
             _target: target,
             action_receiver,
@@ -858,6 +948,7 @@ impl MenuBar {
         menu_bar.render_updater(None, false);
         menu_bar.render_preferences(preferences);
         menu_bar.render_append_space(append_space);
+        menu_bar.render_asr_profile(AsrPreferenceSnapshot::default());
         menu_bar
     }
 
@@ -944,6 +1035,25 @@ impl MenuBar {
             } else {
                 NSControlStateValueOff
             });
+        }
+    }
+
+    pub(crate) fn render_asr_profile(&self, snapshot: AsrPreferenceSnapshot) {
+        let projection = AsrProfileMenuProjection::from_snapshot(snapshot);
+        unsafe {
+            self.asr_profile_active_row
+                .setTitle(&NSString::from_str(&projection.active_title));
+            self.asr_profile_notice_row
+                .setTitle(&NSString::from_str(&projection.notice_title));
+        }
+        for (row, selected) in self.asr_profile_rows.iter().zip(projection.selected) {
+            unsafe {
+                row.setState(if selected {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+            }
         }
     }
 
@@ -1428,6 +1538,7 @@ mod tests {
                 MenuEntry::Trigger,
                 MenuEntry::Threshold,
                 MenuEntry::TrailingSpace,
+                MenuEntry::AsrProfile,
                 MenuEntry::Separator,
                 MenuEntry::Quit,
             ]
@@ -1457,6 +1568,71 @@ mod tests {
         );
 
         assert!(!publisher.send(MenuCommand::SetAppendSpace(true)));
+    }
+
+    #[test]
+    fn asr_profile_projection_distinguishes_active_next_launch_and_failed_save() {
+        let projection = AsrProfileMenuProjection::from_snapshot(AsrPreferenceSnapshot {
+            active: AsrProfile::Balanced,
+            selected: AsrProfile::Fast,
+            save_failed: false,
+        });
+        assert_eq!(projection.active_title, "Сейчас: Сбалансированный");
+        assert_eq!(projection.notice_title, "После перезапуска PTT2me: Быстрый");
+        assert_eq!(projection.selected, [false, true]);
+
+        let failed = AsrProfileMenuProjection::from_snapshot(AsrPreferenceSnapshot {
+            active: AsrProfile::Balanced,
+            selected: AsrProfile::Fast,
+            save_failed: true,
+        });
+        assert_eq!(failed.active_title, projection.active_title);
+        assert_eq!(failed.selected, projection.selected);
+        assert_eq!(
+            failed.notice_title,
+            "Не удалось сохранить выбор. Выберите профиль ещё раз"
+        );
+        assert!(!failed.notice_title.contains("После перезапуска"));
+    }
+
+    #[test]
+    fn asr_profile_command_rejects_invalid_menu_tags_and_preserves_live_hotkey() {
+        assert_eq!(
+            profile_command_for_tag(0),
+            Some(MenuCommand::SetAsrProfile(AsrProfile::Balanced))
+        );
+        assert_eq!(
+            profile_command_for_tag(1),
+            Some(MenuCommand::SetAsrProfile(AsrProfile::Fast))
+        );
+        for tag in [-1, 2, 4, isize::MAX] {
+            assert_eq!(profile_command_for_tag(tag), None);
+        }
+        let (sender, receiver) = mpsc::channel();
+        let control = HotkeyControl::new(Preferences::default());
+        // Profile persistence remains available during a dictation. It never
+        // changes the active trigger or short-press threshold.
+        let publisher =
+            MenuCommandPublisher::new(sender, control.clone(), MenuReadiness::new(false));
+        let start = Instant::now();
+        assert_eq!(
+            control.observe_for_test(observation(ObservationKind::KeyDown, 63), start),
+            Some(HotkeySignal::Pressed)
+        );
+        assert!(publisher.send(MenuCommand::SetAsrProfile(AsrProfile::Fast)));
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(MenuCommand::SetAsrProfile(AsrProfile::Fast))
+        );
+        assert_eq!(
+            control.observe_for_test(
+                observation(ObservationKind::KeyUp, 63),
+                start + Duration::from_millis(499)
+            ),
+            Some(HotkeySignal::Released { short: true })
+        );
+        drop(receiver);
+        assert!(!publisher.send(MenuCommand::SetAsrProfile(AsrProfile::Balanced)));
     }
 
     #[test]

@@ -20,6 +20,7 @@ use objc2_app_kit::NSApplication;
 use objc2_foundation::MainThreadMarker;
 
 use crate::asr::{spawn_asr_worker, AsrCommand, AsrEvent};
+use crate::asr_preferences::{AsrPreferenceController, SystemAsrPreferenceStore};
 use crate::asr_task::{AsrTask, AsrTaskError};
 use crate::audio::{AudioError, AudioRecorder};
 use crate::audio_task::AudioPreparationTask;
@@ -255,6 +256,7 @@ impl<R: RawPreferenceStore> RuntimePreferences<R> {
             MenuCommand::SetThreshold(threshold) => self.current.threshold = threshold,
             MenuCommand::BeginTriggerAssignment { .. }
             | MenuCommand::SetAppendSpace(_)
+            | MenuCommand::SetAsrProfile(_)
             | MenuCommand::Boundary(_) => return Err(()),
         }
         Ok(())
@@ -1056,6 +1058,7 @@ pub struct Runtime {
     menu: MenuBar,
     preferences: RuntimePreferences<SystemPreferenceStore>,
     output_preferences: OutputPreferenceController<SystemOutputPreferenceStore>,
+    asr_preferences: AsrPreferenceController<SystemAsrPreferenceStore>,
     menu_commands: Receiver<MenuCommand>,
     menu_sender: Sender<MenuCommand>,
     hotkey_control: HotkeyControl,
@@ -1183,7 +1186,8 @@ impl Runtime {
         let notifier = event_source.notifier();
         let (hotkey_sender, hotkey_events) = mpsc::channel();
         let (menu_sender, menu_commands) = mpsc::channel();
-        let asr = AsrTask::spawn_notified(notifier.clone());
+        let asr_preferences = AsrPreferenceController::load(SystemAsrPreferenceStore::standard());
+        let asr = AsrTask::spawn_notified(notifier.clone(), asr_preferences.snapshot().active);
         let (model_preparation_events, model_preparation_worker) =
             spawn_model_preparation_worker(notifier.clone());
         let model_preparation =
@@ -1211,6 +1215,7 @@ impl Runtime {
             ),
             preferences: RuntimePreferences::new(preferences, preference_repository),
             output_preferences,
+            asr_preferences,
             menu_commands,
             menu_sender,
             hotkey_control,
@@ -1266,6 +1271,9 @@ impl Runtime {
         let initialization_guard = event_source.suspend();
         let runtime_ref = unsafe { Pin::as_mut(&mut runtime).get_unchecked_mut() };
         let pointer = runtime_ref as *mut Runtime;
+        runtime_ref
+            .menu
+            .render_asr_profile(runtime_ref.asr_preferences.snapshot());
         runtime_ref.initialize_updater();
         tracing::info!(
             lifecycle = "started",
@@ -1968,6 +1976,15 @@ impl Runtime {
             }
             self.menu
                 .render_append_space(self.output_preferences.current().append_space);
+            return;
+        }
+
+        if let MenuCommand::SetAsrProfile(profile) = command {
+            if self.asr_preferences.select(profile).is_err() {
+                tracing::warn!(error_category = "asr_profile_persistence");
+            }
+            self.menu
+                .render_asr_profile(self.asr_preferences.snapshot());
             return;
         }
 

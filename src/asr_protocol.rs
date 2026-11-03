@@ -259,7 +259,7 @@ pub fn isolate_stdout() -> io::Result<File> {
     Ok(File::from(output))
 }
 
-pub fn run_native_worker() -> i32 {
+pub fn run_native_worker(profile: crate::asr::AsrProfile) -> i32 {
     use crate::asr::{RecognizerBackend, SherpaRecognizerBackend};
     use crate::model_store::{embedded_model_manifest, verify_model_directory};
     let Ok(mut output) = isolate_stdout() else {
@@ -273,7 +273,7 @@ pub fn run_native_worker() -> i32 {
         }
         let session = hello.header.session;
         Frame::new(Kind::HelloAck, session, 0, vec![])?.write(&mut output)?;
-        let mut backend = SherpaRecognizerBackend::default();
+        let mut backend = SherpaRecognizerBackend::for_profile(profile);
         let mut last_request = 0;
         let mut loaded = false;
         loop {

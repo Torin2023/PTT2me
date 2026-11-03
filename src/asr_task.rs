@@ -50,13 +50,19 @@ pub struct AsrTask {
 impl AsrTask {
     #[cfg(feature = "test-support")]
     pub fn spawn() -> Self {
-        Self::spawn_notified(EventNotifier::default())
+        Self::spawn_notified(EventNotifier::default(), crate::asr::AsrProfile::default())
     }
-    pub(crate) fn spawn_notified(notifier: EventNotifier) -> Self {
+    pub(crate) fn spawn_notified(notifier: EventNotifier, profile: crate::asr::AsrProfile) -> Self {
         Self::new(Supervisor::spawn_notified(
             std::env::current_exe().map(|program| SpawnSpec {
                 program,
-                args: vec!["--asr-worker".into()],
+                // Supervisor keeps this immutable launch spec for every child,
+                // including recovery. A menu preference never changes it.
+                args: vec![
+                    "--asr-worker".into(),
+                    "--profile".into(),
+                    profile.key().into(),
+                ],
             }),
             notifier,
         ))

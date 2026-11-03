@@ -2,13 +2,15 @@
 compile_error!("PTT2me supports only aarch64-apple-darwin");
 
 pub mod asr;
+mod asr_preferences;
 mod asr_process;
 mod asr_protocol;
 mod asr_task;
 
 /// Hidden worker entry point; dispatched before all application initialization.
-pub fn run_asr_worker_process() -> i32 {
-    asr_protocol::run_native_worker()
+#[doc(hidden)]
+pub fn run_asr_worker_process(profile: asr::AsrProfile) -> i32 {
+    asr_protocol::run_native_worker(profile)
 }
 mod accessibility_preparation;
 pub mod audio;
