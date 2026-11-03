@@ -1098,6 +1098,97 @@ fn download_retry_model_drift_returns_to_full_offer_for_fresh_confirmation() {
 }
 
 #[test]
+fn full_repair_can_reach_verified_open_and_quit_when_the_model_blocks_dictation() {
+    use crate::state::AppStatus;
+    use crate::updater_runtime::{updater_open_allowed, OrderlyQuitGate};
+
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let (bytes, _) = manifest("1.0.6", 202608011200, commit, "13.0");
+    let mut updater = updater_with_installed("1.0.6", 202608011200, commit, "13.0");
+    manual_manifest_result(&mut updater, bytes, ModelAvailability::Missing);
+    assert!(matches!(
+        updater.state(),
+        UpdaterState::RepairRequired { .. }
+    ));
+    let recheck = match updater.handle(UpdaterEvent::DownloadRequested).as_slice() {
+        [UpdaterCommand::RecheckModel { operation_id, .. }] => *operation_id,
+        other => panic!("expected model recheck: {other:?}"),
+    };
+    let command = updater
+        .handle(UpdaterEvent::ModelRechecked {
+            operation_id: recheck,
+            model: ModelAvailability::Missing,
+        })
+        .pop()
+        .unwrap();
+    let UpdaterCommand::DownloadAndVerify {
+        operation_id,
+        release,
+        artifact,
+    } = command
+    else {
+        panic!("expected verified Full download");
+    };
+    assert_eq!(artifact.kind, ArtifactKind::Full);
+    let cache = tempfile::tempdir().unwrap();
+    // The network body and workspace opener are synthetic; signature, actual
+    // cache bytes/size/hash, quarantine and the held-descriptor check are real.
+    let path = cache_verified_download(
+        cache.path(),
+        &release,
+        artifact.kind,
+        &artifact.descriptor,
+        Cursor::new(b"verified PTT2me full dmg fixture"),
+        Some(32),
+    )
+    .unwrap();
+    updater.handle(UpdaterEvent::DownloadVerified {
+        operation_id,
+        download: VerifiedDownload::from_verified_path(path.clone()),
+    });
+    let voice_status = AppStatus::ModelRepairRequired;
+    assert!(!updater_open_allowed(&voice_status, true));
+    assert!(updater_open_allowed(&voice_status, false));
+    let command = updater.handle(UpdaterEvent::OpenRequested).pop().unwrap();
+    let UpdaterCommand::VerifyAndOpenDmg {
+        operation_id,
+        release,
+        artifact,
+        expected_path,
+    } = command
+    else {
+        panic!("expected verification immediately before open");
+    };
+    assert_eq!(artifact.kind, ArtifactKind::Full);
+    let opened = Cell::new(0);
+    let result = verify_and_open_dmg_with(
+        cache.path(),
+        &release,
+        &artifact,
+        &expected_path,
+        || Ok(()),
+        |actual| {
+            assert_eq!(actual, path);
+            opened.set(opened.get() + 1);
+            true
+        },
+    );
+    assert_eq!(result, Ok(()));
+    assert_eq!(opened.get(), 1);
+    assert_eq!(
+        updater.handle(UpdaterEvent::OpenCompleted {
+            operation_id,
+            result
+        }),
+        [UpdaterCommand::RequestOrderlyQuit]
+    );
+    let mut quit = OrderlyQuitGate::default();
+    quit.request();
+    assert!(!quit.take_if_ready(&voice_status, true));
+    assert!(quit.take_if_ready(&voice_status, false));
+}
+
+#[test]
 fn explicit_open_is_one_verified_boundary_with_stale_suppression_and_quit_after_success() {
     let mut updater = updater();
     let download_id = begin_verified_download(&mut updater);

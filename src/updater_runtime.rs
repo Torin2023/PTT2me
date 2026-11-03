@@ -140,7 +140,19 @@ pub(crate) fn required_model_availability(
 }
 
 pub(crate) const fn updater_open_allowed(status: &AppStatus, paste_pending: bool) -> bool {
-    matches!(status, AppStatus::Ready) && !paste_pending
+    // Recovery must remain available when the very model/ASR/permissions that
+    // an update can repair prevent dictation. Active work still owns shutdown.
+    !paste_pending
+        && matches!(
+            status,
+            AppStatus::Ready
+                | AppStatus::ModelRepairRequired
+                | AppStatus::ModelPreparationFailed
+                | AppStatus::PermissionBlocked(_)
+                | AppStatus::PermissionResetFailed
+                | AppStatus::AsrUnavailable
+                | AppStatus::Error { .. }
+        )
 }
 
 #[derive(Debug, Default)]
@@ -1037,17 +1049,51 @@ mod tests {
     }
 
     #[test]
-    fn open_and_orderly_quit_wait_for_idle_voice_and_paste() {
-        assert!(updater_open_allowed(&AppStatus::Ready, false));
-        assert!(!updater_open_allowed(&AppStatus::Recording, false));
-        assert!(!updater_open_allowed(&AppStatus::Ready, true));
-
-        let mut gate = OrderlyQuitGate::default();
-        gate.request();
-        assert!(!gate.take_if_ready(&AppStatus::Recording, false));
-        assert!(!gate.take_if_ready(&AppStatus::Ready, true));
-        assert!(gate.take_if_ready(&AppStatus::Ready, false));
-        assert!(!gate.take_if_ready(&AppStatus::Ready, false));
+    fn recovery_updates_are_available_in_idle_failures_but_never_while_work_is_owned() {
+        use crate::state::PermissionKind;
+        let idle = [
+            AppStatus::Ready,
+            AppStatus::ModelRepairRequired,
+            AppStatus::ModelPreparationFailed,
+            AppStatus::PermissionBlocked(PermissionKind::Accessibility),
+            AppStatus::PermissionBlocked(PermissionKind::InputMonitoring),
+            AppStatus::PermissionBlocked(PermissionKind::Microphone),
+            AppStatus::PermissionResetFailed,
+            AppStatus::AsrUnavailable,
+            AppStatus::Error {
+                message: "synthetic",
+                recoverable: true,
+            },
+            AppStatus::Error {
+                message: "synthetic",
+                recoverable: false,
+            },
+        ];
+        for status in idle {
+            assert!(updater_open_allowed(&status, false), "{status:?}");
+            assert!(!updater_open_allowed(&status, true), "{status:?}");
+            let mut gate = OrderlyQuitGate::default();
+            gate.request();
+            assert!(!gate.take_if_ready(&status, true));
+            assert!(gate.take_if_ready(&status, false));
+            assert!(!gate.take_if_ready(&status, false));
+        }
+        for status in [
+            AppStatus::PreparingModel,
+            AppStatus::ResettingPermissions,
+            AppStatus::AsrCleanupPending,
+            AppStatus::Recording,
+            AppStatus::Recognizing,
+        ] {
+            let mut gate = OrderlyQuitGate::default();
+            gate.request();
+            for paste_pending in [false, true] {
+                assert!(!updater_open_allowed(&status, paste_pending), "{status:?}");
+                assert!(!gate.take_if_ready(&status, paste_pending));
+            }
+            // The request remains pending until ownership is released.
+            assert!(gate.take_if_ready(&AppStatus::ModelRepairRequired, false));
+        }
     }
 
     #[test]
