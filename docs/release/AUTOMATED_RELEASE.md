@@ -13,7 +13,8 @@
 
 Required check `Format, test, lint, and audit` запускается для каждого PR и push
 в `main`, включая документацию. Workflow целиком не пропускается по `paths`:
-это оставило бы required check в Pending. Ошибка или отмена job выбора проверок
+это оставило бы required check в Pending по [правилам GitHub](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/skip-workflow-runs).
+Ошибка или отмена job выбора проверок
 завершает required check ошибкой, а не успехом с пропущенными шагами.
 
 | Изменённые входы | Автоматические проверки |
