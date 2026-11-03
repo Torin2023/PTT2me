@@ -1,29 +1,11 @@
+import { renderWorker } from "../scripts/render-worker.mjs";
 import assert from "node:assert/strict";
 import { access } from "node:fs/promises";
 import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
-async function render(path = "/") {
-  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
-  const { default: worker } = await import(workerUrl.href);
-
-  return worker.fetch(
-    new Request(`http://localhost${path}`, {
-      headers: { accept: "text/html" },
-    }),
-    {
-      ASSETS: {
-        fetch: async () => new Response("Not found", { status: 404 }),
-      },
-    },
-    {
-      waitUntil() {},
-      passThroughOnException() {},
-    },
-  );
-}
+const render = (path = "/") => renderWorker(root, path);
 
 test("renders the current PTT2me v1.3.2 product contract", async () => {
   const response = await render();
