@@ -1,9 +1,8 @@
 # ASR performance measurement
 
-PTT2me keeps the production GigaAM recognizer at two CPU threads. The
-measurement below found a useful four-thread latency improvement on one Apple
-M5, but the synthetic corpus and single machine do not establish recognition
-quality or compatibility across supported Macs.
+PTT2me defaults to two CPU threads. The Russian read-speech measurement below
+found lower latency with four threads on one Apple M5 at higher CPU cost.
+It supports an opt-in fast profile, not a universal default or an energy claim.
 
 ## Reproduce the measurement
 
@@ -105,15 +104,61 @@ python3 scripts/prepare-fleurs-corpus.py \
   --output "$PTT2ME_CORPUS_ROOT/fleurs-ru-16"
 ```
 
-The offline preparer checks pinned SHA-256 values, reads only selected regular
-archive members without extracting paths, and uses macOS `afconvert` to make
+The offline preparer checks pinned SHA-256 values while making private input
+snapshots, reads only selected regular archive members without extracting paths,
+and uses macOS `afconvert` to make
 PCM16 WAV files without trimming or normalizing. It refuses an existing output
 directory. The resulting `manifest.json` goes to `--corpus`; `provenance.json`
 retains attribution, source revision and selection policy. The source archive
 is about 433 MB; generated recordings/references remain outside Git. CI tests
-the scoring and input boundaries without downloading audio or models.
+the scoring and input boundaries without downloading audio or models. The
+preparer supports Python 3.9+ and needs temporary disk space for the 433 MB
+verified snapshot as well as the downloaded archive.
 
-## Recorded result
+## Russian read-speech result, 2026-11-03
+
+The fixed 16-case corpus totals 163.98 seconds (5.46–17.16 seconds per case),
+279 reference words and 1,724 reference characters after normalization. It
+does not cover noisy microphones, whispered speech or the 25-second boundary.
+Model `gigaam-v3-rnnt-v1` and its production manifest are unchanged.
+
+The release-mode schema 3 executable was compiled from clean commit
+`a048a352033186a8b4445d7dd7759b9607b42dc7`, Rust 1.94.0, with SHA-256
+`3c5d5efd8e9518e4c530df7c5862683f215d181d01e0b81462d23fa4a0097264`
+(553,456 bytes). Corpus manifest SHA-256:
+`03be41b671b9fa2150929dd331293840cf16d4b535caff0f726bf7c9552ca93f`.
+The first run used order 2 → 4 → 1, one warmup and five measured repeats per
+case/configuration. Every complete trimmed output matched across all runs.
+
+| CPU threads | Sum of per-case median ASR times | WER | CER |
+| --- | ---: | ---: | ---: |
+| 1 | 23,520.7 ms | 8 / 279 = 2.867% | 11 / 1,724 = 0.638% |
+| 2 (default) | 12,447.9 ms | 2.867% | 0.638% |
+| 4 (opt-in) | 7,921.1 ms | 2.867% | 0.638% |
+
+Four threads reduced this latency measure by 36.4%, with improvement in every
+case (at least 34.6%). CPU time over the complete configuration interval grew
+24.3%. Independent processes, in reverse order 4 → 2 with one warmup/three
+repeats, confirmed 7,652.6 versus 12,389.6 ms and the same WER/CER. Peak RSS
+was 899.9 MiB (4) and 905.2 MiB (2); this small single-run difference does not
+establish memory savings. These are direct recognizer timings, not end-to-text
+latency through microphone capture, worker transport and insertion.
+
+The Mac was Mac17,4, Apple M5, 10 physical/logical CPUs, 16 GiB, macOS 26.6.2
+(25G83). Sandbox restrictions left hardware/thermal fields unavailable in the
+benchmark JSON; a separate read-only system observation established hardware
+and found no recorded thermal/performance warning after the runs. Background
+desktop activity was not controlled, and no energy or cross-device conclusion
+is claimed. The original report's unconditional synthetic-corpus limitation was
+subsequently corrected to corpus-neutral wording; no scoring code changed.
+
+Raw report hashes, retained outside Git:
+
+- Combined 2/4/1: `2c1e3d5f3058e94b0fc9e97386ced47c7cf01d30254d8b4862702c77e1d85203`.
+- Independent 4: `cb902e2c6911dacec718c75e8211c8626703b85a024b56c69f5a8fe0c1c84783`.
+- Independent 2: `47ceebb7e9d216dd941b0e389dac215804e9175e5fcbb9e12fccc4ddb4e2d895`.
+
+## Historical synthetic result
 
 The historical run on 2026-09-06 used the earlier schema 1 tool. Its
 `source_commit` value was the run-time working-directory HEAD

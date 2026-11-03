@@ -5,13 +5,16 @@ Inputs are pinned public CC BY 4.0 data. No model, microphone, or network access
 Output contains licensed reference text/audio and must remain outside Git.
 """
 import argparse
+from contextlib import contextmanager
 import csv
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import stat
 import tarfile
 import tempfile
 import wave
@@ -22,13 +25,26 @@ TSV_SHA256 = "cd54f261220f49afbb4c128633a737eca4a22f6c0a8233d3cc891478d06676e6"
 ATTRIBUTION = "Google FLEURS, Conneau et al. (2022), ru_ru/test, CC BY 4.0"
 
 
-def verify(path, digest):
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("input must be a regular non-symlink file")
-    with path.open("rb") as stream:
-        actual = hashlib.file_digest(stream, "sha256").hexdigest()
-    if actual != digest:
-        raise ValueError("pinned corpus input SHA-256 mismatch")
+@contextmanager
+def verified_input(path, digest, limit):
+    # Parse exactly the bytes that were verified. Private unlinked temporary
+    # storage also isolates a concurrent rewrite of the original inode.
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+            raise ValueError("input must be a bounded regular non-symlink file")
+        with tempfile.TemporaryFile(mode="w+b") as snapshot:
+            hasher, count = hashlib.sha256(), 0
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                count += len(block)
+                if count > limit:
+                    raise ValueError("input exceeds pinned size limit")
+                hasher.update(block)
+                snapshot.write(block)
+            if count != metadata.st_size or hasher.hexdigest() != digest:
+                raise ValueError("pinned corpus input SHA-256 mismatch")
+            snapshot.seek(0)
+            yield snapshot
 
 
 def select_rows(data):
@@ -47,14 +63,18 @@ def select_rows(data):
 
 
 def prepare(archive, tsv, output):
-    verify(archive, ARCHIVE_SHA256)
-    verify(tsv, TSV_SHA256)
-    rows = select_rows(tsv.read_text(encoding="utf-8"))
+    with verified_input(tsv, TSV_SHA256, 735_258) as metadata:
+        rows = select_rows(metadata.read().decode("utf-8"))
+    with verified_input(archive, ARCHIVE_SHA256, 433_142_634) as archive_snapshot:
+        prepare_verified(archive_snapshot, rows, output)
+
+
+def prepare_verified(archive_snapshot, rows, output):
     output.mkdir(mode=0o700, parents=False, exist_ok=False)
     manifest = []
     converted = set()
     with tempfile.TemporaryDirectory(prefix="fleurs-pcm-") as temporary:
-        with tarfile.open(archive, mode="r|gz") as source:
+        with tarfile.open(fileobj=archive_snapshot, mode="r|gz") as source:
             for member in source:
                 filename = Path(member.name).name
                 if filename not in rows:

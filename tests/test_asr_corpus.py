@@ -35,14 +35,37 @@ class CorpusSelectionTests(unittest.TestCase):
             path = Path(directory) / "input"
             path.write_bytes(b"public fixture")
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            corpus.verify(path, digest)
+            with corpus.verified_input(path, digest, 100) as snapshot:
+                self.assertEqual(snapshot.read(), b"public fixture")
             alias = Path(directory) / "alias"
             alias.symlink_to(path)
-            with self.assertRaises(ValueError):
-                corpus.verify(alias, digest)
+            with self.assertRaises((ValueError, OSError)):
+                with corpus.verified_input(alias, digest, 100):
+                    self.fail("symlink accepted")
             path.write_bytes(b"changed")
             with self.assertRaises(ValueError):
-                corpus.verify(path, digest)
+                with corpus.verified_input(path, digest, 100):
+                    self.fail("changed input accepted")
+
+    def test_verified_snapshot_survives_source_replacement_and_rewrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input"
+            original = b"pinned contents"
+            path.write_bytes(original)
+            digest = hashlib.sha256(original).hexdigest()
+            with corpus.verified_input(path, digest, 100) as snapshot:
+                path.write_bytes(b"concurrent rewrite")
+                path.unlink()
+                path.write_bytes(b"replacement inode")
+                self.assertEqual(snapshot.read(), original)
+
+    def test_snapshot_size_bound_precedes_processing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input"
+            path.write_bytes(b"oversize")
+            with self.assertRaises(ValueError):
+                with corpus.verified_input(path, hashlib.sha256(b"oversize").hexdigest(), 3):
+                    self.fail("oversized input accepted")
 
     def test_bad_archive_never_creates_output(self):
         with tempfile.TemporaryDirectory() as directory:

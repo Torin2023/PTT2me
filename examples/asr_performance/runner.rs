@@ -151,7 +151,7 @@ pub(super) fn execute(arguments: Arguments) -> Result<(BenchmarkReport, File), S
             whole_process_peak_rss_scope: "ru_maxrss whole-process high-water mark; use one CPU configuration per invocation for an independent memory observation",
             privacy: "no transcript, audio sample, input path, or recognized-output digest is emitted",
             limitations: [
-                "synthetic speech WER/CER do not establish human recognition accuracy",
+                "WER/CER describe only the supplied corpus, not other speakers, microphones or noise conditions",
                 "one machine does not establish cross-device performance",
                 "few repeats describe this run and do not estimate population tail latency",
             ],
