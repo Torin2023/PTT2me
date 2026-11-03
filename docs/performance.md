@@ -252,10 +252,11 @@ and restoration flow and add no probes solely for metrics.
 
 ## Limits and next experiment
 
-The result describes one short synthetic run on one M5 while other GUI
-processes were active. Five repeats do not estimate population tail latency,
-synthetic speech does not establish human recognition accuracy, and the run
-does not cover older supported Apple Silicon Macs or battery impact.
+The human-corpus result covers 16 read-speech cases on one M5 with uncontrolled
+background desktop activity. The historical synthetic run is separate and does
+not establish human recognition accuracy. Five repeats do not estimate population
+tail latency; neither run covers spontaneous microphone dictation, older supported
+Apple Silicon Macs or battery impact.
 
 A future experiment can compare the current CPU backend with a new runtime or
 CoreML on the same consented human corpus and supported-device matrix. It must
