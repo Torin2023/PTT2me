@@ -155,12 +155,15 @@ Automated Rust/macOS tests (488), shell contracts, fresh-database RustSec audit,
 AppKit/WebKit fixture build-only, model initialization smoke, signature,
 bundle, and Full/Update DMG checks passed for source commit
 `361feb79e437be638e9f4a1b4a05d7a3af746be5` (build `202611031126`).
-The fixture was not executed. Manual P0 has not been completed for this
-candidate and is not PASS. Physical hotkey/TCC workflows, real audio/recognition,
-and insertion in Chrome, Yandex, ChatGPT/Codex, unknown apps, or embedded
-browsers remain unverified. Automated checks do not confirm these manual
-scenarios. This is an unsigned preview: the app is ad-hoc signed and is not
-Apple-notarized.
+The fixture was not executed. Manual P0 is **SKIPPED by explicit owner
+authorization on 2026-11-03**, not PASS. This exception applies only to this
+candidate; its scope and unverified scenarios are recorded in
+[`docs/release/1.3.2-preview-exception.md`](docs/release/1.3.2-preview-exception.md).
+Installation, physical hotkey/TCC workflows, real audio/recognition, insertion
+in Chrome, Yandex, ChatGPT/Codex, unknown apps or embedded browsers, clipboard
+behavior, and updater replacement remain manually unverified. Automated
+checks do not confirm these scenarios. This is an unsigned preview: the app
+is ad-hoc signed and is not Apple-notarized.
 
 ## Build
 
@@ -286,6 +289,9 @@ outputs and are not committed.
 The preflight, builder, and verifier do not publish GitHub Release or the Pages stable channel.
 Publication is a separate owner-authorized workflow after Gate A, Gate B,
 Gate C, and the manual P0 gate all pass.
+The [owner exception for Preview 1.3.2](docs/release/1.3.2-preview-exception.md)
+waives only that candidate's manual P0 publication requirement; the general
+release gate remains in effect for other releases.
 
 The controlled [AppKit/WebKit insertion fixture](docs/testing/INSERTION_GUI.md)
 checks final field contents, focus changes, password rejection, and clipboard
