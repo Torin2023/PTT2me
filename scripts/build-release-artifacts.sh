@@ -10,13 +10,15 @@ readonly SCRIPT_DIR
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 readonly REPO_ROOT
 
+source "$SCRIPT_DIR/code-signing.sh"
+
 fail() {
     echo "PTT2me release artifact build failed: $*" >&2
     exit 1
 }
 
 usage() {
-    fail "usage: $0 --version X.Y.Z --build YYYYMMDDHHMM --source-commit COMMIT --model-manifest PATH --model-source PATH --public-key PATH --private-key PATH --published-at YYYY-MM-DDTHH:MM:SSZ --output-dir PATH"
+    fail "usage: $0 --signing-mode ad-hoc|developer-id [--signing-identity SHA1 --team-id TEAMID] --version X.Y.Z --build YYYYMMDDHHMM --source-commit COMMIT --model-manifest PATH --model-source PATH --public-key PATH --private-key PATH --published-at YYYY-MM-DDTHH:MM:SSZ --output-dir PATH"
 }
 
 reject_private_key_boundary() {
@@ -40,6 +42,11 @@ PUBLISHED_AT=""
 OUTPUT_DIR=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --signing-mode|--signing-identity|--team-id)
+            [[ $# -ge 2 ]] || usage
+            signing_option "$1" "$2"
+            shift 2
+            ;;
         --version)
             [[ $# -ge 2 ]] || usage
             VERSION="$2"
@@ -93,6 +100,7 @@ done
 [[ -n "$MODEL_MANIFEST" && -n "$MODEL_SOURCE" ]] || usage
 [[ -n "$PUBLIC_KEY" && -n "$PRIVATE_KEY" ]] || usage
 [[ -n "$PUBLISHED_AT" && -n "$OUTPUT_DIR" ]] || usage
+signing_validate_policy
 
 [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
     fail "version must be a canonical stable semantic version"
@@ -126,7 +134,7 @@ PRIVATE_KEY="$PRIVATE_KEY_DIR/$(basename -- "$PRIVATE_KEY")"
 OUTPUT_DIR="$(cd -- "$OUTPUT_DIR" && pwd -P)"
 readonly MODEL_MANIFEST MODEL_SOURCE PUBLIC_KEY PRIVATE_KEY OUTPUT_DIR
 
-"$SCRIPT_DIR/release-preflight.sh" \
+"$SCRIPT_DIR/release-preflight.sh" "${SIGNING_ARGS[@]}" \
     --version "$VERSION" \
     --build "$BUILD" \
     --source-commit "$SOURCE_COMMIT" \
@@ -244,7 +252,7 @@ FULL_APP="$TEMP_ROOT/full/$PRODUCT.app"
 UPDATE_APP="$TEMP_ROOT/update/$PRODUCT.app"
 mkdir -p "$(dirname -- "$FULL_APP")" "$(dirname -- "$UPDATE_APP")"
 
-"$SCRIPT_DIR/build-app.sh" \
+"$SCRIPT_DIR/build-app.sh" "${SIGNING_ARGS[@]}" \
     --variant full \
     --model-manifest "$MODEL_MANIFEST" \
     --model-source "$MODEL_SOURCE" \
@@ -257,11 +265,12 @@ mkdir -p "$(dirname -- "$FULL_APP")" "$(dirname -- "$UPDATE_APP")"
 rm -rf "$UPDATE_APP/Contents/Resources/models"
 /usr/libexec/PlistBuddy -c \
     "Set :PTT2meDistributionVariant update" "$UPDATE_APP/Contents/Info.plist"
-codesign --force --sign - "$UPDATE_APP"
+# Variant mutation invalidates the seal; apply the same policy again.
+signing_sign_app "$UPDATE_APP"
 
-"$SCRIPT_DIR/check-bundle.sh" \
+"$SCRIPT_DIR/check-bundle.sh" "${SIGNING_ARGS[@]}" \
     --variant full --model-manifest "$MODEL_MANIFEST" "$FULL_APP"
-"$SCRIPT_DIR/check-bundle.sh" \
+"$SCRIPT_DIR/check-bundle.sh" "${SIGNING_ARGS[@]}" \
     --variant update --model-manifest "$MODEL_MANIFEST" "$UPDATE_APP"
 
 for relative in \
@@ -286,10 +295,10 @@ done
 
 FULL_DMG="$TEMP_ROOT/$FULL_DMG_NAME"
 UPDATE_DMG="$TEMP_ROOT/$UPDATE_DMG_NAME"
-"$SCRIPT_DIR/build-dmg.sh" \
+"$SCRIPT_DIR/build-dmg.sh" "${SIGNING_ARGS[@]}" \
     --variant full --model-manifest "$MODEL_MANIFEST" \
     --app "$FULL_APP" --output "$FULL_DMG"
-"$SCRIPT_DIR/build-dmg.sh" \
+"$SCRIPT_DIR/build-dmg.sh" "${SIGNING_ARGS[@]}" \
     --variant update --model-manifest "$MODEL_MANIFEST" \
     --app "$UPDATE_APP" --output "$UPDATE_DMG"
 

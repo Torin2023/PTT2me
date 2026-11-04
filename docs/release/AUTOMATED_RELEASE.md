@@ -83,14 +83,20 @@ API недоступен, artifact отсутствует/повреждён/п�
    `cargo audit --deny warnings`.
 2. На контролируемом Apple Silicon Mac вызвать
    `scripts/build-release-artifacts.sh` с точной чистой source identity и
-   внешними model/key inputs. Builder сам вызывает `scripts/release-preflight.sh`:
+   внешними model/key inputs и явным `--signing-mode ad-hoc|developer-id`.
+   Для `developer-id` обязательны `--signing-identity` (точный SHA-1 fingerprint
+   сертификата, 40 hex) и `--team-id` (10 символов). Используется только уже
+   существующая Developer ID Application identity; её отсутствие или ошибка
+   подписи завершают сборку без fallback. Builder сам вызывает `scripts/release-preflight.sh`:
    отдельный повтор preflight не является обязательным. Его автоматический
    `pasteboard_main` сохраняется, как и проверка соответствия Ed25519 ключей.
 3. Создать локальный `vX.Y.Z` на binary source, не перемещая существующий tag.
    Выполнить `scripts/verify-release-artifacts.sh --expected-tag vX.Y.Z` для
    закрытого набора из пяти файлов. Проверки signature, hashes/sizes, DMG,
    bundle identity, exact model, model smoke, codesign и Mach-O parity обязательны.
-   Команды с полным набором аргументов приведены в README.
+   Verifier получает тот же явно заданный режим, fingerprint и Team ID; ожидания
+   не выводятся из проверяемого app. Для проверки не нужен приватный ключ
+   Apple identity. Команды с полным набором аргументов приведены в README.
 4. Сохранить результат вне Git: version/build/source, локальный tag, fingerprint
    входов, пути и SHA-256/размеры пяти файлов, использованный verifier и окружение.
    Не повторять build/verifier из-за правок описания или сайта. При изменении
@@ -107,6 +113,23 @@ API недоступен, artifact отсутствует/повреждён/п�
 Preflight/build/verifier сами ничего не публикуют. Запреты изменения модели,
 доверенного ключа, TCC, проверки подписи обновлений и обхода Gatekeeper сохранены.
 Отсутствие Apple Developer ID не отменяет ad-hoc codesign checks или Ed25519.
+Ad-hoc допустим только как явно выбранный Preview/development режим, а не
+автоматическая замена запрошенного Developer ID. Общая signing policy требует
+Python 3.9+. В Developer ID режиме каждый Mach-O и app проверяются по Apple
+anchor, Developer ID Application OID, leaf fingerprint и Team ID, Hardened Runtime,
+secure timestamp и минимальным entitlements. Для app разрешён только audio-input;
+library validation не отключается. После изменения variant/models Update
+подписывается повторно до упаковки. Подпись Ed25519, exact model и Mach-O parity
+остаются обязательными. Apple-подпись DMG и notarization этим кодом не выполняются.
+
+Shell/Python fixtures и `csreq` подтверждают выбор аргументов, отказы, порядок
+подписи и синтаксис requirements. Они не подтверждают реальную Developer ID
+подпись, доступ к приватному ключу, работу Apple timestamp service или ASR и
+микрофона под Hardened Runtime. Без доступной настоящей identity эти результаты
+остаются непроверенными; готовность Developer ID релиза не заявляется.
+Notarization и Gatekeeper acceptance — отдельные непроверенные результаты.
+Если позже авторизованы notarization/stapling, они выполняются до вычисления
+SHA-256 DMG и Ed25519 signing; затем проверяются окончательные байты.
 
 ## Что автоматизация пока не подтверждает
 

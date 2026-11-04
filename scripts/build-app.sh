@@ -5,13 +5,15 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 cd -- "$REPO_ROOT"
 
+source "$SCRIPT_DIR/code-signing.sh"
+
 fail() {
     echo "PTT2me app build failed: $*" >&2
     exit 1
 }
 
 usage() {
-    fail "usage: $0 --variant full|update --model-manifest PATH [--model-source PATH] [--version X.Y.Z --build YYYYMMDDHHMM --source-commit COMMIT --output APP_PATH]"
+    fail "usage: $0 --signing-mode ad-hoc|developer-id [--signing-identity SHA1 --team-id TEAMID] --variant full|update --model-manifest PATH [--model-source PATH] [--version X.Y.Z --build YYYYMMDDHHMM --source-commit COMMIT --output APP_PATH]"
 }
 
 VARIANT=""
@@ -23,6 +25,11 @@ EXPLICIT_SOURCE_COMMIT=""
 OUTPUT_APP=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --signing-mode|--signing-identity|--team-id)
+            [[ $# -ge 2 ]] || usage
+            signing_option "$1" "$2"
+            shift 2
+            ;;
         --variant)
             [[ $# -ge 2 ]] || usage
             VARIANT="$2"
@@ -64,12 +71,15 @@ done
 
 [[ "$VARIANT" == "full" || "$VARIANT" == "update" ]] || usage
 [[ -n "$MODEL_MANIFEST" ]] || usage
+signing_validate_policy
 if [[ "$VARIANT" == "full" && -z "$MODEL_SOURCE" ]]; then
     fail "full variant requires --model-source"
 fi
 if [[ "$VARIANT" == "update" && -n "$MODEL_SOURCE" ]]; then
     fail "update variant does not accept --model-source"
 fi
+
+signing_preflight
 
 COMMITTED_MODEL_MANIFEST="$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
 [[ -f "$MODEL_MANIFEST" && ! -L "$MODEL_MANIFEST" ]] ||
@@ -271,12 +281,9 @@ plutil -create xml1 "$PLIST"
     "Add :NSMicrophoneUsageDescription string PTT2me uses the microphone only while you hold Fn to dictate text." \
     "$PLIST"
 
-codesign --force --sign - "$FRAMEWORKS/$ONNX_DYLIB"
-codesign --force --sign - "$FRAMEWORKS/$SHERPA_DYLIB"
-codesign --force --sign - "$MACOS/$PRODUCT"
-codesign --force --sign - "$APP"
+signing_sign_app "$APP"
 
-scripts/check-bundle.sh \
+scripts/check-bundle.sh "${SIGNING_ARGS[@]}" \
     --variant "$VARIANT" \
     --model-manifest "$MODEL_MANIFEST" \
     "$APP"

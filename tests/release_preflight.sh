@@ -27,7 +27,7 @@ write_fake_tools() {
     mkdir -p "$FAKE_BIN"
     : >"$FAKE_TOOL_LOG"
 
-    for tool in awk base64 basename cmp date dirname find git mktemp plutil printf pwd shasum stat tr wc; do
+    for tool in awk base64 basename cmp date dirname find git mktemp plutil printf pwd python3 shasum stat tr wc; do
         link_tool "$tool"
     done
 
@@ -85,6 +85,7 @@ write_fixture_repo() {
         "$MODEL_SOURCE" "$EXTERNAL_INPUTS" "$OUTPUT_DIR"
 
     cp "$PREFLIGHT_SOURCE" "$FIXTURE_REPO/scripts/release-preflight.sh"
+    cp "$REPO_ROOT/scripts/code-signing.sh" "$REPO_ROOT/scripts/code-signing.py" "$FIXTURE_REPO/scripts/"
     cp "$REPO_ROOT/scripts/check-model-variant.sh" \
         "$FIXTURE_REPO/scripts/check-model-variant.sh"
     chmod 755 "$FIXTURE_REPO/scripts"/*.sh
@@ -146,7 +147,7 @@ preflight_command() {
         PATH="$FAKE_BIN:/bin" \
         FAKE_TOOL_LOG="$FAKE_TOOL_LOG" \
         FAKE_PUBLIC_KEY_SOURCE="$PUBLIC_KEY" \
-        "$FIXTURE_REPO/scripts/release-preflight.sh" \
+        "$FIXTURE_REPO/scripts/release-preflight.sh" --signing-mode ad-hoc \
         --version "${TEST_VERSION:-1.1.0}" \
         --build "${TEST_BUILD:-202608111200}" \
         --source-commit "${TEST_SOURCE_COMMIT:-$SOURCE_COMMIT}" \

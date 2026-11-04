@@ -11,6 +11,8 @@ readonly SCRIPT_DIR
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 readonly REPO_ROOT
 
+source "$SCRIPT_DIR/code-signing.sh"
+
 fail() {
     local category="$1"
     shift
@@ -19,7 +21,7 @@ fail() {
 }
 
 usage() {
-    fail arguments "usage: $0 --version X.Y.Z --build YYYYMMDDHHMM --source-commit COMMIT --model-manifest PATH --model-source PATH --public-key PATH --private-key PATH --published-at YYYY-MM-DDTHH:MM:SSZ --output-dir PATH"
+    fail arguments "usage: $0 --signing-mode ad-hoc|developer-id [--signing-identity SHA1 --team-id TEAMID] --version X.Y.Z --build YYYYMMDDHHMM --source-commit COMMIT --model-manifest PATH --model-source PATH --public-key PATH --private-key PATH --published-at YYYY-MM-DDTHH:MM:SSZ --output-dir PATH"
 }
 
 canonical_file() {
@@ -70,6 +72,11 @@ PUBLISHED_AT=""
 OUTPUT_DIR=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --signing-mode|--signing-identity|--team-id)
+            [[ $# -ge 2 ]] || usage
+            signing_option "$1" "$2"
+            shift 2
+            ;;
         --version)
             [[ $# -ge 2 ]] || usage
             VERSION="$2"
@@ -123,6 +130,7 @@ done
 [[ -n "$MODEL_MANIFEST" && -n "$MODEL_SOURCE" ]] || usage
 [[ -n "$PUBLIC_KEY" && -n "$PRIVATE_KEY" ]] || usage
 [[ -n "$PUBLISHED_AT" && -n "$OUTPUT_DIR" ]] || usage
+signing_validate_policy
 
 [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
     fail arguments "version must be a canonical stable semantic version: $VERSION"
@@ -164,12 +172,14 @@ PRIVATE_ACL="$(/bin/ls -lde "$PRIVATE_KEY" 2>/dev/null)" ||
 
 for command_name in \
     awk base64 cargo codesign cmp df find git hdiutil lipo mktemp otool plutil \
-    rustc shasum stat tr wc; do
+    python3 rustc shasum stat tr wc; do
     command -v "$command_name" >/dev/null 2>&1 ||
         fail tools "required command is unavailable: $command_name"
 done
 [[ -x /usr/libexec/PlistBuddy ]] ||
     fail tools "required command is unavailable: /usr/libexec/PlistBuddy"
+
+signing_preflight
 
 [[ "$(uname -m)" == "arm64" ]] ||
     fail environment "an Apple Silicon (arm64) Mac is required"

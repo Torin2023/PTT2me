@@ -86,6 +86,7 @@ trap 'rm -rf "$TEMP_ROOT"' EXIT
 FIXTURE_REPO="$TEMP_ROOT/repo"
 mkdir -p "$FIXTURE_REPO/scripts" "$TEMP_ROOT/model" "$TEMP_ROOT/output"
 cp "$BUILDER" "$FIXTURE_REPO/scripts/build-release-artifacts.sh"
+cp "$REPO_ROOT/scripts/code-signing.sh" "$FIXTURE_REPO/scripts/"
 cat >"$FIXTURE_REPO/scripts/release-preflight.sh" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$@" >"$PREFLIGHT_INVOCATION_LOG"
@@ -95,7 +96,7 @@ chmod 755 "$FIXTURE_REPO/scripts"/*.sh
 touch "$TEMP_ROOT/model-manifest.json" "$TEMP_ROOT/public-key.txt" "$TEMP_ROOT/private-key.txt"
 chmod 600 "$TEMP_ROOT/private-key.txt"
 PREFLIGHT_INVOCATION_LOG="$TEMP_ROOT/preflight.log" \
-    "$FIXTURE_REPO/scripts/build-release-artifacts.sh" \
+    "$FIXTURE_REPO/scripts/build-release-artifacts.sh" --signing-mode ad-hoc \
     --version 1.1.0 \
     --build 202608111200 \
     --source-commit 1111111111111111111111111111111111111111 \

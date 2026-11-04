@@ -5,13 +5,15 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 cd -- "$REPO_ROOT"
 
+source "$SCRIPT_DIR/code-signing.sh"
+
 fail() {
     echo "PTT2me bundle check failed: $*" >&2
     exit 1
 }
 
 usage() {
-    fail "usage: $0 --variant full|update --model-manifest PATH APP_PATH"
+    fail "usage: $0 --signing-mode ad-hoc|developer-id [--signing-identity SHA1 --team-id TEAMID] --variant full|update --model-manifest PATH APP_PATH"
 }
 
 VARIANT=""
@@ -19,6 +21,11 @@ MODEL_MANIFEST=""
 APP_PATH=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --signing-mode|--signing-identity|--team-id)
+            [[ $# -ge 2 ]] || usage
+            signing_option "$1" "$2"
+            shift 2
+            ;;
         --variant)
             [[ $# -ge 2 ]] || usage
             VARIANT="$2"
@@ -40,6 +47,7 @@ done
 
 [[ "$VARIANT" == "full" || "$VARIANT" == "update" ]] || usage
 [[ -n "$MODEL_MANIFEST" && -n "$APP_PATH" ]] || usage
+signing_validate_policy
 COMMITTED_MODEL_MANIFEST="$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
 [[ -f "$MODEL_MANIFEST" && ! -L "$MODEL_MANIFEST" ]] ||
     fail "model manifest is not a real file: $MODEL_MANIFEST"
@@ -245,7 +253,7 @@ check_executable_linkage "$EXECUTABLE"
 check_sherpa_linkage "$SHERPA_DYLIB"
 check_onnx_linkage "$ONNX_DYLIB"
 
-codesign --verify --deep --strict "$APP_PATH" >/dev/null 2>&1 ||
+signing_verify_app "$APP_PATH" >/dev/null ||
     fail "code signature verification failed"
 
 if [[ "$VARIANT" == "full" ]]; then

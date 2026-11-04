@@ -28,6 +28,9 @@ pasteboard_main
 Ed25519
 SHA-256
 Mach-O parity
+--signing-mode ad-hoc|developer-id
+без fallback
+Hardened Runtime
 Что автоматизация пока не подтверждает
 Fn/Globe
 TCC
@@ -48,6 +51,10 @@ do not publish GitHub Release or the Pages stable channel
 Manual testing is
 not a release or publication requirement
 docs/release/AUTOMATED_RELEASE.md
+--signing-mode developer-id
+--signing-mode ad-hoc
+There is no fallback from Developer ID to ad-hoc
+does not establish readiness for a Developer ID release
 REQUIRED
 
 require_text "$RETIRED" 'чек-лист больше не заполняется'

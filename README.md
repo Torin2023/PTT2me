@@ -189,6 +189,7 @@ Then run:
 
 ```bash
 scripts/build-app.sh \
+  --signing-mode ad-hoc \
   --variant full \
   --model-manifest models/manifests/gigaam-v3-rnnt-v1.json \
   --model-source vendor/models/gigaam-v3-rnnt
@@ -199,6 +200,8 @@ libraries from the Cargo release output, verifies the exact committed model
 manifest, and creates the self-contained Full app at `dist/PTT2me.app`.
 The release coordinator creates the Update variant from the same compiled app
 and removes only `Contents/Resources/models`.
+Python 3.9+ is required by the shared code-signing policy. This development
+example deliberately selects ad-hoc signing; no signing mode is implicit.
 
 ## Automated checks
 
@@ -267,6 +270,9 @@ replace them:
 
 ```bash
 scripts/build-release-artifacts.sh \
+  --signing-mode developer-id \
+  --signing-identity CERTIFICATE_SHA1_FINGERPRINT \
+  --team-id APPLE_TEAM_ID \
   --version X.Y.Z \
   --build YYYYMMDDHHMM \
   --source-commit COMMIT \
@@ -287,6 +293,9 @@ the private key or builder workspace:
 git tag vX.Y.Z COMMIT
 
 scripts/verify-release-artifacts.sh \
+  --signing-mode developer-id \
+  --signing-identity CERTIFICATE_SHA1_FINGERPRINT \
+  --team-id APPLE_TEAM_ID \
   --version X.Y.Z \
   --source-commit COMMIT \
   --full-dmg /absolute/path/to/release-set/PTT2me-X.Y.Z-full-macos-arm64.dmg \
@@ -305,6 +314,50 @@ source/tag, key, model manifest, verifier or relevant environment change, or the
 previous result is incomplete. Documentation edits alone do not require another
 build or full verifier run. Public download/hash and Pages signature/tag/model
 checks still run at publication to verify the delivered bytes.
+
+### Apple code-signing policy
+
+The Developer ID commands above require an **already installed Developer ID
+Application identity**, including its accessible private key. Replace the
+placeholders with the exact 40-hex SHA-1 certificate fingerprint and 10-character
+Team ID. Friendly names and automatic identity selection are rejected. Use the
+same explicit mode, fingerprint and Team ID in the independent verifier; it
+does not need the private key or query signing identities. A missing identity,
+wrong team, signing error or unavailable Apple timestamp service stops the build.
+There is no fallback from Developer ID to ad-hoc.
+
+For an intentionally ad-hoc Preview, replace the three signing arguments in
+both commands with `--signing-mode ad-hoc`. The development-only
+`scripts/grant-and-run.sh` checks ad-hoc bundles. Existing published 1.3.2 Preview
+artifacts remain ad-hoc signed and not Apple-notarized.
+
+Developer ID mode signs both native libraries, the executable and the app from
+the inside out with Hardened Runtime and a secure timestamp. The executable/app
+receives only `com.apple.security.device.audio-input`; library validation stays
+enabled. Update is sealed again after its model removal and Info.plist mutation.
+Every bundle check verifies integrity, the Apple Developer ID certificate chain,
+the exact leaf fingerprint and Team ID, runtime flags, timestamp, app identifier
+and minimal entitlements before the model smoke command can execute. Full/Update
+unsigned Mach-O parity, fixed model checks and all Ed25519 update checks remain
+required. The DMG itself has no Apple signature; its final bytes remain bound by
+the existing signed update manifest.
+
+This path does **not** create/import keys, unlock a keychain, change key access,
+submit for notarization, staple tickets, or publish. Developer ID signing and
+[Apple notarization](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
+are separate. There is currently no available Developer ID identity or real
+Developer ID build result for this work. Stub policy tests and the Apple
+requirement compiler validate command contracts, not certificate access,
+timestamp-service operation, microphone/ASR under Hardened Runtime, notarization
+or Gatekeeper acceptance. Those outcomes remain unverified; this change alone
+does not establish readiness for a Developer ID release. A future authorized
+notarization/stapling stage must finish before DMG hashes and the Ed25519 manifest
+are produced, followed by independent verification of those final bytes.
+
+The certificate requirement follows Apple's
+[code-signing requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements);
+the microphone permission follows its
+[Audio Input entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.device.audio-input).
 
 The preflight, builder, and verifier do not publish GitHub Release or the Pages stable channel.
 Publication is a separate owner-authorized workflow after the applicable CI,

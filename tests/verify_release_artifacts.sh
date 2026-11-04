@@ -91,14 +91,21 @@ write_fixture_helpers() {
 set -euo pipefail
 variant=""
 app=""
+signing_mode=""
+signing_identity=""
+team_id=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --variant) variant="$2"; shift 2 ;;
         --model-manifest) shift 2 ;;
+        --signing-mode) signing_mode="$2"; shift 2 ;;
+        --signing-identity) signing_identity="$2"; shift 2 ;;
+        --team-id) team_id="$2"; shift 2 ;;
         *) app="$1"; shift ;;
     esac
 done
-[[ -n "$variant" && -d "$app" ]] || exit 91
+[[ -n "$variant" && -d "$app" && "$signing_mode" == "$EXPECTED_SIGNING_MODE" ]] || exit 91
+[[ "$signing_identity" == "$EXPECTED_SIGNING_IDENTITY" && "$team_id" == "$EXPECTED_TEAM_ID" ]] || exit 91
 [[ "${FAKE_BUNDLE_FAIL_VARIANT:-}" != "$variant" ]] || exit 92
 [[ "$(cat "$app/variant.txt")" == "$variant" ]] || exit 93
 [[ -x "$app/Contents/MacOS/PTT2me" ]] || exit 94
@@ -177,6 +184,7 @@ write_fixture() {
         "$OUTPUT_DIR" "$KEY_DIR"
 
     cp "$VERIFIER_SOURCE" "$FIXTURE_REPO/scripts/verify-release-artifacts.sh"
+    cp "$REPO_ROOT/scripts/code-signing.sh" "$FIXTURE_REPO/scripts/"
     cp "$REPO_ROOT/scripts/validate-update-manifest.sh" \
         "$FIXTURE_REPO/scripts/validate-update-manifest.sh"
     cp "$REPO_ROOT/scripts/check-model-variant.sh" \
@@ -253,6 +261,14 @@ output_fingerprint() {
 }
 
 verify_command() {
+    local mode="${TEST_SIGNING_MODE:-ad-hoc}"
+    local identity="" team_id=""
+    local policy_args=(--signing-mode "$mode")
+    if [[ "$mode" == developer-id ]]; then
+        identity="0123456789ABCDEF0123456789ABCDEF01234567"
+        team_id="ABCD123456"
+        policy_args+=(--signing-identity "$identity" --team-id "$team_id")
+    fi
     env \
         PATH="$FAKE_BIN:/usr/bin:/bin" \
         IMAGE_ROOT="$IMAGE_ROOT" \
@@ -260,7 +276,10 @@ verify_command() {
         FAKE_HDIUTIL_STATE="$FAKE_HDIUTIL_STATE" \
         FAKE_MANIFEST_VERIFIER="$MANIFEST_VERIFIER" \
         FAKE_MANIFEST_LIBRARY_PATH="$REPO_ROOT/target/debug" \
-        "$FIXTURE_REPO/scripts/verify-release-artifacts.sh" \
+        EXPECTED_SIGNING_MODE="$mode" \
+        EXPECTED_SIGNING_IDENTITY="$identity" \
+        EXPECTED_TEAM_ID="$team_id" \
+        "$FIXTURE_REPO/scripts/verify-release-artifacts.sh" "${policy_args[@]}" \
         --version "${TEST_VERSION:-1.1.0}" \
         --source-commit "${TEST_SOURCE_COMMIT:-$SOURCE_COMMIT}" \
         ${TEST_EXPECTED_TAG:+--expected-tag "$TEST_EXPECTED_TAG"} \
@@ -504,6 +523,15 @@ AFTER="$(output_fingerprint)"
     echo "positive verifier output was unexpected: $OUTPUT" >&2
     exit 1
 }
+expect_detach_logged full
+expect_detach_logged update
+expect_no_mounts
+
+# The bundle verifier is a stub here, but it requires the exact expected policy
+# on both mounted apps. No Apple identity/private key is needed by the release
+# verifier; actual Developer ID signatures are tested only when available.
+write_fixture
+TEST_SIGNING_MODE=developer-id verify_command >/dev/null
 expect_detach_logged full
 expect_detach_logged update
 expect_no_mounts

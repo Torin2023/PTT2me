@@ -35,30 +35,36 @@
 
 ## Developer ID: установленный блокер
 
-На Mac 2026-11-03 команда `security find-identity -v -p codesigning`, выполненная
+На Mac 2026-11-04 команда `security find-identity -v -p codesigning`, выполненная
 также вне sandbox, вернула `0 valid identities found`. Доступная пригодная
 **Developer ID Application identity с приватным ключом не обнаружена**.
 Создание/импорт ключей, сертификатов, API credentials, принятие соглашений и
 оплата не выполнялись. Нельзя объявлять будущую сборку подписанной Developer ID
 или автоматически заменять это требование ad-hoc подписью.
 
-Текущие `build-app.sh` и операция создания Update в
-`build-release-artifacts.sh` явно используют `codesign --sign -`. Наличие
-сертификата само по себе эти команды не изменит. Когда пригодная существующая
-identity будет доступна, интеграция должна:
+В scripts подготовлен явный `--signing-mode ad-hoc|developer-id`.
+Developer ID путь требует точный fingerprint и Team ID уже существующей
+identity, отклоняет отсутствие/ошибку без fallback и передаёт ожидания через
+preflight, Full/Update, DMG и независимую проверку. Вложенные dylib, executable
+и app подписываются изнутри наружу с Hardened Runtime и secure timestamp;
+для executable/app разрешён только audio-input entitlement. Library validation
+не отключается. После изменения variant/models Update подписывается повторно.
+Проверяются Apple certificate requirements, ожидаемые fingerprint/Team ID,
+runtime/timestamp/entitlements, прежние model/bundle checks и Mach-O parity.
+Подробные команды и границы — в разделе Apple code-signing policy README.
 
-- Явно выбрать identity по fingerprint и ожидаемой команде разработчика;
-  preflight должен отклонять отсутствие/неподходящий сертификат без fallback.
-- Подписать вложенные dylib и executable, затем `.app`, после всех изменений
-  Mach-O/Info.plist, с secure timestamp и Hardened Runtime. Отдельно проверить
-  необходимые аудио-entitlements; не отключать library validation без причины.
-- После удаления модели и изменения variant повторно подписать Update bundle
-  той же identity. Проверить цепочку подписи, TeamIdentifier, runtime flags,
-  точную модель, Mach-O parity и все прежние проверки bundle.
-- Для нотариального выпуска использовать уже разрешённую аутентификацию Apple,
-  дождаться принятия, прикрепить и проверить tickets. Создание новых credentials
-  требует отдельного подтверждения. Hashes/размеры DMG и Ed25519 manifest
-  вычисляются после всех изменений подписи/stapling.
+Policy/stub tests и компиляция requirement настоящим `csreq` не доказывают
+наличие настоящей Developer ID подписи. Проверка уже установленного ad-hoc app
+в ad-hoc режиме и его отказ в Developer ID режиме подтверждают только эту
+границу. Доступ к настоящему private key, timestamp service и microphone/ASR
+под Hardened Runtime остаются непроверенными.
+
+Notarization, stapling и Apple-подпись DMG не реализованы этим signing path.
+Для будущего отдельно авторизованного нотариального выпуска нужно использовать
+разрешённую аутентификацию Apple, дождаться принятия, прикрепить и проверить
+tickets. Создание аутентификации не входит в текущую задачу. Хеши DMG и
+Ed25519 manifest вычисляются после всех изменений подписи/stapling, затем
+проверяется окончательный набор артефактов. Gatekeeper acceptance не заявляется.
 
 Developer ID и Ed25519 решают разные задачи: доверенный updater key и проверка
 manifest сохраняются. Подпись сертификатом не является доказательством успешной

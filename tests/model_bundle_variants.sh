@@ -199,7 +199,7 @@ create_update_bundle_fixture \
     "$ARM64_FIXTURE/PTT2me" \
     "$ARM64_FIXTURE/libsherpa-onnx-c-api.dylib" \
     "$ARM64_FIXTURE/libonnxruntime.1.17.1.dylib"
-"$REPO_ROOT/scripts/check-bundle.sh" \
+"$REPO_ROOT/scripts/check-bundle.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json" \
     "$THIN_BUNDLE"
@@ -234,7 +234,7 @@ for universal_name in \
     esac
     expect_failure_containing \
         "$universal_name architectures must be exactly arm64" \
-        "$REPO_ROOT/scripts/check-bundle.sh" \
+        "$REPO_ROOT/scripts/check-bundle.sh" --signing-mode ad-hoc \
         --variant update \
         --model-manifest "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json" \
         "$UNIVERSAL_BUNDLE"
@@ -253,6 +253,9 @@ cp "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json" \
     "$BUILD_FIXTURE_REPO/models/manifests/gigaam-v3-rnnt-v1.json"
 cp "$REPO_ROOT"/licenses/* "$BUILD_FIXTURE_REPO/licenses/"
 for fixture_script in \
+    code-signing.sh \
+    code-signing.py \
+    developer-id-entitlements.plist \
     build-app.sh \
     check-app-icon.sh \
     check-bundle.sh \
@@ -286,7 +289,7 @@ PACKAGED_APP="$TEMP_ROOT/packaged-universal-input.app"
 env \
     PATH="$BUILD_FIXTURE_REPO/fake-tools:$PATH" \
     FIXTURE_BIN_DIR="$UNIVERSAL_LIBRARY_INPUT" \
-    "$BUILD_FIXTURE_REPO/scripts/build-app.sh" \
+    "$BUILD_FIXTURE_REPO/scripts/build-app.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest \
     "$BUILD_FIXTURE_REPO/models/manifests/gigaam-v3-rnnt-v1.json" \
@@ -300,7 +303,7 @@ PACKAGED_THIN_APP="$TEMP_ROOT/packaged-thin-input.app"
 env \
     PATH="$BUILD_FIXTURE_REPO/fake-tools:$PATH" \
     FIXTURE_BIN_DIR="$ARM64_FIXTURE" \
-    "$BUILD_FIXTURE_REPO/scripts/build-app.sh" \
+    "$BUILD_FIXTURE_REPO/scripts/build-app.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest \
     "$BUILD_FIXTURE_REPO/models/manifests/gigaam-v3-rnnt-v1.json" \
@@ -320,7 +323,7 @@ expect_failure_containing \
     env \
     PATH="$BUILD_FIXTURE_REPO/fake-tools:$PATH" \
     FIXTURE_BIN_DIR="$X86_64_LIBRARY_INPUT" \
-    "$BUILD_FIXTURE_REPO/scripts/build-app.sh" \
+    "$BUILD_FIXTURE_REPO/scripts/build-app.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest \
     "$BUILD_FIXTURE_REPO/models/manifests/gigaam-v3-rnnt-v1.json" \
@@ -336,16 +339,16 @@ expect_failure_containing "production manifest SHA-256 mismatch" \
 FAKE_APP="$TEMP_ROOT/fake.app"
 mkdir "$FAKE_APP"
 expect_failure_containing "production manifest SHA-256 mismatch" \
-    "$REPO_ROOT/scripts/build-app.sh" \
+    "$REPO_ROOT/scripts/build-app.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest "$WHITESPACE_MUTATION"
 expect_failure_containing "production manifest SHA-256 mismatch" \
-    "$REPO_ROOT/scripts/check-bundle.sh" \
+    "$REPO_ROOT/scripts/check-bundle.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest "$WHITESPACE_MUTATION" \
     "$FAKE_APP"
 expect_failure_containing "production manifest SHA-256 mismatch" \
-    "$REPO_ROOT/scripts/build-dmg.sh" \
+    "$REPO_ROOT/scripts/build-dmg.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest "$WHITESPACE_MUTATION" \
     --app "$FAKE_APP" \
@@ -353,13 +356,13 @@ expect_failure_containing "production manifest SHA-256 mismatch" \
 
 expect_failure_containing "git HEAD must be exactly 40 lowercase hexadecimal characters" \
     env PATH="$FAKE_TOOLS:$PATH" \
-    "$REPO_ROOT/scripts/build-app.sh" \
+    "$REPO_ROOT/scripts/build-app.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
 
 expect_failure_containing "explicit build must be a valid 12-digit UTC calendar minute" \
     env PATH="$FAKE_TOOLS:$PATH" \
-    "$REPO_ROOT/scripts/build-app.sh" \
+    "$REPO_ROOT/scripts/build-app.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json" \
     --build invalid
@@ -395,7 +398,7 @@ plutil -create xml1 "$INVALID_IDENTITY_PLIST"
 expect_failure_containing \
     "Info.plist PTT2meSourceCommit must be 40 lowercase hexadecimal characters" \
     env PATH="$FAKE_TOOLS:$PATH" \
-    "$REPO_ROOT/scripts/check-bundle.sh" \
+    "$REPO_ROOT/scripts/check-bundle.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json" \
     "$INVALID_IDENTITY_APP"
@@ -476,7 +479,7 @@ PRODUCTION_MANIFEST="$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json"
 OUTPUT_DIRECTORY="$TEMP_ROOT/existing-output.dmg"
 mkdir "$OUTPUT_DIRECTORY"
 expect_failure_containing "output path already exists" \
-    "$REPO_ROOT/scripts/build-dmg.sh" \
+    "$REPO_ROOT/scripts/build-dmg.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest "$PRODUCTION_MANIFEST" \
     --app "$FAKE_APP" \
@@ -485,7 +488,7 @@ expect_failure_containing "output path already exists" \
 CHECKSUM_DIRECTORY_OUTPUT="$TEMP_ROOT/checksum-directory.dmg"
 mkdir "$CHECKSUM_DIRECTORY_OUTPUT.sha256"
 expect_failure_containing "checksum path already exists" \
-    "$REPO_ROOT/scripts/build-dmg.sh" \
+    "$REPO_ROOT/scripts/build-dmg.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest "$PRODUCTION_MANIFEST" \
     --app "$FAKE_APP" \
@@ -494,14 +497,14 @@ expect_failure_containing "checksum path already exists" \
 CHECKSUM_SYMLINK_OUTPUT="$TEMP_ROOT/checksum-symlink.dmg"
 ln -s "$TEMP_ROOT/missing-checksum-target" "$CHECKSUM_SYMLINK_OUTPUT.sha256"
 expect_failure_containing "checksum path already exists" \
-    "$REPO_ROOT/scripts/build-dmg.sh" \
+    "$REPO_ROOT/scripts/build-dmg.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest "$PRODUCTION_MANIFEST" \
     --app "$FAKE_APP" \
     --output "$CHECKSUM_SYMLINK_OUTPUT"
 
 expect_failure_containing "output must not be inside the supplied app" \
-    "$REPO_ROOT/scripts/build-dmg.sh" \
+    "$REPO_ROOT/scripts/build-dmg.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest "$PRODUCTION_MANIFEST" \
     --app "$FAKE_APP" \
@@ -527,16 +530,16 @@ if grep -Fq 'mv -f' "$REPO_ROOT/scripts/build-dmg.sh"; then
 fi
 
 expect_failure_containing "update variant does not accept --model-source" \
-    "$REPO_ROOT/scripts/build-app.sh" \
+    "$REPO_ROOT/scripts/build-app.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest "$MANIFEST" \
     --model-source "$MODEL_DIRECTORY"
 expect_failure_containing "full variant requires --model-source" \
-    "$REPO_ROOT/scripts/build-app.sh" \
+    "$REPO_ROOT/scripts/build-app.sh" --signing-mode ad-hoc \
     --variant full \
     --model-manifest "$MANIFEST"
 expect_failure_containing "app bundle is not a real directory" \
-    "$REPO_ROOT/scripts/build-dmg.sh" \
+    "$REPO_ROOT/scripts/build-dmg.sh" --signing-mode ad-hoc \
     --variant update \
     --model-manifest "$MANIFEST" \
     --app "$TEMP_ROOT/missing.app" \

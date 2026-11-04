@@ -25,9 +25,9 @@ cp "$RIGHT" "$RIGHT_UNSIGNED"
 chmod u+w "$LEFT_UNSIGNED" "$RIGHT_UNSIGNED"
 
 codesign --remove-signature "$LEFT_UNSIGNED" >/dev/null 2>&1 ||
-    fail "could not remove the left ad-hoc signature"
+    fail "could not remove the left code signature"
 codesign --remove-signature "$RIGHT_UNSIGNED" >/dev/null 2>&1 ||
-    fail "could not remove the right ad-hoc signature"
+    fail "could not remove the right code signature"
 
 cmp -s "$LEFT_UNSIGNED" "$RIGHT_UNSIGNED" ||
     fail "unsigned Mach-O payloads differ"

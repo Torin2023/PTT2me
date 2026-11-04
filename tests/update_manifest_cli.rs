@@ -268,6 +268,7 @@ fn release_coordinator_rejects_a_different_public_key_before_building() {
     fs::set_permissions(&private_key, fs::Permissions::from_mode(0o600)).unwrap();
 
     let output = Command::new(repository.join("scripts/build-release-artifacts.sh"))
+        .args(["--signing-mode", "ad-hoc"])
         .arg("--version")
         .arg("1.0.5")
         .arg("--build")

@@ -8,13 +8,15 @@ readonly SCRIPT_DIR
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 readonly REPO_ROOT
 
+source "$SCRIPT_DIR/code-signing.sh"
+
 fail() {
     echo "PTT2me DMG build failed: $*" >&2
     exit 1
 }
 
 usage() {
-    fail "usage: $0 --variant full|update --model-manifest PATH --app APP_PATH --output DMG_PATH"
+    fail "usage: $0 --signing-mode ad-hoc|developer-id [--signing-identity SHA1 --team-id TEAMID] --variant full|update --model-manifest PATH --app APP_PATH --output DMG_PATH"
 }
 
 VARIANT=""
@@ -23,6 +25,11 @@ APP_PATH=""
 DMG_PATH=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --signing-mode|--signing-identity|--team-id)
+            [[ $# -ge 2 ]] || usage
+            signing_option "$1" "$2"
+            shift 2
+            ;;
         --variant)
             [[ $# -ge 2 ]] || usage
             VARIANT="$2"
@@ -49,6 +56,7 @@ done
 
 [[ "$VARIANT" == "full" || "$VARIANT" == "update" ]] || usage
 [[ -n "$MODEL_MANIFEST" && -n "$APP_PATH" && -n "$DMG_PATH" ]] || usage
+signing_validate_policy
 
 # Resolve caller-supplied paths before changing the working directory.
 [[ -d "$APP_PATH" && ! -L "$APP_PATH" ]] ||
@@ -113,7 +121,7 @@ readonly MOUNT_DIR="$TEMP_ROOT/mount"
 readonly TEMP_DMG="$TEMP_ROOT/image.dmg"
 readonly TEMP_CHECKSUM="$TEMP_ROOT/image.sha256"
 
-"$SCRIPT_DIR/check-bundle.sh" \
+"$SCRIPT_DIR/check-bundle.sh" "${SIGNING_ARGS[@]}" \
     --variant "$VARIANT" \
     --model-manifest "$MODEL_MANIFEST" \
     "$APP_PATH"
@@ -143,7 +151,7 @@ DMG_MOUNTED=true
     fail "Applications link has the wrong target"
 [[ "$(find "$MOUNT_DIR" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" == "2" ]] ||
     fail "mounted image contains unexpected root items"
-"$SCRIPT_DIR/check-bundle.sh" \
+"$SCRIPT_DIR/check-bundle.sh" "${SIGNING_ARGS[@]}" \
     --variant "$VARIANT" \
     --model-manifest "$MODEL_MANIFEST" \
     "$MOUNT_DIR/$PRODUCT.app"

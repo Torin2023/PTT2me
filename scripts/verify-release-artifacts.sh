@@ -9,6 +9,8 @@ readonly SCRIPT_DIR
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 readonly REPO_ROOT
 
+source "$SCRIPT_DIR/code-signing.sh"
+
 fail() {
     local category="$1"
     shift
@@ -17,7 +19,7 @@ fail() {
 }
 
 usage() {
-    fail arguments "usage: $0 --version X.Y.Z --source-commit COMMIT [--expected-tag vX.Y.Z] --full-dmg PATH --full-checksum PATH --update-dmg PATH --update-checksum PATH --manifest PATH --public-key PATH --model-manifest PATH"
+    fail arguments "usage: $0 --signing-mode ad-hoc|developer-id [--signing-identity SHA1 --team-id TEAMID] --version X.Y.Z --source-commit COMMIT [--expected-tag vX.Y.Z] --full-dmg PATH --full-checksum PATH --update-dmg PATH --update-checksum PATH --manifest PATH --public-key PATH --model-manifest PATH"
 }
 
 canonical_file() {
@@ -50,6 +52,11 @@ PUBLIC_KEY=""
 MODEL_MANIFEST=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --signing-mode|--signing-identity|--team-id)
+            [[ $# -ge 2 ]] || usage
+            signing_option "$1" "$2"
+            shift 2
+            ;;
         --version)
             [[ $# -ge 2 ]] || usage
             VERSION="$2"
@@ -108,6 +115,7 @@ done
 [[ -n "$FULL_DMG" && -n "$FULL_CHECKSUM" ]] || usage
 [[ -n "$UPDATE_DMG" && -n "$UPDATE_CHECKSUM" ]] || usage
 [[ -n "$SIGNED_MANIFEST" && -n "$PUBLIC_KEY" && -n "$MODEL_MANIFEST" ]] || usage
+signing_validate_policy
 [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
     fail arguments "version must be a canonical stable semantic version: $VERSION"
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
@@ -329,9 +337,9 @@ verify_bundle_identity() {
 
 verify_bundle_identity Full "$FULL_APP"
 verify_bundle_identity Update "$UPDATE_APP"
-"$SCRIPT_DIR/check-bundle.sh" --variant full --model-manifest "$MODEL_MANIFEST" "$FULL_APP" ||
+"$SCRIPT_DIR/check-bundle.sh" "${SIGNING_ARGS[@]}" --variant full --model-manifest "$MODEL_MANIFEST" "$FULL_APP" ||
     fail bundle "Full bundle recheck failed"
-"$SCRIPT_DIR/check-bundle.sh" --variant update --model-manifest "$MODEL_MANIFEST" "$UPDATE_APP" ||
+"$SCRIPT_DIR/check-bundle.sh" "${SIGNING_ARGS[@]}" --variant update --model-manifest "$MODEL_MANIFEST" "$UPDATE_APP" ||
     fail bundle "Update bundle recheck failed"
 "$SCRIPT_DIR/check-model-variant.sh" --variant full --model-manifest "$MODEL_MANIFEST" --resources "$FULL_APP/Contents/Resources" ||
     fail bundle "Full bundle does not contain the exact production model"

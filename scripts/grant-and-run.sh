@@ -22,6 +22,10 @@ Usage:
   scripts/grant-and-run.sh --open-panes
   scripts/grant-and-run.sh --help
 
+This development helper accepts explicitly ad-hoc signed bundles only.
+Verify Developer ID bundles with the expected fingerprint and Team ID using
+scripts/check-bundle.sh; this helper does not infer their signing identity.
+
 Modes:
   (default)     Preserve permissions and launch PTT2me.
   --open-panes  Open the three required Privacy & Security panes.
@@ -87,7 +91,7 @@ case "$BUNDLE_VARIANT" in
         ;;
 esac
 readonly BUNDLE_VARIANT
-"$SCRIPT_DIR/check-bundle.sh" \
+"$SCRIPT_DIR/check-bundle.sh" --signing-mode ad-hoc \
     --variant "$BUNDLE_VARIANT" \
     --model-manifest "$REPO_ROOT/models/manifests/gigaam-v3-rnnt-v1.json" \
     "$APP_PATH"
