@@ -14,5 +14,6 @@ bash tests/verify_release_artifacts.sh
 bash tests/release_ci_contracts.sh
 bash tests/release_documentation.sh
 python3 -B -m unittest discover -s tests -p 'test_ci_validation.py'
+python3 -B -m unittest discover -s tests -p 'test_asr_corpus.py'
 
 echo "PTT2me shell contract gate passed"

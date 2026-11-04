@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::MainThreadMarker;
+use ptt2me::asr::AsrProfile;
 use ptt2me::permissions::prime_microphone_and_exit;
 use ptt2me::release_manifest::verify_release_files;
 use ptt2me::runtime::{finish_after_run, smoke_bundled_model, smoke_bundled_model_child, Runtime};
@@ -11,7 +12,7 @@ use ptt2me::single_instance::InstanceLock;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LaunchMode {
     App,
-    AsrWorker,
+    AsrWorker(AsrProfile),
     PrimeMicrophone,
     SmokeModel,
     SmokeModelChild,
@@ -56,8 +57,8 @@ fn main() -> ExitCode {
         };
     }
 
-    if mode == LaunchMode::AsrWorker {
-        return ExitCode::from(ptt2me::run_asr_worker_process() as u8);
+    if let LaunchMode::AsrWorker(profile) = mode {
+        return ExitCode::from(ptt2me::run_asr_worker_process(profile) as u8);
     }
 
     ptt2me::logging::init();
@@ -72,7 +73,7 @@ fn main() -> ExitCode {
             return ExitCode::from(smoke_bundled_model_child() as u8);
         }
         LaunchMode::App => {}
-        LaunchMode::VerifyUpdateManifest { .. } | LaunchMode::AsrWorker => unreachable!(),
+        LaunchMode::VerifyUpdateManifest { .. } | LaunchMode::AsrWorker(_) => unreachable!(),
     }
 
     let Ok(_instance_lock) = InstanceLock::acquire() else {
@@ -100,7 +101,14 @@ fn parse_launch_mode(
     let arguments = arguments.into_iter().collect::<Vec<_>>();
     match arguments.as_slice() {
         [] => Ok(LaunchMode::App),
-        [argument] if argument == "--asr-worker" => Ok(LaunchMode::AsrWorker),
+        [argument] if argument == "--asr-worker" => {
+            Ok(LaunchMode::AsrWorker(AsrProfile::default()))
+        }
+        [mode, option, profile] if mode == "--asr-worker" && option == "--profile" => profile
+            .to_str()
+            .and_then(AsrProfile::from_key)
+            .map(LaunchMode::AsrWorker)
+            .ok_or(()),
         [argument] if argument == "--prime-microphone-and-exit" => Ok(LaunchMode::PrimeMicrophone),
         [argument] if argument == "--smoke-model" => Ok(LaunchMode::SmokeModel),
         [argument] if argument == "--smoke-model-child" => Ok(LaunchMode::SmokeModelChild),
@@ -130,12 +138,16 @@ fn activation_policy_allows_launch(
 mod tests {
     use std::ffi::OsString;
 
-    use super::{activation_policy_allows_launch, parse_launch_mode, LaunchMode};
+    use super::{activation_policy_allows_launch, parse_launch_mode, AsrProfile, LaunchMode};
     use objc2_app_kit::NSApplicationActivationPolicy;
 
     #[test]
     fn recognizes_only_the_hidden_modes() {
         assert_eq!(parse_launch_mode(Vec::new()), Ok(LaunchMode::App));
+        assert_eq!(
+            parse_launch_mode([OsString::from("--asr-worker")]),
+            Ok(LaunchMode::AsrWorker(AsrProfile::Balanced))
+        );
         assert_eq!(
             parse_launch_mode([OsString::from("--prime-microphone-and-exit")]),
             Ok(LaunchMode::PrimeMicrophone)
@@ -148,6 +160,34 @@ mod tests {
             parse_launch_mode([OsString::from("--smoke-model-child")]),
             Ok(LaunchMode::SmokeModelChild)
         );
+    }
+
+    #[test]
+    fn worker_profiles_require_one_known_explicit_value() {
+        for (key, profile) in [
+            ("balanced", AsrProfile::Balanced),
+            ("fast", AsrProfile::Fast),
+        ] {
+            assert_eq!(
+                parse_launch_mode(["--asr-worker", "--profile", key].map(OsString::from)),
+                Ok(LaunchMode::AsrWorker(profile))
+            );
+        }
+        for arguments in [
+            vec!["--asr-worker", "--profile"],
+            vec!["--asr-worker", "--profile", "4"],
+            vec!["--asr-worker", "--profile", "FAST"],
+            vec!["--asr-worker", "--profile", "unknown"],
+            vec!["--asr-worker", "--profile", "fast", "--smoke-model"],
+            vec!["--asr-worker", "--profile", "fast", "--profile", "balanced"],
+            vec!["--profile", "fast"],
+            vec!["--smoke-model", "--profile", "fast"],
+        ] {
+            assert_eq!(
+                parse_launch_mode(arguments.into_iter().map(OsString::from)),
+                Err(())
+            );
+        }
     }
 
     #[test]

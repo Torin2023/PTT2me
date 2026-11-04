@@ -1,3 +1,8 @@
+mod scheduling;
+use scheduling::{asr_wake_deadline, drain_event_lanes, PermissionRetry};
+#[cfg(test)]
+use scheduling::{EVENTS_PER_LANE, EVENTS_PER_PASS, EVENT_BUDGET, PERMISSION_POLL_MS};
+
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -20,6 +25,7 @@ use objc2_app_kit::NSApplication;
 use objc2_foundation::MainThreadMarker;
 
 use crate::asr::{spawn_asr_worker, AsrCommand, AsrEvent};
+use crate::asr_preferences::{AsrPreferenceController, SystemAsrPreferenceStore};
 use crate::asr_task::{AsrTask, AsrTaskError};
 use crate::audio::{AudioError, AudioRecorder};
 use crate::audio_task::AudioPreparationTask;
@@ -61,7 +67,6 @@ use crate::updater_runtime::{
     UpdaterLaunchConfig, UpdaterRuntimeEffect,
 };
 
-const PERMISSION_POLL_MS: u64 = 1_000;
 const INSERTION_PROBE_RETRY_MS: u64 = 10;
 const SMOKE_MODEL_TIMEOUT: Duration = Duration::from_secs(180);
 const SMOKE_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -255,6 +260,7 @@ impl<R: RawPreferenceStore> RuntimePreferences<R> {
             MenuCommand::SetThreshold(threshold) => self.current.threshold = threshold,
             MenuCommand::BeginTriggerAssignment { .. }
             | MenuCommand::SetAppendSpace(_)
+            | MenuCommand::SetAsrProfile(_)
             | MenuCommand::Boundary(_) => return Err(()),
         }
         Ok(())
@@ -555,8 +561,8 @@ impl PasteOutcome {
             Self::Delivered if generation == capture.generation => {
                 Some(AppEvent::PasteFinished(Ok(())))
             }
-            Self::PasteFailed(_) if generation == capture.generation => {
-                Some(AppEvent::PasteFinished(Err("insert failed".to_owned())))
+            Self::PasteFailed(error) if generation == capture.generation => {
+                Some(AppEvent::PasteFinished(Err(*error)))
             }
             Self::Restored(Err(_))
                 if generation == capture.latest_started_generation
@@ -798,88 +804,6 @@ extern "C" fn timer_fired(_timer: CFRunLoopTimerRef, raw_context: *mut c_void) {
     }
 }
 
-#[derive(Default)]
-struct PermissionRetry {
-    delay_ms: u64,
-}
-impl PermissionRetry {
-    fn restart(&mut self) {
-        self.delay_ms = 0;
-    }
-    fn next(&mut self, needed: bool) -> Option<u64> {
-        if !needed {
-            self.restart();
-            return None;
-        }
-        self.delay_ms = if self.delay_ms == 0 {
-            PERMISSION_POLL_MS
-        } else {
-            (self.delay_ms * 2).min(30_000)
-        };
-        Some(self.delay_ms)
-    }
-}
-
-fn asr_wake_deadline(
-    now: Instant,
-    operation: Option<Instant>,
-    cleanup_pending: bool,
-    scheduled: Option<Instant>,
-    cleanup_check_ms: &mut u64,
-) -> Option<Instant> {
-    if !cleanup_pending {
-        *cleanup_check_ms = 10;
-    }
-    operation.or_else(|| {
-        if !cleanup_pending {
-            return None;
-        }
-        scheduled.or_else(|| {
-            let deadline = now + Duration::from_millis(*cleanup_check_ms);
-            *cleanup_check_ms = (*cleanup_check_ms * 2).min(1_000);
-            Some(deadline)
-        })
-    })
-}
-
-const EVENT_LANES: usize = 11;
-const EVENTS_PER_LANE: usize = 32;
-const EVENTS_PER_PASS: usize = 128;
-const EVENT_BUDGET: Duration = Duration::from_millis(2);
-
-fn drain_event_lanes(
-    next_lane: &mut usize,
-    mut drain: impl FnMut(usize) -> bool,
-    mut elapsed: impl FnMut() -> Duration,
-) -> bool {
-    let mut counts = [0; EVENT_LANES];
-    let mut available = [true; EVENT_LANES];
-    let mut total = 0;
-    let mut continuation = false;
-    while available.iter().any(|ready| *ready) {
-        let lane = *next_lane;
-        *next_lane = (lane + 1) % EVENT_LANES;
-        if !available[lane] {
-            continue;
-        }
-        if drain(lane) {
-            counts[lane] += 1;
-            total += 1;
-            if counts[lane] == EVENTS_PER_LANE {
-                available[lane] = false;
-                continuation = true;
-            }
-            if total == EVENTS_PER_PASS || elapsed() >= EVENT_BUDGET {
-                continuation = true;
-                break;
-            }
-        } else {
-            available[lane] = false;
-        }
-    }
-    continuation
-}
-
 // FIFO fences bound the prefix without copying it or allowing later arrivals
 // to prolong it. At most one clipboard completion and one open preflight exist.
 #[derive(Default)]
@@ -1056,6 +980,7 @@ pub struct Runtime {
     menu: MenuBar,
     preferences: RuntimePreferences<SystemPreferenceStore>,
     output_preferences: OutputPreferenceController<SystemOutputPreferenceStore>,
+    asr_preferences: AsrPreferenceController<SystemAsrPreferenceStore>,
     menu_commands: Receiver<MenuCommand>,
     menu_sender: Sender<MenuCommand>,
     hotkey_control: HotkeyControl,
@@ -1183,7 +1108,8 @@ impl Runtime {
         let notifier = event_source.notifier();
         let (hotkey_sender, hotkey_events) = mpsc::channel();
         let (menu_sender, menu_commands) = mpsc::channel();
-        let asr = AsrTask::spawn_notified(notifier.clone());
+        let asr_preferences = AsrPreferenceController::load(SystemAsrPreferenceStore::standard());
+        let asr = AsrTask::spawn_notified(notifier.clone(), asr_preferences.snapshot().active);
         let (model_preparation_events, model_preparation_worker) =
             spawn_model_preparation_worker(notifier.clone());
         let model_preparation =
@@ -1211,6 +1137,7 @@ impl Runtime {
             ),
             preferences: RuntimePreferences::new(preferences, preference_repository),
             output_preferences,
+            asr_preferences,
             menu_commands,
             menu_sender,
             hotkey_control,
@@ -1266,6 +1193,9 @@ impl Runtime {
         let initialization_guard = event_source.suspend();
         let runtime_ref = unsafe { Pin::as_mut(&mut runtime).get_unchecked_mut() };
         let pointer = runtime_ref as *mut Runtime;
+        runtime_ref
+            .menu
+            .render_asr_profile(runtime_ref.asr_preferences.snapshot());
         runtime_ref.initialize_updater();
         tracing::info!(
             lifecycle = "started",
@@ -1774,6 +1704,9 @@ impl Runtime {
         self.menu.render_updater(
             self.updater.as_ref().map(SystemUpdaterLane::state),
             open_enabled,
+            self.updater
+                .as_ref()
+                .and_then(SystemUpdaterLane::last_open_failure),
         );
     }
 
@@ -1968,6 +1901,15 @@ impl Runtime {
             }
             self.menu
                 .render_append_space(self.output_preferences.current().append_space);
+            return;
+        }
+
+        if let MenuCommand::SetAsrProfile(profile) = command {
+            if self.asr_preferences.select(profile).is_err() {
+                tracing::warn!(error_category = "asr_profile_persistence");
+            }
+            self.menu
+                .render_asr_profile(self.asr_preferences.snapshot());
             return;
         }
 
@@ -3542,14 +3484,18 @@ mod tests {
         assert_eq!(timers.scheduled, [(30, TimerKind::PasteCommand(1))]);
         let mut controller = recognizing_controller();
         let mut capture = inserting_capture();
+        assert_eq!(
+            outcome.foreground_event(1, &capture),
+            Some(AppEvent::PasteFinished(Err(InsertError::KeyboardEvent)))
+        );
         apply_paste_outcome(&mut controller, &mut capture, 1, outcome);
-        assert!(matches!(
+        assert_eq!(
             controller.status(),
-            AppStatus::Error {
+            &AppStatus::Error {
+                message: "Не удалось отправить команду вставки. Повторите диктовку",
                 recoverable: true,
-                ..
             }
-        ));
+        );
     }
 
     #[test]
@@ -4339,65 +4285,6 @@ mod event_tests {
     }
 
     #[test]
-    fn lane_and_pass_caps_are_fair_and_consumed_suppression_continues() {
-        let mut cursor = 0;
-        let mut counts = [0; EVENT_LANES];
-        assert!(drain_event_lanes(
-            &mut cursor,
-            |lane| {
-                counts[lane] += 1;
-                true
-            },
-            || Duration::ZERO
-        ));
-        assert_eq!(counts.iter().sum::<usize>(), EVENTS_PER_PASS);
-        assert!(counts.iter().all(|count| (11..=12).contains(count)));
-        let mut remaining = 65;
-        let mut passes = 0;
-        loop {
-            let mut consumed = 0;
-            let more = drain_event_lanes(
-                &mut cursor,
-                |lane| {
-                    if lane == 8 && remaining != 0 {
-                        remaining -= 1;
-                        consumed += 1;
-                        true
-                    } else {
-                        false
-                    }
-                },
-                || Duration::ZERO,
-            );
-            assert!(consumed <= 32);
-            passes += 1;
-            if !more {
-                break;
-            }
-        }
-        assert_eq!(passes, 3);
-        assert_eq!(remaining, 0);
-    }
-
-    #[test]
-    fn cooperative_time_budget_rotates_even_if_one_handler_takes_two_ms() {
-        let mut cursor = 0;
-        let mut serviced = Vec::new();
-        for _ in 0..EVENT_LANES {
-            assert!(drain_event_lanes(
-                &mut cursor,
-                |lane| {
-                    serviced.push(lane);
-                    true
-                },
-                || EVENT_BUDGET
-            ));
-        }
-        assert_eq!(serviced, (0..EVENT_LANES).collect::<Vec<_>>());
-        assert!(!drain_event_lanes(&mut cursor, |_| false, || EVENT_BUDGET));
-    }
-
-    #[test]
     fn bounded_paste_and_open_fences_preserve_busy_prefix_and_later_press() {
         let mut controller = ready();
         controller.handle(AppEvent::TriggerPressed);
@@ -4556,23 +4443,7 @@ mod event_tests {
     }
 
     #[test]
-    fn permission_backoff_keeps_late_grants_observable_and_healthy_idle_has_no_timer() {
-        let mut retry = PermissionRetry::default();
-        assert_eq!(
-            (0..8)
-                .map(|_| retry.next(true).unwrap())
-                .collect::<Vec<_>>(),
-            [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]
-        );
-        for _ in 0..100 {
-            assert_eq!(retry.next(true), Some(30_000));
-        }
-        assert_eq!(retry.next(false), None);
-        for _ in 0..100 {
-            assert_eq!(retry.next(false), None);
-        }
-        retry.restart();
-        assert_eq!(retry.next(true), Some(1_000));
+    fn revoked_permissions_block_capture_and_asr_recovery_until_granted() {
         let mut controller = ready();
         let revoked = PermissionSnapshot {
             microphone: false,
@@ -4806,41 +4677,6 @@ mod producer_wake_tests {
             pump_until(|| seen.get());
             assert_eq!(worker.join().is_err(), panics);
         }
-    }
-
-    #[test]
-    fn completion_watchdog_backoff_is_pending_only_and_keeps_exact_operation_deadline() {
-        let now = Instant::now();
-        let mut delay = 10;
-        assert_eq!(asr_wake_deadline(now, None, false, None, &mut delay), None);
-        let operation = now + Duration::from_secs(60);
-        assert_eq!(
-            asr_wake_deadline(now, Some(operation), false, None, &mut delay),
-            Some(operation)
-        );
-        assert_eq!(
-            asr_wake_deadline(now, None, false, Some(operation), &mut delay),
-            None
-        );
-        let first = asr_wake_deadline(now, None, true, None, &mut delay).unwrap();
-        assert_eq!(first, now + Duration::from_millis(10));
-        assert_eq!(
-            asr_wake_deadline(now, None, true, Some(first), &mut delay),
-            Some(first)
-        );
-        assert_eq!(delay, 20);
-        let mut instant = first;
-        for _ in 0..20 {
-            let next = asr_wake_deadline(instant, None, true, None, &mut delay).unwrap();
-            assert!(next > instant);
-            assert!(next <= instant + Duration::from_secs(1));
-            instant = next;
-        }
-        assert_eq!(
-            asr_wake_deadline(instant, None, false, Some(instant), &mut delay),
-            None
-        );
-        assert_eq!(delay, 10);
     }
 
     #[test]

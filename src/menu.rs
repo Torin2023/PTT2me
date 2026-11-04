@@ -15,10 +15,13 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 
+use crate::asr::AsrProfile;
+use crate::asr_preferences::AsrPreferenceSnapshot;
+use crate::diagnostics;
 use crate::hotkey::{AssignmentEpoch, HotkeyControl};
 use crate::preferences::{HoldThreshold, Preferences, TriggerKey};
 use crate::state::{AppStatus, PermissionKind};
-use crate::updater::{ArtifactKind, RetryAction, UpdaterState};
+use crate::updater::{ArtifactKind, RetryAction, UpdateFailure, UpdaterState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolStyle {
@@ -98,7 +101,11 @@ impl UpdaterMenuProjection {
         }
     }
 
-    fn from_state(state: Option<&UpdaterState>, open_enabled: bool) -> Self {
+    fn from_state(
+        state: Option<&UpdaterState>,
+        open_enabled: bool,
+        last_open_failure: Option<UpdateFailure>,
+    ) -> Self {
         let Some(state) = state else {
             return Self::hidden();
         };
@@ -160,41 +167,39 @@ impl UpdaterMenuProjection {
             UpdaterState::Downloading { release, .. } => {
                 Self::information(format!("Загрузка обновления {}…", release.version))
             }
-            UpdaterState::ReadyToInstall { release, .. } => Self::information_and_action(
-                format!("Обновление {} загружено", release.version),
-                "Открыть DMG и выйти…".to_owned(),
-                UpdaterMenuAction::OpenDownloadedUpdate,
-                open_enabled,
-            ),
+            UpdaterState::ReadyToInstall { release, .. } => {
+                let opening_failed = last_open_failure == Some(UpdateFailure::OpenDmg);
+                Self::information_and_action(
+                    if opening_failed {
+                        diagnostics::update_message(UpdateFailure::OpenDmg).to_owned()
+                    } else {
+                        format!("Обновление {} загружено", release.version)
+                    },
+                    if opening_failed {
+                        "Повторить открытие DMG и выйти…"
+                    } else {
+                        "Открыть DMG и выйти…"
+                    }
+                    .to_owned(),
+                    UpdaterMenuAction::OpenDownloadedUpdate,
+                    open_enabled,
+                )
+            }
             UpdaterState::Opening { release, .. } => {
                 Self::information(format!("Открытие обновления {}…", release.version))
             }
             UpdaterState::Failed { failure, retry, .. } => {
-                let mut projection = match retry {
-                    RetryAction::ManualCheck => Self::information_and_action(
-                        "Не удалось проверить обновления".to_owned(),
-                        "Повторить проверку".to_owned(),
-                        UpdaterMenuAction::RetryUpdate,
-                        true,
-                    ),
-                    RetryAction::Download => Self::information_and_action(
-                        "Не удалось загрузить обновление".to_owned(),
-                        "Повторить загрузку".to_owned(),
-                        UpdaterMenuAction::RetryUpdate,
-                        true,
-                    ),
-                    RetryAction::ModelRecheck => Self::information_and_action(
-                        "Не удалось проверить модель".to_owned(),
-                        "Повторить".to_owned(),
-                        UpdaterMenuAction::RetryUpdate,
-                        true,
-                    ),
+                let action_title = match retry {
+                    RetryAction::ManualCheck => "Повторить проверку",
+                    RetryAction::Download => "Повторить загрузку",
+                    RetryAction::ModelRecheck => "Повторить",
                 };
-                if *failure == crate::updater::UpdateFailure::WorkerStopped {
-                    projection.information_title =
-                        "Обработчик обновлений остановился. Повторите попытку".to_owned();
-                }
-                projection
+                Self::information_and_action(
+                    diagnostics::update_message(*failure).to_owned(),
+                    action_title.to_owned(),
+                    UpdaterMenuAction::RetryUpdate,
+                    true,
+                )
             }
         }
     }
@@ -364,11 +369,12 @@ pub enum MenuEntry {
     Trigger,
     Threshold,
     TrailingSpace,
+    AsrProfile,
     Separator,
     Quit,
 }
 
-pub const MENU_DESCRIPTOR: [MenuEntry; 10] = [
+pub const MENU_DESCRIPTOR: [MenuEntry; 11] = [
     MenuEntry::Status,
     MenuEntry::Version,
     MenuEntry::UpdaterInfo,
@@ -377,6 +383,7 @@ pub const MENU_DESCRIPTOR: [MenuEntry; 10] = [
     MenuEntry::Trigger,
     MenuEntry::Threshold,
     MenuEntry::TrailingSpace,
+    MenuEntry::AsrProfile,
     MenuEntry::Separator,
     MenuEntry::Quit,
 ];
@@ -392,6 +399,38 @@ pub enum MenuCommand {
     ResetTrigger,
     SetThreshold(HoldThreshold),
     SetAppendSpace(bool),
+    SetAsrProfile(AsrProfile),
+}
+
+fn profile_command_for_tag(tag: isize) -> Option<MenuCommand> {
+    let index = usize::try_from(tag).ok()?;
+    AsrProfile::OPTIONS
+        .get(index)
+        .copied()
+        .map(MenuCommand::SetAsrProfile)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AsrProfileMenuProjection {
+    active_title: String,
+    notice_title: String,
+    selected: [bool; 2],
+}
+
+impl AsrProfileMenuProjection {
+    fn from_snapshot(snapshot: AsrPreferenceSnapshot) -> Self {
+        Self {
+            active_title: format!("Сейчас: {}", snapshot.active.title()),
+            notice_title: if snapshot.save_failed {
+                "Не удалось сохранить выбор. Выберите профиль ещё раз".to_owned()
+            } else if snapshot.active != snapshot.selected {
+                format!("После перезапуска PTT2me: {}", snapshot.selected.title())
+            } else {
+                "Выбор применяется после перезапуска PTT2me".to_owned()
+            },
+            selected: AsrProfile::OPTIONS.map(|profile| profile == snapshot.selected),
+        }
+    }
 }
 
 fn toggled_append_space(selected: bool) -> (bool, MenuCommand) {
@@ -487,7 +526,9 @@ impl MenuCommandPublisher {
                 self.hotkey.set_threshold(threshold);
                 self.notifier.send(&self.sender, command)
             }
-            MenuCommand::SetAppendSpace(_) => self.notifier.send(&self.sender, command),
+            MenuCommand::SetAppendSpace(_) | MenuCommand::SetAsrProfile(_) => {
+                self.notifier.send(&self.sender, command)
+            }
         }
     }
 
@@ -600,6 +641,14 @@ declare_class!(
             self.ivars().append_space.set(selected);
             self.ivars().publisher.send(command);
         }
+
+        #[method(selectAsrProfile:)]
+        fn select_asr_profile(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            if let Some(command) = profile_command_for_tag(tag) {
+                self.ivars().publisher.send(command);
+            }
+        }
     }
 );
 
@@ -636,6 +685,9 @@ pub struct MenuBar {
     current_trigger_row: Retained<NSMenuItem>,
     threshold_rows: [Retained<NSMenuItem>; 3],
     trailing_space_row: Retained<NSMenuItem>,
+    asr_profile_rows: [Retained<NSMenuItem>; 2],
+    asr_profile_active_row: Retained<NSMenuItem>,
+    asr_profile_notice_row: Retained<NSMenuItem>,
     button: Retained<NSStatusBarButton>,
     _target: Retained<MenuTarget>,
     action_receiver: Receiver<MenuAction>,
@@ -700,6 +752,9 @@ impl MenuBar {
         let mut current_trigger_row = None;
         let mut threshold_rows = Vec::with_capacity(HoldThreshold::OPTIONS.len());
         let mut trailing_space_row = None;
+        let mut asr_profile_rows = Vec::with_capacity(AsrProfile::OPTIONS.len());
+        let mut asr_profile_active_row = None;
+        let mut asr_profile_notice_row = None;
         for entry in MENU_DESCRIPTOR {
             match entry {
                 MenuEntry::Status => {
@@ -806,6 +861,37 @@ impl MenuBar {
                     menu.addItem(&item);
                     trailing_space_row = Some(item);
                 }
+                MenuEntry::AsrProfile => {
+                    let parent = menu_item(mtm, "Распознавание", None);
+                    let submenu = unsafe {
+                        NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Распознавание"))
+                    };
+                    unsafe { submenu.setAutoenablesItems(false) };
+                    let active = menu_item(mtm, "", None);
+                    unsafe { active.setEnabled(false) };
+                    submenu.addItem(&active);
+                    asr_profile_active_row = Some(active);
+                    for (index, profile) in AsrProfile::OPTIONS.into_iter().enumerate() {
+                        let title = match profile {
+                            AsrProfile::Balanced => profile.title(),
+                            AsrProfile::Fast => "Быстрый (выше нагрузка)",
+                        };
+                        let item = menu_item(mtm, title, Some(sel!(selectAsrProfile:)));
+                        unsafe {
+                            item.setTarget(Some(&target));
+                            item.setTag(index as isize);
+                            item.setEnabled(true);
+                        }
+                        submenu.addItem(&item);
+                        asr_profile_rows.push(item);
+                    }
+                    let notice = menu_item(mtm, "", None);
+                    unsafe { notice.setEnabled(false) };
+                    submenu.addItem(&notice);
+                    asr_profile_notice_row = Some(notice);
+                    parent.setSubmenu(Some(&submenu));
+                    menu.addItem(&parent);
+                }
                 MenuEntry::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
                 MenuEntry::Quit => {
                     let item = menu_item(mtm, "Выйти", Some(sel!(quit:)));
@@ -848,6 +934,13 @@ impl MenuBar {
                 .unwrap_or_else(|_| panic!("menu descriptor must contain three threshold rows")),
             trailing_space_row: trailing_space_row
                 .expect("menu descriptor must contain the trailing-space row"),
+            asr_profile_rows: asr_profile_rows
+                .try_into()
+                .unwrap_or_else(|_| panic!("menu descriptor must contain two ASR profile rows")),
+            asr_profile_active_row: asr_profile_active_row
+                .expect("menu descriptor must contain the active ASR profile row"),
+            asr_profile_notice_row: asr_profile_notice_row
+                .expect("menu descriptor must contain the ASR profile notice row"),
             button,
             _target: target,
             action_receiver,
@@ -855,9 +948,10 @@ impl MenuBar {
             pulse_active: false,
         };
         menu_bar.render(&AppStatus::PreparingModel);
-        menu_bar.render_updater(None, false);
+        menu_bar.render_updater(None, false, None);
         menu_bar.render_preferences(preferences);
         menu_bar.render_append_space(append_space);
+        menu_bar.render_asr_profile(AsrPreferenceSnapshot::default());
         menu_bar
     }
 
@@ -898,8 +992,13 @@ impl MenuBar {
         }
     }
 
-    pub(crate) fn render_updater(&self, state: Option<&UpdaterState>, open_enabled: bool) {
-        let projection = UpdaterMenuProjection::from_state(state, open_enabled);
+    pub(crate) fn render_updater(
+        &self,
+        state: Option<&UpdaterState>,
+        open_enabled: bool,
+        last_open_failure: Option<UpdateFailure>,
+    ) {
+        let projection = UpdaterMenuProjection::from_state(state, open_enabled, last_open_failure);
         unsafe {
             self.updater_info_row
                 .setTitle(&NSString::from_str(&projection.information_title));
@@ -944,6 +1043,25 @@ impl MenuBar {
             } else {
                 NSControlStateValueOff
             });
+        }
+    }
+
+    pub(crate) fn render_asr_profile(&self, snapshot: AsrPreferenceSnapshot) {
+        let projection = AsrProfileMenuProjection::from_snapshot(snapshot);
+        unsafe {
+            self.asr_profile_active_row
+                .setTitle(&NSString::from_str(&projection.active_title));
+            self.asr_profile_notice_row
+                .setTitle(&NSString::from_str(&projection.notice_title));
+        }
+        for (row, selected) in self.asr_profile_rows.iter().zip(projection.selected) {
+            unsafe {
+                row.setState(if selected {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+            }
         }
     }
 
@@ -1178,11 +1296,11 @@ mod tests {
     #[test]
     fn unavailable_updater_is_hidden_while_idle_exposes_only_manual_check() {
         assert_eq!(
-            UpdaterMenuProjection::from_state(None, true),
+            UpdaterMenuProjection::from_state(None, true, None),
             UpdaterMenuProjection::hidden()
         );
 
-        let idle = UpdaterMenuProjection::from_state(Some(&UpdaterState::Idle), true);
+        let idle = UpdaterMenuProjection::from_state(Some(&UpdaterState::Idle), true, None);
         assert!(!idle.information_visible);
         assert_eq!(idle.action_title, "Проверить обновления…");
         assert!(idle.action_visible);
@@ -1209,6 +1327,7 @@ mod tests {
                     artifact: selected(kind, &release),
                 }),
                 true,
+                None,
             );
             assert_eq!(projection.information_title, expected);
             assert_eq!(projection.action_title, "Скачать обновление 1.0.6…");
@@ -1221,6 +1340,7 @@ mod tests {
                 artifact: selected(ArtifactKind::Full, &release),
             }),
             true,
+            None,
         );
         assert_eq!(
             repair.information_title,
@@ -1238,6 +1358,7 @@ mod tests {
                 operation_id: OperationId(7),
             }),
             true,
+            None,
         );
         assert_eq!(checking.information_title, "Проверка обновлений…");
         assert!(!checking.action_visible);
@@ -1250,6 +1371,7 @@ mod tests {
                 operation_id: OperationId(8),
             }),
             true,
+            None,
         );
         assert_eq!(downloading.information_title, "Загрузка обновления 1.0.6…");
         assert!(!downloading.action_visible);
@@ -1260,7 +1382,7 @@ mod tests {
             disposition: OfferDisposition::Available,
             path: "/tmp/PTT2me.dmg".into(),
         };
-        let blocked = UpdaterMenuProjection::from_state(Some(&ready_state), false);
+        let blocked = UpdaterMenuProjection::from_state(Some(&ready_state), false, None);
         assert_eq!(blocked.information_title, "Обновление 1.0.6 загружено");
         assert_eq!(blocked.action_title, "Открыть DMG и выйти…");
         assert_eq!(
@@ -1269,7 +1391,7 @@ mod tests {
         );
         assert!(!blocked.action_enabled);
 
-        let allowed = UpdaterMenuProjection::from_state(Some(&ready_state), true);
+        let allowed = UpdaterMenuProjection::from_state(Some(&ready_state), true, None);
         assert!(allowed.action_enabled);
     }
 
@@ -1282,11 +1404,113 @@ mod tests {
                 context: None,
             }),
             true,
+            None,
         );
-        assert_eq!(failure.information_title, "Не удалось проверить обновления");
+        assert_eq!(
+            failure.information_title,
+            "Ошибка сети. Проверьте подключение"
+        );
         assert_eq!(failure.action_title, "Повторить проверку");
         assert_eq!(failure.action, Some(UpdaterMenuAction::RetryUpdate));
         assert!(failure.action_enabled);
+    }
+
+    #[test]
+    fn open_failure_retries_only_opening_and_preserves_the_busy_gate() {
+        let release = updater_release();
+        let state = UpdaterState::ReadyToInstall {
+            artifact: selected(ArtifactKind::Update, &release),
+            release,
+            disposition: OfferDisposition::Available,
+            path: "/private/sensitive-user/secret-update.dmg".into(),
+        };
+        for open_enabled in [false, true] {
+            let projection = UpdaterMenuProjection::from_state(
+                Some(&state),
+                open_enabled,
+                Some(UpdateFailure::OpenDmg),
+            );
+            assert_eq!(
+                projection.information_title,
+                "Не удалось открыть образ обновления"
+            );
+            assert_eq!(
+                projection.action,
+                Some(UpdaterMenuAction::OpenDownloadedUpdate)
+            );
+            assert_eq!(projection.action_title, "Повторить открытие DMG и выйти…");
+            assert_eq!(projection.action_enabled, open_enabled);
+            assert!(!format!("{projection:?}").contains("sensitive-user"));
+            assert!(!format!("{projection:?}").contains("secret-update"));
+        }
+        let current = UpdaterMenuProjection::from_state(
+            Some(&UpdaterState::Current),
+            true,
+            Some(UpdateFailure::OpenDmg),
+        );
+        assert_eq!(current.action, Some(UpdaterMenuAction::CheckForUpdates));
+        assert_eq!(current.information_title, "Установлена актуальная версия");
+    }
+
+    #[test]
+    fn typed_update_diagnostics_preserve_retry_policy_without_disclosing_context() {
+        let mut release = updater_release();
+        release.application_update.url = "https://example.invalid/private-download-token".into();
+        for failure in [
+            UpdateFailure::WorkerStopped,
+            UpdateFailure::Network,
+            UpdateFailure::UntrustedManifest,
+            UpdateFailure::Storage,
+            UpdateFailure::DigestMismatch,
+            UpdateFailure::InvalidArtifactSize,
+            UpdateFailure::ContentLengthMismatch,
+            UpdateFailure::BodySizeMismatch,
+            UpdateFailure::ManifestTooLarge,
+            UpdateFailure::HttpStatus,
+            UpdateFailure::InsecureTransport,
+            UpdateFailure::QuarantineMissing,
+            UpdateFailure::WrongThread,
+            UpdateFailure::OpenDmg,
+        ] {
+            for (retry, title) in [
+                (RetryAction::ManualCheck, "Повторить проверку"),
+                (RetryAction::Download, "Повторить загрузку"),
+                (RetryAction::ModelRecheck, "Повторить"),
+            ] {
+                let state = UpdaterState::Failed {
+                    failure,
+                    retry,
+                    context: Some(crate::updater::RetryContext::Download {
+                        artifact: selected(ArtifactKind::Update, &release),
+                        release: release.clone(),
+                        disposition: OfferDisposition::Available,
+                    }),
+                };
+                let projection = UpdaterMenuProjection::from_state(
+                    Some(&state),
+                    false,
+                    Some(UpdateFailure::OpenDmg),
+                );
+                assert!(
+                    projection.information_visible
+                        && projection.action_visible
+                        && projection.action_enabled
+                );
+                assert_eq!(projection.action, Some(UpdaterMenuAction::RetryUpdate));
+                assert_eq!(projection.action_title, title);
+                assert!(!projection.information_title.is_empty());
+                assert!(!format!("{projection:?}").contains("private-download-token"));
+                assert!(!format!("{projection:?}").contains("example.invalid"));
+            }
+        }
+        assert_ne!(
+            diagnostics::update_message(UpdateFailure::Network),
+            diagnostics::update_message(UpdateFailure::UntrustedManifest)
+        );
+        assert_ne!(
+            diagnostics::update_message(UpdateFailure::Network),
+            diagnostics::update_message(UpdateFailure::QuarantineMissing)
+        );
     }
 
     #[test]
@@ -1428,6 +1652,7 @@ mod tests {
                 MenuEntry::Trigger,
                 MenuEntry::Threshold,
                 MenuEntry::TrailingSpace,
+                MenuEntry::AsrProfile,
                 MenuEntry::Separator,
                 MenuEntry::Quit,
             ]
@@ -1457,6 +1682,71 @@ mod tests {
         );
 
         assert!(!publisher.send(MenuCommand::SetAppendSpace(true)));
+    }
+
+    #[test]
+    fn asr_profile_projection_distinguishes_active_next_launch_and_failed_save() {
+        let projection = AsrProfileMenuProjection::from_snapshot(AsrPreferenceSnapshot {
+            active: AsrProfile::Balanced,
+            selected: AsrProfile::Fast,
+            save_failed: false,
+        });
+        assert_eq!(projection.active_title, "Сейчас: Сбалансированный");
+        assert_eq!(projection.notice_title, "После перезапуска PTT2me: Быстрый");
+        assert_eq!(projection.selected, [false, true]);
+
+        let failed = AsrProfileMenuProjection::from_snapshot(AsrPreferenceSnapshot {
+            active: AsrProfile::Balanced,
+            selected: AsrProfile::Fast,
+            save_failed: true,
+        });
+        assert_eq!(failed.active_title, projection.active_title);
+        assert_eq!(failed.selected, projection.selected);
+        assert_eq!(
+            failed.notice_title,
+            "Не удалось сохранить выбор. Выберите профиль ещё раз"
+        );
+        assert!(!failed.notice_title.contains("После перезапуска"));
+    }
+
+    #[test]
+    fn asr_profile_command_rejects_invalid_menu_tags_and_preserves_live_hotkey() {
+        assert_eq!(
+            profile_command_for_tag(0),
+            Some(MenuCommand::SetAsrProfile(AsrProfile::Balanced))
+        );
+        assert_eq!(
+            profile_command_for_tag(1),
+            Some(MenuCommand::SetAsrProfile(AsrProfile::Fast))
+        );
+        for tag in [-1, 2, 4, isize::MAX] {
+            assert_eq!(profile_command_for_tag(tag), None);
+        }
+        let (sender, receiver) = mpsc::channel();
+        let control = HotkeyControl::new(Preferences::default());
+        // Profile persistence remains available during a dictation. It never
+        // changes the active trigger or short-press threshold.
+        let publisher =
+            MenuCommandPublisher::new(sender, control.clone(), MenuReadiness::new(false));
+        let start = Instant::now();
+        assert_eq!(
+            control.observe_for_test(observation(ObservationKind::KeyDown, 63), start),
+            Some(HotkeySignal::Pressed)
+        );
+        assert!(publisher.send(MenuCommand::SetAsrProfile(AsrProfile::Fast)));
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(MenuCommand::SetAsrProfile(AsrProfile::Fast))
+        );
+        assert_eq!(
+            control.observe_for_test(
+                observation(ObservationKind::KeyUp, 63),
+                start + Duration::from_millis(499)
+            ),
+            Some(HotkeySignal::Released { short: true })
+        );
+        drop(receiver);
+        assert!(!publisher.send(MenuCommand::SetAsrProfile(AsrProfile::Balanced)));
     }
 
     #[test]

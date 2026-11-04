@@ -9,6 +9,48 @@ use crate::model::ModelPaths;
 pub const DEFAULT_CPU_THREADS: i32 = 2;
 pub const SUPPORTED_CPU_THREADS: [i32; 3] = [1, 2, 4];
 
+/// Validated launch configuration shared with the private worker entry point.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AsrProfile {
+    #[default]
+    Balanced,
+    Fast,
+}
+
+impl AsrProfile {
+    pub(crate) const OPTIONS: [Self; 2] = [Self::Balanced, Self::Fast];
+
+    pub fn from_key(value: &str) -> Option<Self> {
+        match value {
+            "balanced" => Some(Self::Balanced),
+            "fast" => Some(Self::Fast),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn key(self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::Fast => "fast",
+        }
+    }
+
+    pub(crate) const fn title(self) -> &'static str {
+        match self {
+            Self::Balanced => "Сбалансированный",
+            Self::Fast => "Быстрый",
+        }
+    }
+
+    pub(crate) const fn cpu_threads(self) -> i32 {
+        match self {
+            Self::Balanced => DEFAULT_CPU_THREADS,
+            Self::Fast => 4,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum AsrCommand {
     Load(ModelPaths),
@@ -37,6 +79,16 @@ pub(crate) trait RecognizerBackend {
 #[derive(Default)]
 pub(crate) struct SherpaRecognizerBackend {
     recognizer: Option<TransducerRecognizer>,
+    profile: AsrProfile,
+}
+
+impl SherpaRecognizerBackend {
+    pub(crate) const fn for_profile(profile: AsrProfile) -> Self {
+        Self {
+            recognizer: None,
+            profile,
+        }
+    }
 }
 
 // sherpa-rs accepts UTF-8 Strings. Reject unsupported Unix bytes rather than
@@ -50,7 +102,7 @@ fn native_model_path(path: &std::path::Path) -> Result<String, String> {
 impl RecognizerBackend for SherpaRecognizerBackend {
     fn load(&mut self, paths: ModelPaths) -> Result<(), String> {
         self.recognizer = None;
-        self.recognizer = Some(load_sherpa_recognizer(&paths, DEFAULT_CPU_THREADS)?);
+        self.recognizer = Some(load_sherpa_recognizer(&paths, self.profile.cpu_threads())?);
         Ok(())
     }
 
@@ -206,6 +258,20 @@ mod tests {
     fn supported_performance_thread_counts_do_not_change_the_cpu2_product_default() {
         assert_eq!(super::DEFAULT_CPU_THREADS, 2);
         assert_eq!(super::SUPPORTED_CPU_THREADS, [1, 2, 4]);
+        assert_eq!(
+            super::SherpaRecognizerBackend::default()
+                .profile
+                .cpu_threads(),
+            2
+        );
+        assert_eq!(super::AsrProfile::Balanced.cpu_threads(), 2);
+        assert_eq!(super::AsrProfile::Fast.cpu_threads(), 4);
+        assert_eq!(
+            super::SherpaRecognizerBackend::for_profile(super::AsrProfile::Fast)
+                .profile
+                .cpu_threads(),
+            4
+        );
         let paths = model_paths();
         for threads in super::SUPPORTED_CPU_THREADS {
             assert_eq!(

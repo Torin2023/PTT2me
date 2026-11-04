@@ -17,6 +17,13 @@ The previous pasteboard is restored unless newer contents appeared meanwhile.
 The current published version is Preview 1.3.2. The Full download, signed
 update channel, and menu snapshot below describe this version.
 
+Development for the next Preview is tracked in the
+[sequential release plan](docs/release/NEXT_PREVIEW.md). It includes measured
+Russian WER/CER, an optional faster recognition profile, additional native
+clipboard checks, clearer diagnostics and recovery updates. These changes are
+not yet published. A Developer ID release also requires an available signing
+identity; the existing published Preview remains ad-hoc signed.
+
 ## Cloud development without Codespaces
 
 Repository work can be delegated to Codex Cloud from a browser or mobile
@@ -74,8 +81,9 @@ Completed microphone captures are converted to mono 16 kHz for GigaAM. When
 the device rate differs, a windowed-sinc filter prevents high-frequency noise
 from folding into the speech band during conversion. Native 16 kHz audio is
 passed through unchanged. See [audio quality checks](docs/audio-quality.md)
-for the signal tests and the listening/recognition comparison still required
-on a Mac; signal fidelity alone does not establish a reduction in word errors.
+for automated signal tests and the reproducible recognition comparison;
+signal fidelity alone does not establish a reduction in word errors. Manual
+testing is not a release requirement.
 
 Insertion uses Accessibility to inspect the focused field and rejects secure
 text fields. For ordinary text, PTT2me temporarily uses the full macOS

@@ -747,9 +747,10 @@ fn post_command_v_up(source: CGEventSource) -> Result<(), InsertError> {
     Ok(())
 }
 
-/// Exercises the real NSPasteboard snapshot/restore path.
+/// Exercises real private NSPasteboard snapshots and insertion transactions.
 ///
-/// This entry point is available only to the custom main-thread test target.
+/// This main-thread test entry point never accesses the general pasteboard or
+/// sends keyboard events. It does not prove delivery to another application's UI.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn run_pasteboard_main_thread_tests() -> Result<(), InsertError> {
@@ -769,9 +770,21 @@ pub fn run_pasteboard_main_thread_tests() -> Result<(), InsertError> {
                 ],
             },
             PasteboardItemSnapshot {
+                representations: vec![
+                    PasteboardRepresentation {
+                        type_name: "public.png".to_owned(),
+                        data: vec![0x89, 0x50, 0x4e, 0x47],
+                    },
+                    PasteboardRepresentation {
+                        type_name: "com.ptt2me.synthetic-binary".to_owned(),
+                        data: vec![0, 1, 0xff, 0, 0x80],
+                    },
+                ],
+            },
+            PasteboardItemSnapshot {
                 representations: vec![PasteboardRepresentation {
-                    type_name: "public.png".to_owned(),
-                    data: vec![0x89, 0x50, 0x4e, 0x47],
+                    type_name: "public.file-url".to_owned(),
+                    data: b"file:///tmp/ptt2me-synthetic-pasteboard-fixture".to_vec(),
                 }],
             },
         ],
@@ -829,6 +842,7 @@ pub fn run_pasteboard_main_thread_tests() -> Result<(), InsertError> {
         assert_eq!(data.bytes(), [expected]);
     }
 
+    native_transaction_tests::run(&expected)?;
     Ok(())
 }
 
@@ -861,6 +875,222 @@ fn assert_snapshot_contains(actual: &PasteboardSnapshot, expected: &PasteboardSn
                 expected_representation.type_name
             );
         }
+    }
+}
+
+#[cfg(feature = "test-support")]
+mod native_transaction_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // Record the native clipboard value at the command boundary. No CGEvent,
+    // Accessibility call, window, or real application is involved in this seam.
+    struct RecordingCommand {
+        pasteboard: Retained<NSPasteboard>,
+        observed: Rc<RefCell<Vec<String>>>,
+        result: Result<(), InsertError>,
+    }
+
+    impl PasteCommand for RecordingCommand {
+        fn send_command_v(&mut self) -> Result<(), InsertError> {
+            let text = unsafe { self.pasteboard.stringForType(NSPasteboardTypeString) }
+                .ok_or(InsertError::PasteboardSnapshot)?;
+            self.observed.borrow_mut().push(text.to_string());
+            self.result
+        }
+    }
+
+    struct Fixture {
+        pasteboard: Retained<NSPasteboard>,
+        original: PasteboardSnapshot,
+        observed: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Fixture {
+        fn new(original: &PasteboardSnapshot) -> Result<Self, InsertError> {
+            let pasteboard = unsafe { NSPasteboard::pasteboardWithUniqueName() };
+            write_snapshot_fixture(&pasteboard, original)?;
+            let captured = SystemPasteboard::new(pasteboard.clone())
+                .snapshot()?
+                .snapshot;
+            assert_snapshot_contains(&captured, original);
+            // AppKit may add representation aliases. Preserve the complete
+            // native snapshot, including those aliases, rather than just input.
+            Ok(Self {
+                pasteboard,
+                original: captured,
+                observed: Rc::default(),
+            })
+        }
+
+        fn begin(
+            &self,
+            result: Result<(), InsertError>,
+        ) -> Result<InsertionTransaction<SystemPasteboard, RecordingCommand>, InsertError> {
+            InsertionTransaction::begin_with(
+                "Привет. ",
+                SystemPasteboard::new(self.pasteboard.clone()),
+                RecordingCommand {
+                    pasteboard: self.pasteboard.clone(),
+                    observed: Rc::clone(&self.observed),
+                    result,
+                },
+            )
+        }
+
+        fn snapshot(&self) -> Result<PasteboardSnapshot, InsertError> {
+            Ok(SystemPasteboard::new(self.pasteboard.clone())
+                .snapshot()?
+                .snapshot)
+        }
+
+        fn change_count(&self) -> isize {
+            unsafe { self.pasteboard.changeCount() }
+        }
+
+        fn copy(&self, contents: &PasteboardSnapshot) -> Result<PasteboardSnapshot, InsertError> {
+            let before = self.change_count();
+            write_snapshot_fixture(&self.pasteboard, contents)?;
+            assert_ne!(
+                self.change_count(),
+                before,
+                "native copy must transfer ownership"
+            );
+            self.snapshot()
+        }
+
+        fn assert_unchanged(&self, expected: &PasteboardSnapshot, count: isize) {
+            assert_eq!(self.change_count(), count, "cleanup must not write again");
+            assert_eq!(&self.snapshot().unwrap(), expected);
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // This board was created only for this case and is never general.
+            // Declared in AppKit's NSPasteboard.h, but absent from objc2 0.2.
+            let _: () = unsafe { objc2::msg_send![&*self.pasteboard, releaseGlobally] };
+        }
+    }
+
+    fn newer_copy() -> PasteboardSnapshot {
+        PasteboardSnapshot {
+            items: vec![PasteboardItemSnapshot {
+                representations: vec![
+                    PasteboardRepresentation {
+                        type_name: "public.utf8-plain-text".to_owned(),
+                        data: b"newer synthetic copy".to_vec(),
+                    },
+                    PasteboardRepresentation {
+                        type_name: "com.ptt2me.synthetic-binary".to_owned(),
+                        data: vec![0xff, 0, 2, 0],
+                    },
+                ],
+            }],
+        }
+    }
+
+    fn round_trip(original: &PasteboardSnapshot) -> Result<(), InsertError> {
+        let fixture = Fixture::new(original)?;
+        let mut insertion = fixture.begin(Ok(()))?;
+        assert!(fixture.observed.borrow().is_empty());
+        insertion.paste()?;
+        assert_eq!(fixture.observed.borrow().as_slice(), ["Привет. "]);
+        insertion.restore()?;
+        assert_eq!(fixture.snapshot()?, fixture.original);
+        let restored = fixture.change_count();
+        drop(insertion);
+        fixture.assert_unchanged(&fixture.original, restored);
+        println!("PASS: native transaction restores all representations exactly once");
+        Ok(())
+    }
+
+    fn copy_during_settle(
+        original: &PasteboardSnapshot,
+        identical: bool,
+    ) -> Result<(), InsertError> {
+        let fixture = Fixture::new(original)?;
+        let mut insertion = fixture.begin(Ok(()))?;
+        let temporary = fixture.snapshot()?;
+        let copied = fixture.copy(&if identical {
+            temporary.clone()
+        } else {
+            newer_copy()
+        })?;
+        if identical {
+            assert_eq!(
+                copied, temporary,
+                "only ownership changes for an identical copy"
+            );
+        }
+        let copied_count = fixture.change_count();
+        let primary = insertion.paste().unwrap_err();
+        assert_eq!(primary, InsertError::PasteboardChanged);
+        assert!(fixture.observed.borrow().is_empty());
+        assert_eq!(insertion.restore_after_paste_failure(primary), primary);
+        drop(insertion);
+        fixture.assert_unchanged(&copied, copied_count);
+        println!("PASS: native copy during settle blocks paste (identical={identical})");
+        Ok(())
+    }
+
+    fn copy_after_paste(original: &PasteboardSnapshot) -> Result<(), InsertError> {
+        let fixture = Fixture::new(original)?;
+        let mut insertion = fixture.begin(Ok(()))?;
+        insertion.paste()?;
+        assert_eq!(fixture.observed.borrow().as_slice(), ["Привет. "]);
+        let copied = fixture.copy(&newer_copy())?;
+        let copied_count = fixture.change_count();
+        insertion.restore()?;
+        drop(insertion);
+        fixture.assert_unchanged(&copied, copied_count);
+        println!("PASS: native copy after paste survives restore and drop");
+        Ok(())
+    }
+
+    fn command_failure(original: &PasteboardSnapshot) -> Result<(), InsertError> {
+        let fixture = Fixture::new(original)?;
+        let mut insertion = fixture.begin(Err(InsertError::KeyboardEvent))?;
+        let primary = insertion.paste().unwrap_err();
+        assert_eq!(primary, InsertError::KeyboardEvent);
+        assert_eq!(fixture.observed.borrow().as_slice(), ["Привет. "]);
+        assert_eq!(insertion.restore_after_paste_failure(primary), primary);
+        assert_eq!(fixture.snapshot()?, fixture.original);
+        let restored = fixture.change_count();
+        drop(insertion);
+        fixture.assert_unchanged(&fixture.original, restored);
+        println!("PASS: native failure cleanup restores contents and retains primary error");
+        Ok(())
+    }
+
+    fn drop_restores(original: &PasteboardSnapshot, after_paste: bool) -> Result<(), InsertError> {
+        let fixture = Fixture::new(original)?;
+        let mut insertion = fixture.begin(Ok(()))?;
+        if after_paste {
+            insertion.paste()?;
+        }
+        drop(insertion);
+        assert_eq!(fixture.snapshot()?, fixture.original);
+        if after_paste {
+            assert_eq!(fixture.observed.borrow().as_slice(), ["Привет. "]);
+        } else {
+            assert!(fixture.observed.borrow().is_empty());
+        }
+        println!(
+            "PASS: dropping a native transaction restores contents (after_paste={after_paste})"
+        );
+        Ok(())
+    }
+
+    pub(super) fn run(original: &PasteboardSnapshot) -> Result<(), InsertError> {
+        round_trip(original)?;
+        copy_during_settle(original, false)?;
+        copy_during_settle(original, true)?;
+        copy_after_paste(original)?;
+        command_failure(original)?;
+        drop_restores(original, false)?;
+        drop_restores(original, true)
     }
 }
 

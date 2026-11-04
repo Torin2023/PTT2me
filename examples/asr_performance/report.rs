@@ -68,6 +68,7 @@ pub(super) struct CorpusCaseReport {
 
 #[derive(Serialize)]
 pub(super) struct CorpusReport {
+    pub(super) manifest_sha256: String,
     pub(super) cases: Vec<CorpusCaseReport>,
     pub(super) preparation_scope: &'static str,
 }
@@ -86,6 +87,7 @@ pub(super) struct CasePerformance {
     pub(super) warmup_p50_ms: f64,
     pub(super) warmup_p95_ms: f64,
     pub(super) measured: Quantiles,
+    pub(super) quality: super::quality::QualityReport,
 }
 
 #[derive(Serialize)]
@@ -103,6 +105,7 @@ pub(super) struct ConfigurationReport {
     pub(super) configuration_wall_scope: &'static str,
     pub(super) cpu_delta: CpuDelta,
     pub(super) cases: Vec<CasePerformance>,
+    pub(super) quality: super::quality::QualityReport,
 }
 
 #[derive(Serialize)]
@@ -117,6 +120,8 @@ pub(super) struct MethodReport {
     pub(super) measured_repeats_per_case: u32,
     pub(super) quantiles: &'static str,
     pub(super) transport: &'static str,
+    pub(super) normalization: &'static str,
+    pub(super) quality_scope: &'static str,
 }
 
 #[derive(Serialize)]

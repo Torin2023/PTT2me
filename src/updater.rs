@@ -708,6 +708,9 @@ impl Updater {
         if expected != operation_id || !self.finish_operation(operation_id) {
             return Vec::new();
         }
+        // This is a fresh verified download. A prior opening failure belongs
+        // only to its old attempt, not to this newly accepted artifact.
+        self.last_open_failure = None;
         self.state = UpdaterState::ReadyToInstall {
             release,
             artifact,

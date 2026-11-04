@@ -22,8 +22,7 @@ const MAX_WAV_BYTES: u64 = (MAX_AUDIO_FRAMES as u64 * 2) + 4_096;
 struct CorpusEntry {
     id: String,
     wav: PathBuf,
-    #[serde(rename = "reference")]
-    _reference: serde::de::IgnoredAny,
+    reference: String,
     duration_seconds: f64,
     source: String,
     sha256: String,
@@ -36,13 +35,19 @@ pub(super) struct CorpusCase {
     pub(super) source: String,
     pub(super) duration_seconds: f64,
     pub(super) samples: Vec<f32>,
+    pub(super) reference: String,
 }
 
-pub(super) fn load(manifest_path: &Path) -> Result<Vec<CorpusCase>, String> {
+pub(super) struct LoadedCorpus {
+    pub(super) cases: Vec<CorpusCase>,
+    pub(super) manifest_sha256: String,
+}
+
+pub(super) fn load(manifest_path: &Path) -> Result<LoadedCorpus, String> {
     let manifest_bytes =
         read_bounded_regular(manifest_path, MAX_MANIFEST_BYTES, "corpus manifest")?;
     let entries: Vec<CorpusEntry> = serde_json::from_slice(&manifest_bytes)
-        .map_err(|error| format!("invalid corpus manifest JSON: {error}"))?;
+        .map_err(|_| "invalid corpus manifest JSON or schema".to_owned())?;
     if entries.is_empty() || entries.len() > MAX_CORPUS_CASES {
         return Err(format!("corpus must contain 1..={MAX_CORPUS_CASES} cases"));
     }
@@ -56,13 +61,14 @@ pub(super) fn load(manifest_path: &Path) -> Result<Vec<CorpusCase>, String> {
         let CorpusEntry {
             id,
             wav,
-            _reference: _,
+            reference,
             duration_seconds,
             source,
             sha256,
             frames,
             format,
         } = entry;
+        super::quality::validate_reference(&reference)?;
         if id.is_empty()
             || id.len() > MAX_ID_BYTES
             || !id
@@ -109,9 +115,13 @@ pub(super) fn load(manifest_path: &Path) -> Result<Vec<CorpusCase>, String> {
             source,
             duration_seconds,
             samples: decoded.samples,
+            reference,
         });
     }
-    Ok(corpus)
+    Ok(LoadedCorpus {
+        cases: corpus,
+        manifest_sha256: format!("{:x}", Sha256::digest(&manifest_bytes)),
+    })
 }
 
 fn read_bounded_regular(path: &Path, limit: u64, kind: &str) -> Result<Vec<u8>, String> {
@@ -344,9 +354,9 @@ mod tests {
     }
 
     #[test]
-    fn loads_relative_verified_corpus_without_retaining_reference_text() {
+    fn loads_verified_corpus_with_bounded_reference_in_memory() {
         let (_directory, manifest) = corpus_fixture();
-        let corpus = load(&manifest).unwrap();
+        let corpus = load(&manifest).unwrap().cases;
 
         assert_eq!(corpus.len(), 1);
         assert_eq!(corpus[0].id, "sample");
@@ -424,7 +434,7 @@ mod tests {
             entry.insert("frames".into(), EXPECTED_MAX_AUDIO_FRAMES.into());
         });
 
-        let corpus = load(&manifest).unwrap();
+        let corpus = load(&manifest).unwrap().cases;
         assert_eq!(corpus[0].samples.len(), EXPECTED_MAX_AUDIO_FRAMES);
     }
 
@@ -509,6 +519,29 @@ mod tests {
                 "corpus source labels must be non-empty bounded single-line text"
             );
         }
+    }
+
+    #[test]
+    fn rejects_bad_references_without_disclosing_manifest_values() {
+        let (_directory, manifest) = corpus_fixture();
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!("!!!"),
+            serde_json::json!("я".repeat(2049)),
+        ] {
+            update_single_case_manifest(&manifest, |entry| {
+                entry.insert("reference".into(), value);
+            });
+            assert!(load(&manifest).is_err());
+        }
+        update_single_case_manifest(&manifest, |entry| {
+            entry.insert("reference".into(), "private-reference".into());
+            entry.insert("frames".into(), "private-invalid-value".into());
+        });
+        assert_eq!(
+            load(&manifest).err().unwrap(),
+            "invalid corpus manifest JSON or schema"
+        );
     }
 
     #[test]

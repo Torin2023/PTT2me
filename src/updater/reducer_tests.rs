@@ -1098,6 +1098,97 @@ fn download_retry_model_drift_returns_to_full_offer_for_fresh_confirmation() {
 }
 
 #[test]
+fn full_repair_can_reach_verified_open_and_quit_when_the_model_blocks_dictation() {
+    use crate::state::AppStatus;
+    use crate::updater_runtime::{updater_open_allowed, OrderlyQuitGate};
+
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let (bytes, _) = manifest("1.0.6", 202608011200, commit, "13.0");
+    let mut updater = updater_with_installed("1.0.6", 202608011200, commit, "13.0");
+    manual_manifest_result(&mut updater, bytes, ModelAvailability::Missing);
+    assert!(matches!(
+        updater.state(),
+        UpdaterState::RepairRequired { .. }
+    ));
+    let recheck = match updater.handle(UpdaterEvent::DownloadRequested).as_slice() {
+        [UpdaterCommand::RecheckModel { operation_id, .. }] => *operation_id,
+        other => panic!("expected model recheck: {other:?}"),
+    };
+    let command = updater
+        .handle(UpdaterEvent::ModelRechecked {
+            operation_id: recheck,
+            model: ModelAvailability::Missing,
+        })
+        .pop()
+        .unwrap();
+    let UpdaterCommand::DownloadAndVerify {
+        operation_id,
+        release,
+        artifact,
+    } = command
+    else {
+        panic!("expected verified Full download");
+    };
+    assert_eq!(artifact.kind, ArtifactKind::Full);
+    let cache = tempfile::tempdir().unwrap();
+    // The network body and workspace opener are synthetic; signature, actual
+    // cache bytes/size/hash, quarantine and the held-descriptor check are real.
+    let path = cache_verified_download(
+        cache.path(),
+        &release,
+        artifact.kind,
+        &artifact.descriptor,
+        Cursor::new(b"verified PTT2me full dmg fixture"),
+        Some(32),
+    )
+    .unwrap();
+    updater.handle(UpdaterEvent::DownloadVerified {
+        operation_id,
+        download: VerifiedDownload::from_verified_path(path.clone()),
+    });
+    let voice_status = AppStatus::ModelRepairRequired;
+    assert!(!updater_open_allowed(&voice_status, true));
+    assert!(updater_open_allowed(&voice_status, false));
+    let command = updater.handle(UpdaterEvent::OpenRequested).pop().unwrap();
+    let UpdaterCommand::VerifyAndOpenDmg {
+        operation_id,
+        release,
+        artifact,
+        expected_path,
+    } = command
+    else {
+        panic!("expected verification immediately before open");
+    };
+    assert_eq!(artifact.kind, ArtifactKind::Full);
+    let opened = Cell::new(0);
+    let result = verify_and_open_dmg_with(
+        cache.path(),
+        &release,
+        &artifact,
+        &expected_path,
+        || Ok(()),
+        |actual| {
+            assert_eq!(actual, path);
+            opened.set(opened.get() + 1);
+            true
+        },
+    );
+    assert_eq!(result, Ok(()));
+    assert_eq!(opened.get(), 1);
+    assert_eq!(
+        updater.handle(UpdaterEvent::OpenCompleted {
+            operation_id,
+            result
+        }),
+        [UpdaterCommand::RequestOrderlyQuit]
+    );
+    let mut quit = OrderlyQuitGate::default();
+    quit.request();
+    assert!(!quit.take_if_ready(&voice_status, true));
+    assert!(quit.take_if_ready(&voice_status, false));
+}
+
+#[test]
 fn explicit_open_is_one_verified_boundary_with_stale_suppression_and_quit_after_success() {
     let mut updater = updater();
     let download_id = begin_verified_download(&mut updater);
@@ -1205,6 +1296,89 @@ fn failed_open_time_verification_never_opens_and_exposes_a_download_retry() {
         updater.handle(UpdaterEvent::RetryRequested).as_slice(),
         [UpdaterCommand::RecheckModel { .. }]
     ));
+}
+
+#[test]
+fn open_failure_survives_automatic_fallback_but_not_a_fresh_verified_download() {
+    let mut updater = updater();
+    let first_download = begin_verified_download(&mut updater);
+    updater.handle(UpdaterEvent::DownloadVerified {
+        operation_id: first_download,
+        download: VerifiedDownload::from_verified_path(PathBuf::from("/cache/first.dmg")),
+    });
+    let open_id = match updater.handle(UpdaterEvent::OpenRequested).as_slice() {
+        [UpdaterCommand::VerifyAndOpenDmg { operation_id, .. }] => *operation_id,
+        unexpected => panic!("expected verified open, got {unexpected:?}"),
+    };
+    assert!(updater
+        .handle(UpdaterEvent::OpenCompleted {
+            operation_id: open_id,
+            result: Err(UpdateFailure::OpenDmg),
+        })
+        .is_empty());
+    let ready = updater.state().clone();
+    assert_eq!(updater.last_open_failure(), Some(UpdateFailure::OpenDmg));
+
+    for (index, failure) in [
+        UpdateFailure::Network,
+        UpdateFailure::UntrustedManifest,
+        UpdateFailure::Storage,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let commands = updater.handle(UpdaterEvent::AutomaticCheckDue {
+            launch_at: 0,
+            now: 1_000_000 * (index as u64 + 1),
+            last_attempt: None,
+        });
+        let operation_id = match commands.last() {
+            Some(UpdaterCommand::FetchManifest {
+                operation_id,
+                reason: CheckReason::Automatic,
+            }) => *operation_id,
+            unexpected => panic!("expected automatic check, got {unexpected:?}"),
+        };
+        let event = match failure {
+            UpdateFailure::UntrustedManifest => UpdaterEvent::ManifestReceived {
+                operation_id,
+                bytes: b"private-invalid-manifest".to_vec(),
+                model: ModelAvailability::Missing,
+            },
+            UpdateFailure::Storage => UpdaterEvent::LastAttemptPersistenceFailed { operation_id },
+            _ => UpdaterEvent::ManifestFailed {
+                operation_id,
+                failure,
+            },
+        };
+        assert!(updater.handle(event).is_empty());
+        assert_eq!(updater.state(), &ready);
+        assert_eq!(updater.last_open_failure(), Some(UpdateFailure::OpenDmg));
+    }
+
+    let next_download = begin_verified_download(&mut updater);
+    // Late completion from the previous artifact cannot clear its diagnosis
+    // while the new download is still being checked.
+    assert!(updater
+        .handle(UpdaterEvent::DownloadVerified {
+            operation_id: first_download,
+            download: VerifiedDownload::from_verified_path(PathBuf::from("/cache/stale.dmg")),
+        })
+        .is_empty());
+    assert!(
+        matches!(updater.state(), UpdaterState::Downloading { operation_id, .. } if *operation_id == next_download)
+    );
+    assert_eq!(updater.last_open_failure(), Some(UpdateFailure::OpenDmg));
+    assert!(updater
+        .handle(UpdaterEvent::DownloadVerified {
+            operation_id: next_download,
+            download: VerifiedDownload::from_verified_path(PathBuf::from("/cache/fresh.dmg")),
+        })
+        .is_empty());
+    assert!(
+        matches!(updater.state(), UpdaterState::ReadyToInstall { path, .. } if path == Path::new("/cache/fresh.dmg"))
+    );
+    assert_eq!(updater.last_open_failure(), None);
 }
 
 #[test]

@@ -79,40 +79,58 @@ fn stop(task: &mut AsrTask, log: &Path) {
 
 #[test]
 fn real_worker_hidden_mode_rejects_early_eof_and_combined_flags() {
-    let output = Command::new(env!("CARGO_BIN_EXE_ptt2me"))
-        .arg("--asr-worker")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(output.stderr.is_empty());
-    let output = Command::new(env!("CARGO_BIN_EXE_ptt2me"))
-        .args(["--asr-worker", "--smoke-model"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    // Real child handshake occurs without loading model/TCC/AppKit.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ptt2me"))
-        .arg("--asr-worker")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let frame =
-        ptt2me::asr_test_support::Frame::new(ptt2me::asr_test_support::Kind::Hello, 9, 0, vec![])
+    for arguments in [
+        vec!["--asr-worker"],
+        vec!["--asr-worker", "--profile", "balanced"],
+        vec!["--asr-worker", "--profile", "fast"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ptt2me"))
+            .args(&arguments)
+            .stdin(Stdio::null())
+            .output()
             .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(&frame.encode().unwrap())
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        // Real child handshake occurs without loading model/TCC/AppKit.
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ptt2me"))
+            .args(&arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let frame = ptt2me::asr_test_support::Frame::new(
+            ptt2me::asr_test_support::Kind::Hello,
+            9,
+            0,
+            vec![],
+        )
         .unwrap();
-    let ack = ptt2me::asr_test_support::Frame::read(child.stdout.as_mut().unwrap()).unwrap();
-    assert_eq!(ack.header.kind, ptt2me::asr_test_support::Kind::HelloAck);
-    child.stdin.take();
-    assert!(!child.wait().unwrap().success());
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&frame.encode().unwrap())
+            .unwrap();
+        let ack = ptt2me::asr_test_support::Frame::read(child.stdout.as_mut().unwrap()).unwrap();
+        assert_eq!(ack.header.kind, ptt2me::asr_test_support::Kind::HelloAck);
+        child.stdin.take();
+        assert!(!child.wait().unwrap().success());
+    }
+    for arguments in [
+        vec!["--asr-worker", "--smoke-model"],
+        vec!["--asr-worker", "--profile", "unknown"],
+        vec!["--asr-worker", "--profile", "fast", "--smoke-model"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ptt2me"))
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
 }
 #[test]
 fn normal_process_unicode_and_native_stdout_isolation() {
@@ -345,17 +363,23 @@ fn deadlines_precede_already_queued_success_and_stale_results_cannot_cross_reloa
 
 #[test]
 fn native_child_reverifies_model_directory_before_backend_initialization() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut task = AsrTask::for_process_test(
-        env!("CARGO_BIN_EXE_ptt2me").into(),
-        vec!["--asr-worker".into()],
-        LOAD,
-        TRANSCRIBE,
-    );
-    // Empty fixture directory cannot be promoted to trusted native paths.
-    task.load_fixture_directory(dir.path(), Instant::now())
-        .unwrap();
-    assert_eq!(result(&mut task), Err(AsrTaskError::WorkerFailed));
-    task.stop();
-    until(|| task.cleanup_complete());
+    for arguments in [
+        vec!["--asr-worker"],
+        vec!["--asr-worker", "--profile", "balanced"],
+        vec!["--asr-worker", "--profile", "fast"],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut task = AsrTask::for_process_test(
+            env!("CARGO_BIN_EXE_ptt2me").into(),
+            arguments.into_iter().map(Into::into).collect(),
+            LOAD,
+            TRANSCRIBE,
+        );
+        // Empty fixture directory cannot be promoted to trusted native paths.
+        task.load_fixture_directory(dir.path(), Instant::now())
+            .unwrap();
+        assert_eq!(result(&mut task), Err(AsrTaskError::WorkerFailed));
+        task.stop();
+        until(|| task.cleanup_complete());
+    }
 }

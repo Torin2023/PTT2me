@@ -2,6 +2,8 @@
 mod args;
 #[path = "asr_performance/corpus.rs"]
 mod corpus;
+#[path = "asr_performance/quality.rs"]
+mod quality;
 #[path = "asr_performance/report.rs"]
 mod report;
 #[path = "asr_performance/runner.rs"]

@@ -1,9 +1,15 @@
 # ASR performance measurement
 
-PTT2me keeps the production GigaAM recognizer at two CPU threads. The
-measurement below found a useful four-thread latency improvement on one Apple
-M5, but the synthetic corpus and single machine do not establish recognition
-quality or compatibility across supported Macs.
+PTT2me defaults to two CPU threads. The Russian read-speech measurement below
+found lower latency with four threads on one Apple M5 at higher CPU cost.
+It supports an opt-in fast profile, not a universal default or an energy claim.
+
+In the next Preview, the menu `Распознавание` offers `Сбалансированный` (2)
+and `Быстрый (выше нагрузка)` (4). The selected value takes effect on the next
+application launch; the menu separately shows the active profile. Worker
+recovery during the current session retains that active profile. The model,
+decoder and audio conversion remain identical. An unsuccessful preference save
+is shown in the menu and does not change the running recognizer.
 
 ## Reproduce the measurement
 
@@ -45,7 +51,7 @@ JSON and corpus audio outside Git. The tool emits no transcript, audio sample,
 input path, or recognized-output digest.
 
 An actual measurement fails closed unless the build command embeds a source
-commit, dirty state, and compiler identity. Schema 2 records those compile-time
+commit, dirty state, and compiler identity. Schema 3 records those compile-time
 values under `provenance.build`, plus the SHA-256 and size of the executable
 opened by the benchmark process under `provenance.executable`. The separate
 `provenance.runtime_checkout` and `environment.runtime_rustc` fields describe
@@ -57,12 +63,109 @@ a non-symlink regular file, bounded to the production capture allowance,
 checked against its declared SHA-256, and decoded only if it is mono 16 kHz
 PCM16. Warmups are limited to 1..=3 and measured repeats to 1..=20.
 
-Schema 2 labels each configuration wall and CPU interval as recognizer load,
+Schema 3 labels each configuration wall and CPU interval as recognizer load,
 warmups, measured transcriptions, and the per-case quantile/RTF report
 bookkeeping through the final resource snapshot. Per-case transcription
 latencies remain timed around the recognizer call itself.
 
-## Recorded result
+## Recognition accuracy and fixed Russian corpus
+
+Schema 3 adds per-case and aggregate WER/CER, reference lengths, edit counts and
+the SHA-256 of the exact corpus manifest. `reference` is now a required string
+with at most 2,048 Unicode characters and a non-empty normalized form. Recognized
+text has the same scoring limit. Both remain in memory only. Public case IDs
+and source labels are report metadata; do not put private information in them.
+
+Normalization `ru-lower-yo-alnum-v1` lowercases Unicode characters, maps `ё` to
+`е`, replaces every non-alphanumeric character with a separator, and splits on
+whitespace. Inputs should use composed Unicode spelling. Digits are kept as
+digits, not expanded to words. Hyphens split words. CER counts Unicode scalar
+values after removing separators, not UTF-8 bytes. Levenshtein edits include
+substitution, deletion and insertion. Corpus rates divide total edits by total
+reference length; they are not an average of sentence rates and can exceed 1.
+
+Accuracy uses the first measured output per case/configuration; timing excludes
+scoring. Exact output comparison separately covers all warmups, repeats and
+configurations. `PASS` means a completed, repeatable measurement, not zero WER
+or a universal quality threshold. A changing output makes the run `FAIL` even
+when its reported first-output WER is low.
+
+The reproducible public subset uses [Google FLEURS](https://huggingface.co/datasets/google/fleurs),
+Conneau et al. (2022), Russian `ru_ru/test`, under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). It contains the first
+16 distinct sentence IDs with durations from 1 to 25 seconds in a pinned TSV,
+using the first eligible recording of each sentence. Selection is independent
+of recognition results. This is a small read-speech regression sample, not an
+estimate of real microphone dictation quality across speakers or noise levels.
+
+Download the two public inputs explicitly into a directory outside Git:
+
+```bash
+PTT2ME_CORPUS_ROOT=/path/to/asr-evidence
+PTT2ME_FLEURS_BASE=https://huggingface.co/datasets/google/fleurs/resolve/70bb2e84b976b7e960aa89f1c648e09c59f894dd/data/ru_ru
+curl --fail --location --proto '=https' --output "$PTT2ME_CORPUS_ROOT/test.tsv" "$PTT2ME_FLEURS_BASE/test.tsv"
+curl --fail --location --proto '=https' --output "$PTT2ME_CORPUS_ROOT/test.tar.gz" "$PTT2ME_FLEURS_BASE/audio/test.tar.gz"
+python3 scripts/prepare-fleurs-corpus.py \
+  --archive "$PTT2ME_CORPUS_ROOT/test.tar.gz" \
+  --tsv "$PTT2ME_CORPUS_ROOT/test.tsv" \
+  --output "$PTT2ME_CORPUS_ROOT/fleurs-ru-16"
+```
+
+The offline preparer checks pinned SHA-256 values while making private input
+snapshots, reads only selected regular archive members without extracting paths,
+and uses macOS `afconvert` to make
+PCM16 WAV files without trimming or normalizing. It refuses an existing output
+directory. The resulting `manifest.json` goes to `--corpus`; `provenance.json`
+retains attribution, source revision and selection policy. The source archive
+is about 433 MB; generated recordings/references remain outside Git. CI tests
+the scoring and input boundaries without downloading audio or models. The
+preparer supports Python 3.9+ and needs temporary disk space for the 433 MB
+verified snapshot as well as the downloaded archive.
+
+## Russian read-speech result, 2026-11-03
+
+The fixed 16-case corpus totals 163.98 seconds (5.46–17.16 seconds per case),
+279 reference words and 1,724 reference characters after normalization. It
+does not cover noisy microphones, whispered speech or the 25-second boundary.
+Model `gigaam-v3-rnnt-v1` and its production manifest are unchanged.
+
+The release-mode schema 3 executable was compiled from clean commit
+`a048a352033186a8b4445d7dd7759b9607b42dc7`, Rust 1.94.0, with SHA-256
+`3c5d5efd8e9518e4c530df7c5862683f215d181d01e0b81462d23fa4a0097264`
+(553,456 bytes). Corpus manifest SHA-256:
+`03be41b671b9fa2150929dd331293840cf16d4b535caff0f726bf7c9552ca93f`.
+The first run used order 2 → 4 → 1, one warmup and five measured repeats per
+case/configuration. Every complete trimmed output matched across all runs.
+
+| CPU threads | Sum of per-case median ASR times | WER | CER |
+| --- | ---: | ---: | ---: |
+| 1 | 23,520.7 ms | 8 / 279 = 2.867% | 11 / 1,724 = 0.638% |
+| 2 (default) | 12,447.9 ms | 2.867% | 0.638% |
+| 4 (opt-in) | 7,921.1 ms | 2.867% | 0.638% |
+
+Four threads reduced this latency measure by 36.4%, with improvement in every
+case (at least 34.6%). CPU time over the complete configuration interval grew
+24.3%. Independent processes, in reverse order 4 → 2 with one warmup/three
+repeats, confirmed 7,652.6 versus 12,389.6 ms and the same WER/CER. Peak RSS
+was 899.9 MiB (4) and 905.2 MiB (2); this small single-run difference does not
+establish memory savings. These are direct recognizer timings, not end-to-text
+latency through microphone capture, worker transport and insertion.
+
+The Mac was Mac17,4, Apple M5, 10 physical/logical CPUs, 16 GiB, macOS 26.6.2
+(25G83). Sandbox restrictions left hardware/thermal fields unavailable in the
+benchmark JSON; a separate read-only system observation established hardware
+and found no recorded thermal/performance warning after the runs. Background
+desktop activity was not controlled, and no energy or cross-device conclusion
+is claimed. The original report's unconditional synthetic-corpus limitation was
+subsequently corrected to corpus-neutral wording; no scoring code changed.
+
+Raw report hashes, retained outside Git:
+
+- Combined 2/4/1: `2c1e3d5f3058e94b0fc9e97386ced47c7cf01d30254d8b4862702c77e1d85203`.
+- Independent 4: `cb902e2c6911dacec718c75e8211c8626703b85a024b56c69f5a8fe0c1c84783`.
+- Independent 2: `47ceebb7e9d216dd941b0e389dac215804e9175e5fcbb9e12fccc4ddb4e2d895`.
+
+## Historical synthetic result
 
 The historical run on 2026-09-06 used the earlier schema 1 tool. Its
 `source_commit` value was the run-time working-directory HEAD
@@ -149,10 +252,11 @@ and restoration flow and add no probes solely for metrics.
 
 ## Limits and next experiment
 
-The result describes one short synthetic run on one M5 while other GUI
-processes were active. Five repeats do not estimate population tail latency,
-synthetic speech does not establish human recognition accuracy, and the run
-does not cover older supported Apple Silicon Macs or battery impact.
+The human-corpus result covers 16 read-speech cases on one M5 with uncontrolled
+background desktop activity. The historical synthetic run is separate and does
+not establish human recognition accuracy. Five repeats do not estimate population
+tail latency; neither run covers spontaneous microphone dictation, older supported
+Apple Silicon Macs or battery impact.
 
 A future experiment can compare the current CPU backend with a new runtime or
 CoreML on the same consented human corpus and supported-device matrix. It must
