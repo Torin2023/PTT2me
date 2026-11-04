@@ -17,6 +17,8 @@ export async function renderWorker(projectRoot, path = "/") {
       contents: await readFile(resolve(directory, path), "utf8"),
     }])));
   const runtime = new Miniflare({
+    // Static export does not need a Cloudflare location lookup or cf.json cache.
+    cf: false,
     telemetry: { enabled: false },
     enableDevRegistry: false,
     workers: [{
