@@ -1,3 +1,4 @@
+import { renderWorker } from "./render-worker.mjs";
 import {
   access,
   cp,
@@ -159,23 +160,7 @@ export async function exportGitHubPages({
   ]);
   await removeJavaScriptAssets(outputDirectory);
 
-  const workerUrl = pathToFileURL(workerPath);
-  workerUrl.searchParams.set("github-pages-export", `${process.pid}-${Date.now()}`);
-  const { default: worker } = await import(workerUrl.href);
-  const response = await worker.fetch(
-    new Request("http://localhost/", {
-      headers: { accept: "text/html" },
-    }),
-    {
-      ASSETS: {
-        fetch: async () => new Response("Not found", { status: 404 }),
-      },
-    },
-    {
-      waitUntil() {},
-      passThroughOnException() {},
-    },
-  );
+  const response = await renderWorker(root);
 
   if (!response.ok) {
     throw new Error(`Site render failed with HTTP ${response.status}`);
