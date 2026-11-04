@@ -14,16 +14,15 @@ The previous pasteboard is restored unless newer contents appeared meanwhile.
 - Apple Silicon (`arm64`) Mac
 - macOS 13 Ventura or newer
 
-The current published version is Preview 1.3.2. The Full download, signed
+The current published version is Preview 1.4.0. The Full download, signed
 update channel, and menu snapshot below describe this version.
 
-Development for the next Preview is tracked in the
-[sequential release plan](docs/release/NEXT_PREVIEW.md). It includes measured
-Russian WER/CER, an optional faster recognition profile, additional native
-clipboard checks, clearer diagnostics and recovery updates. These changes are
-not yet published. The next Preview continues to use ad-hoc code signing,
-without Apple Developer ID or notarization. The trusted Ed25519 update key
-and all update verification remain required.
+Preview 1.4.0 adds measured Russian WER/CER, an optional faster recognition
+profile, additional native clipboard checks, clearer diagnostics and recovery
+updates. See the [release plan and coverage limits](docs/release/NEXT_PREVIEW.md)
+and [benchmark methodology](docs/performance.md). The app remains ad-hoc signed,
+without Apple Developer ID or notarization. The trusted Ed25519 update key and
+all update verification remain required.
 
 ## Cloud development without Codespaces
 
@@ -106,7 +105,7 @@ The menu contains the trigger controls:
 
 ```text
 <status>
-PTT2me 1.3.2
+PTT2me 1.4.0
 Проверить обновления…
 Открыть настройки…   (only while a required permission is missing)
 Клавиша активации
@@ -118,11 +117,16 @@ PTT2me 1.3.2
   500 мс
   750 мс
 Пробел в конце
+Распознавание
+  <active profile>
+  Сбалансированный
+  Быстрый (выше нагрузка)
+  Выбор применяется после перезапуска PTT2me
 ────────────
 Выйти
 ```
 
-This menu snapshot describes the currently published Preview 1.3.2. The
+This menu snapshot describes the currently published Preview 1.4.0. The
 updater action changes when a signed release is available or downloaded.
 
 The status and version rows are informational. While a permission is missing,
@@ -143,36 +147,48 @@ ASCII space to each non-empty recognized phrase after trimming outer
 whitespace. The option persists across application restarts. Recognition
 punctuation is never added, removed, or rewritten by PTT2me.
 
+`Распознавание` selects the balanced (2 threads, default) or fast (4 threads)
+profile. The selection persists and takes effect after restarting PTT2me;
+worker recovery retains the active session profile. Fast mode trades higher
+CPU use for lower measured recognizer latency on the tested Mac; see
+[measurements and limitations](docs/performance.md).
+
 `Выйти` terminates the app.
 
 ## Published release
 
-The current public download is the Preview 1.3.2 Full DMG:
-[PTT2me-1.3.2-full-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.3.2/PTT2me-1.3.2-full-macos-arm64.dmg)
-(183,587,123 bytes / 175.1 MiB, SHA-256
-`476cba2b3b505c4b1d12e3fcaea0004c901b680072702147dd05e0afb2c566fb`).
-See the [v1.3.2 release page](https://github.com/Torin2023/PTT2me/releases/tag/v1.3.2)
-for the model-free Update DMG and checksum files.
+The current public download is the Preview 1.4.0 Full DMG:
+[PTT2me-1.4.0-full-macos-arm64.dmg](https://github.com/Torin2023/PTT2me/releases/download/v1.4.0/PTT2me-1.4.0-full-macos-arm64.dmg)
+(183,584,940 bytes / 175.1 MiB, SHA-256
+`0f506b3918f8140df39cffb08405639556b8034df70ab2869dc5a1dcc02b270a`).
+See the [v1.4.0 release page](https://github.com/Torin2023/PTT2me/releases/tag/v1.4.0)
+for the model-free Update DMG (11,380,018 bytes / 10.9 MiB), signed manifest
+and checksum files.
 
-Version 1.3.2 updates the locked TLS dependencies to rustls 0.23.46,
-rustls-webpki 0.103.16, and webpki-roots 1.0.10 after the dependency audit
-fix in PR #59. Application behavior, the fixed GigaAM model, and the trusted
-update-verification public key are unchanged from 1.3.1. The model-free
-Update DMG is 11,360,108 bytes / 10.8 MiB.
+Version 1.4.0 adds an optional faster recognition profile, privacy-preserving
+error messages and verified Full repair from idle error states. Production
+clipboard transactions have additional native automatic coverage; pure runtime
+scheduling policy is separated from AppKit effects. The fixed GigaAM model and
+trusted Ed25519 update key are unchanged. Russian WER/CER and latency results
+are documented in [performance.md](docs/performance.md), with one-Mac and
+small read-speech corpus limitations.
 
-Automated Rust/macOS tests (488), shell contracts, fresh-database RustSec audit,
-AppKit/WebKit fixture build-only, model initialization smoke, signature,
-bundle, and Full/Update DMG checks passed for source commit
-`361feb79e437be638e9f4a1b4a05d7a3af746be5` (build `202611031126`).
-The fixture was not executed. Manual P0 is **SKIPPED by explicit owner
-authorization on 2026-11-03**, not PASS. This exception applies only to this
-candidate; its scope and unverified scenarios are recorded in
-[`docs/release/1.3.2-preview-exception.md`](docs/release/1.3.2-preview-exception.md).
-Installation, physical hotkey/TCC workflows, real audio/recognition, insertion
-in Chrome, Yandex, ChatGPT/Codex, unknown apps or embedded browsers, clipboard
-behavior, and updater replacement remain manually unverified. Automated
-checks do not confirm these scenarios. This is an unsigned preview: the app
-is ad-hoc signed and is not Apple-notarized.
+[The complete macOS CI](https://github.com/Torin2023/PTT2me/actions/runs/41788508016)
+passed 505 Rust tests, native NSPasteboard checks, shell contracts, fmt,
+Clippy, a fresh strict RustSec audit and the AppKit/WebKit fixture build.
+The release builder and independent artifact verifier passed model smoke,
+Ed25519, hashes/sizes, DMG integrity, bundle identity, codesign and Full/Update
+Mach-O parity for source `97f9647be67e14f81b1f0012751d05e7b7582880`
+(build `202611040702`).
+
+Manual testing is not a release or publication requirement. Finder installation
+and replacement, physical Fn/Globe, TCC grant/migration, real microphone/live
+dictation, third-party Command-V and the complete user updater cycle remain
+unverified. Private NSPasteboard tests, a fake opener and a build-only GUI
+fixture do not establish those end-to-end outcomes. The app is ad-hoc signed,
+without Apple Developer ID or notarization. Site dependency audit results and
+remaining moderate tooling advisories are recorded in
+[SITE_DEPENDENCY_REFRESH.md](docs/release/SITE_DEPENDENCY_REFRESH.md).
 
 ## Build
 
@@ -255,7 +271,7 @@ use Full only. Update is selected only inside an already installed PTT2me.
 The release coordinator requires an explicit stable version, 12-digit UTC
 build, exact clean `HEAD`, model source, committed model manifest, publication
 timestamp, and matching key pair. The private signing key must remain outside
-Git. The currently published stable package version is exactly 1.3.2.
+Git. The currently published stable package version is exactly 1.4.0.
 
 ### Reproducible release gates
 
@@ -323,11 +339,11 @@ execution requires a macOS GUI session with Accessibility and event-posting
 access. Executing it is an optional, separately scoped diagnostic, not a release
 gate. Build-only does not prove successful insertion into real applications.
 
-## Updating (PTT2me 1.3.2)
+## Updating (PTT2me 1.4.0)
 
 Preview 1.0.5 cannot discover this release. Versions 1.1.0 and 1.1.1 can check
 the signed stable channel, but their updater cannot download the build that
-contains its fix. Replace any of these versions once with the published 1.3.2
+contains its fix. Replace any of these versions once with the published 1.4.0
 Full DMG. Starting with 1.1.2, PTT2me can download subsequent signed updates
 through the flow described below.
 

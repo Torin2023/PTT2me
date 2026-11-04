@@ -23,13 +23,13 @@ export async function generateMetadata(): Promise<Metadata> {
     metadataBase: new URL(origin),
     title: "PTT2me — локальная диктовка для macOS",
     description:
-      "PTT2me 1.3.2: локальная диктовка на Apple Silicon. Исправления безопасности сетевых библиотек. Unsigned preview; совместимость с приложениями вручную не проверена.",
+      "PTT2me 1.4.0: локальная диктовка на Apple Silicon. Быстрый профиль распознавания, понятные ошибки и восстановление. Ad-hoc preview без Developer ID и нотариализации Apple.",
     openGraph: {
       type: "website",
       locale: "ru_RU",
       title: "PTT2me — локальная диктовка для macOS",
       description:
-        "PTT2me 1.3.2: локальная диктовка на Apple Silicon. Исправления безопасности сетевых библиотек. Unsigned preview; совместимость с приложениями вручную не проверена.",
+        "PTT2me 1.4.0: локальная диктовка на Apple Silicon. Быстрый профиль распознавания, понятные ошибки и восстановление. Ad-hoc preview без Developer ID и нотариализации Apple.",
       images: [
         {
           url: "/og.png",
@@ -43,7 +43,7 @@ export async function generateMetadata(): Promise<Metadata> {
       card: "summary_large_image",
       title: "PTT2me — локальная диктовка для macOS",
       description:
-        "PTT2me 1.3.2: локальная диктовка на Apple Silicon. Исправления безопасности сетевых библиотек. Unsigned preview; совместимость с приложениями вручную не проверена.",
+        "PTT2me 1.4.0: локальная диктовка на Apple Silicon. Быстрый профиль распознавания, понятные ошибки и восстановление. Ad-hoc preview без Developer ID и нотариализации Apple.",
       images: ["/og.png"],
     },
     icons: {
