@@ -72,7 +72,9 @@ cargo audit --no-fetch --deny warnings
 нативного runtime, зафиксируйте точную ошибку в Pull Request и не обходите
 macOS platform guards.
 
-Полный gate на Apple Silicon macOS и в GitHub Actions:
+Полный gate на Apple Silicon macOS и в GitHub Actions для изменённых входов
+приложения (выбор и допустимое повторное использование CI описаны в
+`docs/release/AUTOMATED_RELEASE.md`):
 
 ```bash
 cargo fmt --all -- --check
@@ -85,8 +87,12 @@ cargo audit --no-fetch --deny warnings
 `NSPasteboard pasteboardWithUniqueName` в headless/sandbox окружении нужно
 отличать от регрессии и проверять тем же тестом в GitHub Actions.
 
-Сборку Full/Update DMG и ручные проверки TCC выполняйте только для явно
-поставленной release-задачи и по release gate из `README.md`.
+Сборку Full/Update DMG выполняйте только для явно поставленной release-задачи
+и по автоматическому release gate из `README.md`. Ручное тестирование полностью
+исключено из требований публикации и релиза. Не запрашивайте ручной P0,
+заполненный ручной чек-лист или исключение владельца для его пропуска.
+Непокрытые автоматизацией сценарии раскрывайте как непроверенные; не объявляйте
+их пройденными по результатам unit tests или build-only fixture.
 
 ## Границы изменений
 
@@ -115,6 +121,9 @@ cargo audit --no-fetch --deny warnings
   риски и platform limitations.
 - Не merge Pull Request, пока required check
   `Format, test, lint, and audit` не завершён успешно.
+- Required check всегда запускается. Он проверяет выбранные наборы и может
+  использовать доказательство полного прогона только по правилам
+  `scripts/ci-validation.py`. Не обходите ошибки автоматических gates.
 - Merge и публикация релиза остаются решением владельца репозитория.
 
 ## Правила code review
@@ -125,5 +134,5 @@ cargo audit --no-fetch --deny warnings
   явного release scope.
 - Отмечайте появление секретов, неприкреплённых внешних GitHub Actions,
   ослабление `permissions:` и команды, зависящие от локального компьютера.
-- Проверяйте, что документация разделяет возможности Linux cloud, macOS CI и
-  ручного release gate.
+- Проверяйте, что документация разделяет возможности Linux cloud, macOS CI,
+  автоматической проверки релизных артефактов и непокрытые сценарии.

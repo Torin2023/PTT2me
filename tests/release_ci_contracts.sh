@@ -39,6 +39,38 @@ SHELL_TEST_LINE="$(grep -n -F 'run: bash scripts/test-shell-contracts.sh' "$WORK
 }
 
 for required in \
+    '    name: Format, test, lint, and audit' \
+    '    needs: scope' \
+    '    if: always()' \
+    '          test "$SCOPE_RESULT" = success' \
+    '          case "$RUST_AFFECTED:$SITE_SELECTED" in' \
+    '          fetch-depth: 0' \
+    '        run: python3 -B scripts/ci-validation.py scope' \
+    '        run: python3 -B scripts/ci-validation.py reuse' \
+    '        run: python3 -B scripts/ci-validation.py record' \
+    '        run: bash scripts/cloud-setup.sh' \
+    '  actions: read' \
+    'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2' \
+    '          if-no-files-found: error'; do
+    grep -Fq -- "$required" "$WORKFLOW" || {
+        echo "CI is missing required validation behavior: $required" >&2
+        exit 1
+    }
+done
+
+if grep -Eq '^[[:space:]]+(paths|paths-ignore|continue-on-error):' "$WORKFLOW"; then
+    echo "required CI must not disappear through path filters or ignore failures" >&2
+    exit 1
+fi
+
+# Setup is the one fresh strict audit in a full CI run.
+grep -Fq 'cargo audit --deny warnings' "$REPO_ROOT/scripts/cloud-setup.sh"
+if grep -Fq 'run: cargo audit --no-fetch' "$WORKFLOW"; then
+    echo "CI repeats the audit already performed by cloud-setup" >&2
+    exit 1
+fi
+
+for required in \
     '      - site/**' \
     'npm ci' \
     'npm test' \
