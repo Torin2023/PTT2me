@@ -21,8 +21,9 @@ Development for the next Preview is tracked in the
 [sequential release plan](docs/release/NEXT_PREVIEW.md). It includes measured
 Russian WER/CER, an optional faster recognition profile, additional native
 clipboard checks, clearer diagnostics and recovery updates. These changes are
-not yet published. A Developer ID release also requires an available signing
-identity; the existing published Preview remains ad-hoc signed.
+not yet published. The next Preview continues to use ad-hoc code signing,
+without Apple Developer ID or notarization. The trusted Ed25519 update key
+and all update verification remain required.
 
 ## Cloud development without Codespaces
 
